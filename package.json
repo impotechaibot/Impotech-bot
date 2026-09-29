@@ -1,13 +1,14 @@
 {
-  "name": "impotech-ai-autoresponder",
+  "name": "impotech-ai-bot",
   "version": "1.0.0",
+  "description": "Smart Multimodal Auto-Responder for ImpoTech Bd",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "axios": "^1.7.2",
-    "dotenv": "^16.4.5"
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
   }
 }
