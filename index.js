@@ -75,7 +75,7 @@ app.post('/webhook', async (req, res) => {
           );
 
           const aiReply = geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 
-                          'আসসালামু আলাইকুম! ImpoTech Bd-তে আপনাকে স্বাগতম। আমাদের প্রতিনিধি দ্রুত যোগাযোগ করবে।';
+                          'আসসালামু আলাইকুম! ImpoTech -তে আপনাকে স্বাগতম। আমাদের প্রতিনিধি দ্রুত যোগাযোগ করবে।';
 
           await axios.post(
             `https://graph.facebook.com/v20.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
