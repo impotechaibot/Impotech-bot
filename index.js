@@ -415,90 +415,35 @@ ${rules.customInstructions || ''}
 
 
 /* =========================================================
-   MIME TYPE HELPERS
+   MIME TYPE HELPERS (FIXED FOR VOICE)
 ========================================================= */
 
 function normalizeMimeType(contentType, attachmentType, attachmentUrl) {
-
   let mime = (contentType || '').split(';')[0].trim().toLowerCase();
 
-  const supported = new Set([
-    'audio/wav',
-    'audio/x-wav',
-    'audio/wave',
-    'audio/mpeg',
-    'audio/mp3',
-    'audio/mp4',
-    'audio/m4a',
-    'audio/ogg',
-    'audio/opus',
-    'audio/webm',
-    'audio/aac',
-    'audio/flac',
-    'audio/aiff',
-
-    'image/jpeg',
-    'image/jpg',
-    'image/png',
-    'image/webp',
-    'image/gif',
-
-    'video/mp4',
-    'video/webm',
-    'video/mpeg',
-    'video/quicktime'
-  ]);
-
-  if (supported.has(mime)) {
-
-    if (mime === 'audio/x-wav' || mime === 'audio/wave') {
-      return 'audio/wav';
+  // Facebook-এর ভয়েস ক্লাইপ যাতে Gemini সরাসরি প্রসেস করতে পারে
+  if (attachmentType === 'audio' || mime.includes('audio')) {
+    if (mime === 'audio/aac' || mime === 'audio/m4a' || mime === 'audio/mp4') {
+      return 'audio/mp4'; 
     }
-
-    if (mime === 'image/jpg') {
-      return 'image/jpeg';
+    if (mime === 'audio/ogg' || mime === 'audio/opus') {
+      return 'audio/ogg';
     }
-
-    return mime;
+    return 'audio/mp3';
   }
 
-
-  const url = (attachmentUrl || '').toLowerCase();
-
-
-  if (attachmentType === 'audio') {
-
-    if (url.includes('.ogg')) return 'audio/ogg';
-    if (url.includes('.opus')) return 'audio/opus';
-    if (url.includes('.webm')) return 'audio/webm';
-    if (url.includes('.m4a')) return 'audio/mp4';
-    if (url.includes('.mp3')) return 'audio/mp3';
-    if (url.includes('.wav')) return 'audio/wav';
-
-    return 'audio/ogg';
-  }
-
-
-  if (attachmentType === 'image') {
-
-    if (url.includes('.png')) return 'image/png';
-    if (url.includes('.webp')) return 'image/webp';
-
+  if (attachmentType === 'image' || mime.includes('image')) {
+    if (mime === 'image/png') return 'image/png';
+    if (mime === 'image/webp') return 'image/webp';
     return 'image/jpeg';
   }
 
-
-  if (attachmentType === 'video') {
-
-    if (url.includes('.webm')) return 'video/webm';
-
+  if (attachmentType === 'video' || mime.includes('video')) {
     return 'video/mp4';
   }
 
-
-  return null;
+  return 'audio/mp3';
 }
-
 
 /* =========================================================
    DOWNLOAD FACEBOOK ATTACHMENT
