@@ -579,8 +579,8 @@ async function callGeminiWithSmartRetry(parts) {
 
 
   const models = [
-  'gemini-3.5-flash',
-  'gemini-3.8-flash'
+  'gemini-1.5-flash',
+  'gemini-1.5-pro'
 ];
 
   let lastError = null;
