@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'impotech_secret_123';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const GEMINI_MODEL = 'gemini-3.5-flash-lite'; // গুগলের অনুমোদিত লেটেস্ট মডেল
 
 const SYSTEM_INSTRUCTION = `
 You are a polite, helpful e-commerce support assistant for 'ImpoTech Bd' in Bangladesh.
@@ -31,7 +31,28 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// ২. ফেসবুক থেকে মেসেজ/ভয়েস/ছবি রিসিভ করা ও জেমিনাই দিয়ে উত্তর দেওয়া
+// এআই কল করার স্মার্ট ফাংশন (হাই ডিমান্ড থাকলে নিজে থেকেই ১ সেকেন্ড পর আবার চেষ্টা করবে)
+async function callGemini(parts, retries = 2) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  
+  for (let i = 0; i < retries; i++) {
+    try {
+      const resp = await axios.post(url, { contents: [{ parts }] }, { timeout: 15000 });
+      const text = resp.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) return text.trim();
+    } catch (err) {
+      console.warn(`Attempt ${i + 1} failed:`, err.response?.data?.error?.message || err.message);
+      if (i < retries - 1) {
+        // ১.৫ সেকেন্ড বিরতি দিয়ে আবার চেষ্টা করবে
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
+  }
+  // কোনো কারণে গুগল ডাউন থাকলে ব্যাকআপ উত্তর
+  return 'আসসালামু আলাইকুম! ImpoTech Bd-তে স্বাগতম। আমাদের ডেলিভারি চার্জ: ঢাকায় ৭০ টাকা, ঢাকার বাইরে ১৩০ টাকা। ক্যাশ অন ডেলিভারি সুবিধা আছে। কীভাবে সাহায্য করতে পারি?';
+}
+
+// ২. ফেসবুক থেকে মেসেজ/ভয়েস/ছবি রিসিভ করা ও উত্তর পাঠানো
 app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
   const body = req.body;
@@ -68,15 +89,11 @@ app.post('/webhook', async (req, res) => {
         }
         parts.push({ text: `${SYSTEM_INSTRUCTION}\n\nCustomer: ${userText}` });
 
+        // এআই উত্তর নিয়ে আসা
+        const aiReply = await callGemini(parts);
+
+        // ফেসবুকে উত্তর পাঠিয়ে দেওয়া
         try {
-          const geminiResp = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-            { contents: [{ parts }] }
-          );
-
-          const aiReply = geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 
-                          'আসসালামু আলাইকুম! ImpoTech -তে আপনাকে স্বাগতম। আমাদের প্রতিনিধি দ্রুত যোগাযোগ করবে।';
-
           await axios.post(
             `https://graph.facebook.com/v20.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
             {
@@ -84,8 +101,9 @@ app.post('/webhook', async (req, res) => {
               message: { text: aiReply }
             }
           );
-        } catch (e) {
-          console.error('AI Error:', e.response?.data || e.message);
+          console.log(`Replied successfully to customer: ${senderId}`);
+        } catch (fbErr) {
+          console.error('Facebook Send Error:', fbErr.response?.data || fbErr.message);
         }
       }
     }
