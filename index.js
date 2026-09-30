@@ -568,38 +568,224 @@ async function callVoiceGemini(
     );
   }
 
+  const audioBuffer =
+    Buffer.from(
+      audioBase64,
+      'base64'
+    );
+
+  const fileSize =
+    audioBuffer.length;
+
+  console.log(
+    `[GEMINI VOICE] Uploading audio | ${mimeType} | ${fileSize} bytes`
+  );
+
+  // =========================
+  // STEP 1: START FILE UPLOAD
+  // =========================
+
+  const startResponse =
+    await axios.post(
+      'https://generativelanguage.googleapis.com/upload/v1beta/files',
+
+      {
+        file: {
+          display_name:
+            `messenger_voice_${Date.now()}`
+        }
+      },
+
+      {
+        headers: {
+          'x-goog-api-key':
+            GEMINI_API_KEY,
+
+          'X-Goog-Upload-Protocol':
+            'resumable',
+
+          'X-Goog-Upload-Command':
+            'start',
+
+          'X-Goog-Upload-Header-Content-Length':
+            String(fileSize),
+
+          'X-Goog-Upload-Header-Content-Type':
+            mimeType,
+
+          'Content-Type':
+            'application/json'
+        },
+
+        timeout: 30000,
+
+        validateStatus:
+          () => true
+      }
+    );
+
+  if (
+    startResponse.status < 200 ||
+    startResponse.status >= 300
+  ) {
+    console.error(
+      '[GEMINI VOICE] Upload start failed:',
+      startResponse.status,
+      startResponse.data
+    );
+
+    throw new Error(
+      `Gemini upload start failed with status ${startResponse.status}`
+    );
+  }
+
+  const uploadUrl =
+    startResponse.headers[
+      'x-goog-upload-url'
+    ];
+
+  if (!uploadUrl) {
+    console.error(
+      '[GEMINI VOICE] Upload headers:',
+      startResponse.headers
+    );
+
+    throw new Error(
+      'Gemini Files API upload URL was not returned'
+    );
+  }
+
+  console.log(
+    '[GEMINI VOICE] Upload URL received'
+  );
+
+  // =========================
+  // STEP 2: UPLOAD AUDIO
+  // =========================
+
+  const uploadResponse =
+    await axios.post(
+      uploadUrl,
+
+      audioBuffer,
+
+      {
+        headers: {
+          'Content-Length':
+            String(fileSize),
+
+          'X-Goog-Upload-Offset':
+            '0',
+
+          'X-Goog-Upload-Command':
+            'upload, finalize'
+        },
+
+        timeout: 60000,
+
+        maxContentLength:
+          MAX_ATTACHMENT_BYTES,
+
+        maxBodyLength:
+          MAX_ATTACHMENT_BYTES,
+
+        validateStatus:
+          () => true
+      }
+    );
+
+  if (
+    uploadResponse.status < 200 ||
+    uploadResponse.status >= 300
+  ) {
+    console.error(
+      '[GEMINI VOICE] File upload failed:',
+      uploadResponse.status,
+      uploadResponse.data
+    );
+
+    throw new Error(
+      `Gemini file upload failed with status ${uploadResponse.status}`
+    );
+  }
+
+  const fileUri =
+    uploadResponse.data?.file?.uri;
+
+  const uploadedMimeType =
+    uploadResponse.data?.file?.mimeType ||
+    mimeType;
+
+  if (!fileUri) {
+    console.error(
+      '[GEMINI VOICE] Upload response:',
+      uploadResponse.data
+    );
+
+    throw new Error(
+      'Gemini Files API did not return file URI'
+    );
+  }
+
+  console.log(
+    '[GEMINI VOICE] File uploaded successfully'
+  );
+
+  // =========================
+  // STEP 3: INTERACTIONS API
+  // =========================
+
   const body = {
-    model: VOICE_MODEL,
+    model:
+      VOICE_MODEL,
 
     input: [
       {
         type: 'text',
-        text: prompt
+
+        text:
+          `${prompt}
+
+গুরুত্বপূর্ণ:
+Customer-এর voice message শুনে তার বক্তব্য বুঝে সরাসরি customer-এর প্রশ্নের উত্তর দাও।
+Voice message-এর transcript customer-কে আলাদাভাবে দেখাবে না।`
       },
 
       {
         type: 'audio',
-        data: audioBase64,
-        mime_type: mimeType
+
+        uri:
+          fileUri,
+
+        mime_type:
+          uploadedMimeType
       }
     ],
 
-    store: false
+    store:
+      false,
+
+    generation_config: {
+      max_output_tokens:
+        MAX_OUTPUT_TOKENS,
+
+      thinking_level:
+        'minimal'
+    }
   };
 
   try {
-    console.log(
-      `[GEMINI VOICE] ${VOICE_MODEL}`
-    );
 
     console.log(
-      `[GEMINI VOICE] MIME: ${mimeType}`
+      `[GEMINI VOICE] Sending audio to ${VOICE_MODEL}`
     );
 
     const response =
       await axios.post(
         INTERACTIONS_URL,
+
         body,
+
         {
           headers: {
             'Content-Type':
@@ -609,29 +795,45 @@ async function callVoiceGemini(
               GEMINI_API_KEY
           },
 
-          timeout: 60000,
-
-          maxContentLength:
-            MAX_ATTACHMENT_BYTES,
-
-          maxBodyLength:
-            MAX_ATTACHMENT_BYTES
+          timeout: 60000
         }
       );
 
+    console.log(
+      '[GEMINI VOICE] Interaction completed'
+    );
+
     const outputText =
       response.data?.output_text ||
-      response.data?.output
-        ?.filter(item =>
-          item?.type === 'text'
+      response.data?.steps
+        ?.filter(
+          step =>
+            step?.type ===
+            'model_output'
         )
-        ?.map(item =>
-          item.text || ''
+        ?.flatMap(
+          step =>
+            step.content || []
+        )
+        ?.filter(
+          item =>
+            item?.type === 'text'
+        )
+        ?.map(
+          item =>
+            item.text || ''
         )
         ?.join('')
         ?.trim();
 
     if (!outputText) {
+      console.error(
+        '[GEMINI VOICE] Full response:',
+        JSON.stringify(
+          response.data
+        )
+      );
+
       throw new Error(
         'Gemini voice returned empty response'
       );
@@ -640,8 +842,9 @@ async function callVoiceGemini(
     return outputText;
 
   } catch (error) {
+
     console.error(
-      '[GEMINI VOICE] Error:',
+      '[GEMINI VOICE] Interaction error:',
       error.response?.status || ''
     );
 
@@ -653,57 +856,7 @@ async function callVoiceGemini(
 
     throw error;
   }
-}
-
-// =========================
-// MIME TYPE
-// =========================
-
-function guessMimeType(
-  type,
-  url = ''
-) {
-  const t =
-    String(type || '').toLowerCase();
-
-  const u =
-    String(url || '').toLowerCase();
-
-  if (t === 'image') {
-    return 'image/jpeg';
   }
-
-  if (t === 'video') {
-    return 'video/mp4';
-  }
-
-  if (t === 'audio') {
-    if (u.includes('.ogg')) {
-      return 'audio/ogg';
-    }
-
-    if (u.includes('.opus')) {
-      return 'audio/opus';
-    }
-
-    if (u.includes('.mp3')) {
-      return 'audio/mp3';
-    }
-
-    if (u.includes('.wav')) {
-      return 'audio/wav';
-    }
-
-    if (u.includes('.m4a')) {
-      return 'audio/m4a';
-    }
-
-    return 'audio/aac';
-  }
-
-  return 'application/octet-stream';
-}
-
 // =========================
 // DOWNLOAD MESSENGER MEDIA
 // =========================
