@@ -19,6 +19,17 @@
       "mediaUrl": "",
       "name": "Motorcycle Angle wings",
       "price": "650"
+    },
+    {
+      "category": "bike accessories",
+      "description": "",
+      "fileUri": "https://www.facebook.com/share/v/1F8iPKKBh6/",
+      "id": "prod_2c3b7eab",
+      "inStock": true,
+      "mediaType": "IMAGE",
+      "mediaUrl": "https://www.facebook.com/share/v/1F8iPKKBh6/",
+      "name": "5 lens fog light",
+      "price": "450"
     }
   ],
   "faqs": [
