@@ -5,7 +5,7 @@
  *   gemini-3.1-flash-lite
  *
  * VOICE:
- *   gemini-flash-latet
+ *   gemini-3.5-flash-lite
  *   Interactions API
  *
  * GitHub:
@@ -49,7 +49,7 @@ const TEXT_MODEL = 'gemini-3.1-flash-lite';
 
 // Google currently documents audio understanding
 // with the Interactions API.
-const VOICE_MODEL = 'gemini-flash-latet';
+const VOICE_MODEL = 'gemini-3.5-flash-lite';
 
 const TEXT_GEMINI_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent`;
