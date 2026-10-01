@@ -1,4 +1,13 @@
 {
-  "products": [],
+  "products": [
+    {
+      "id": "test1",
+      "name": "ডানা লাইট",
+      "price": "750",
+      "fileUri": "https://www.facebook.com/photo.php?fbid=123",
+      "mediaUrl": "https://www.facebook.com/photo.php?fbid=123",
+      "description": "ডানা লাইট বাইক ও স্কুটার"
+    }
+  ],
   "faqs": []
 }
