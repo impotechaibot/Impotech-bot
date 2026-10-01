@@ -49,7 +49,7 @@ const TEXT_MODEL = 'gemini-3.1-flash-lite';
 
 // Google currently documents audio understanding
 // with the Interactions API.
-const VOICE_MODEL = 'gemini-3.8-flash';
+const VOICE_MODEL = 'gemini-flash-latet';
 
 const TEXT_GEMINI_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent`;
