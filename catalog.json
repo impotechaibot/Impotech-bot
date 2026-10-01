@@ -1,13 +1,341 @@
 {
-  "products": [
+  "products": [],
+  "faqs": [
     {
-      "id": "test1",
-      "name": "ডানা লাইট",
-      "price": "750",
-      "fileUri": "https://www.facebook.com/photo.php?fbid=123",
-      "mediaUrl": "https://www.facebook.com/photo.php?fbid=123",
-      "description": "ডানা লাইট বাইক ও স্কুটার"
+      "answer": "অর্ডার করতে আপনার প্রয়োজনীয় প্রোডাক্টের নাম, পরিমাণ এবং আপনার ঠিকানা জানিয়ে দিন।",
+      "category": "GENERAL",
+      "id": "faq_1790878359914_0_417",
+      "question": "অর্ডার কীভাবে করব?"
+    },
+    {
+      "answer": "আমাদের পেমেন্ট মেথড হলো ক্যাশ অন ডেলিভারি।",
+      "category": "GENERAL",
+      "id": "faq_1790878359915_1_368",
+      "question": "আপনাদের পেমেন্ট কীভাবে করতে হবে?"
+    },
+    {
+      "answer": "গাজীপুরের ভেতরে ডেলিভারি চার্জ ৫০ টাকা এবং গাজীপুরের বাইরে ১০০ টাকা।",
+      "category": "GENERAL",
+      "id": "faq_1790878359915_2_612",
+      "question": "ডেলিভারি চার্জ কত?"
+    },
+    {
+      "answer": "জি, পুরো বাংলাদেশে  ডেলিভারি দেওয়া হয়। ডেলিভারি চার্জ ১০০ টাকা।",
+      "category": "GENERAL",
+      "id": "faq_1790878359915_3_983",
+      "question": "গাজীপুরের বাইরে কি ডেলিভারি দেওয়া হয়?"
+    },
+    {
+      "answer": "গাজীপুরের ভেতরে ডেলিভারি চার্জ ৫০ টাকা।",
+      "category": "GENERAL",
+      "id": "faq_1790878359915_4_397",
+      "question": "গাজীপুরের ভিতরে ডেলিভারি চার্জ কত?"
+    },
+    {
+      "answer": "আমাদের পেমেন্ট মেথড হলো ক্যাশ অন ডেলিভারি।",
+      "category": "GENERAL",
+      "id": "faq_1790878359915_5_244",
+      "question": "ডেলিভারি নেওয়ার সময় আগে টাকা দিতে হবে?"
+    },
+    {
+      "answer": "জি, আমাদের পেমেন্ট মেথড হলো ক্যাশ অন ডেলিভারি।",
+      "category": "GENERAL",
+      "id": "faq_1790878359915_6_841",
+      "question": "প্রোডাক্ট হাতে পাওয়ার পর পেমেন্ট করা যাবে?"
+    },
+    {
+      "answer": "জি, ডেলিভারিম্যানের সামনে লাইটের বক্স খুলে ব্যাটারি বা ১২ ভোল্ট লাইনে কানেক্ট করে আলো জ্বালিয়ে টেস্ট করে দেখে তারপর পেমেন্ট করতে পারবেন।\n🔹 Fog Light, ফগ লাইট সম্পর্কিত আরও FAQ",
+      "category": "GENERAL",
+      "id": "faq_1790878359916_7_315",
+      "question": "ডেলিভারির সময় প্রোডাক্ট চেক করা যাবে?"
+    },
+    {
+      "answer": "12 Lens Fog Light,১২ লেন্স ফগ লাইট-এর দাম ৭৫০ টাকা পিস।",
+      "category": "GENERAL",
+      "id": "faq_1790878359916_8_264",
+      "question": "12 Lens Fog Light,১২ লেন্স ফগ লাইট -এর দাম কত?"
+    },
+    {
+      "answer": "5 Lens Fog Light,৫লেন্স ফগ লাইট-এর দাম ৪৫০ টাকা পিস।",
+      "category": "GENERAL",
+      "id": "faq_1790878359916_9_904",
+      "question": "5 Lens Fog Light,৫ লেন্স ফগ লাইট-এর দাম কত?"
+    },
+    {
+      "answer": "জি, মোট ৬টি মোড পাবেন।",
+      "category": "GENERAL",
+      "id": "faq_1790878359916_10_936",
+      "question": "Fog Light,ফগ লাইট-এ মোট কয়টি মোড আছে?"
+    },
+    {
+      "answer": "জি, মোট ৬টি মোড পাবেন। সাদা,হলুদ ও পুলিশ লাইট",
+      "category": "GENERAL",
+      "id": "faq_1790878359916_11_260",
+      "question": "Fog Light,ফগ লাইট-এ কি Yellow এবং White দুটো আলো পাওয়া যায়?"
+    },
+    {
+      "answer": "জি, এতে High Beam এবং Low Beam দুটো মোডই রয়েছে। মোট ৬টি মোড পাবেন।",
+      "category": "GENERAL",
+      "id": "faq_1790878359917_12_781",
+      "question": "Fog Light,ফগ লাইট-এ High Beam আছে?"
+    },
+    {
+      "answer": "জি, এতে High Beam এবং Low Beam দুটো মোডই রয়েছে। মোট ৬টি মোড পাবেন।",
+      "category": "GENERAL",
+      "id": "faq_1790878359917_13_608",
+      "question": "Fog Light,ফগ লাইট-এ Low Beam আছে?"
+    },
+    {
+      "answer": "জি, এটি IP67/IP68 Waterproof Rating-যুক্ত।",
+      "category": "GENERAL",
+      "id": "faq_1790878359917_14_167",
+      "question": "এই Fog Light,ফগ লাইট কি বৃষ্টিতে ব্যবহার করা যাবে?"
+    },
+    {
+      "answer": "এটি IP67/IP68 Waterproof Rating-যুক্ত, তাই প্রচণ্ড বৃষ্টি বা কাদা-পানিতেও ব্যবহারের জন্য তৈরি।",
+      "category": "GENERAL",
+      "id": "faq_1790878359917_15_628",
+      "question": "কাদাপানিতে Fog Light,ফগ লাইট নষ্ট হবে না তো?"
+    },
+    {
+      "answer": "এটি CNC Aluminium Heavy-Duty Body এবং Projector Lens দিয়ে তৈরি।",
+      "category": "GENERAL",
+      "id": "faq_1790878359917_16_423",
+      "question": "Fog Light,ফগ লাইট-এর বডি কী দিয়ে তৈরি?"
+    },
+    {
+      "answer": "স্বাভাবিক ব্যবহারে এর সার্ভিস প্রায় ৩০,০০০ থেকে ৫০,০০০ ঘণ্টা পর্যন্ত হতে পারে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359917_17_781",
+      "question": "Fog Light,ফগ লাইট কতদিন চলবে?"
+    },
+    {
+      "answer": "জি, এটি Universal Projector Fog Light। বাইক, স্কুটার, প্রাইভেটকার বা মাইক্রোবাসে ফিটিং করা যায়।",
+      "category": "GENERAL",
+      "id": "faq_1790878359918_18_889",
+      "question": "Fog Light,ফগ লাইট কি সব বাইকে লাগানো যাবে?"
+    },
+    {
+      "answer": "সুইচ বা হারনেস ব্যবহার করে লাগালে মূল Wiring কাটার প্রয়োজন পড়ে না।",
+      "category": "GENERAL",
+      "id": "faq_1790878359918_19_267",
+      "question": "গাড়িতে Fog Light,ফগ লাইট লাগাতে Wiring কাটতে হবে?"
+    },
+    {
+      "answer": "এটি Low Wattage-এ কাজ করে, তাই গাড়ির ব্যাটারির কোনো ক্ষতি হবে না।",
+      "category": "GENERAL",
+      "id": "faq_1790878359918_20_532",
+      "question": "Fog Light,ফগ লাইট লাগালে গাড়ির Battery নষ্ট হবে?"
+    },
+    {
+      "answer": "হলুদ আলোর ওয়েভলেংথ বেশি হওয়ায় ঘন কুয়াশা, ধুলাবালি এবং কড়া বৃষ্টিতেও আলো কুয়াশা ভেদ করে রাস্তায় স্পষ্ট Visibility তৈরি করে।\n🔹 Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা  লাইট সম্পর্কিত FAQ",
+      "category": "GENERAL",
+      "id": "faq_1790878359918_21_717",
+      "question": "Fog Light,ফগ লাইট-এর আলো কুয়াশায় কেমন কাজ করে?"
+    },
+    {
+      "answer": "Angel Wings,ডানা মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট-এর দাম ৬৫০ টাকা জোড়া।",
+      "category": "GENERAL",
+      "id": "faq_1790878359918_22_199",
+      "question": "Angel Wings,ডানা লাইট এর দাম কত?"
+    },
+    {
+      "answer": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট-এর দাম ৬৫০ টাকা জোড়া।",
+      "category": "GENERAL",
+      "id": "faq_1790878359918_23_770",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট এক পিস নাকি জোড়া বিক্রি হয়?"
+    },
+    {
+      "answer": "সাদা (White), নীল (Blue) এবং লাল (Red) কালারে পাওয়া যায়।",
+      "category": "GENERAL",
+      "id": "faq_1790878359919_24_386",
+      "question": "Angel Wings ,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট কী কী কালারে পাওয়া যায়?"
+    },
+    {
+      "answer": "এটি Universal Side Projection Light। মোটরসাইকেল, স্কুটার বা ই-বাইকে ক্ল্যাম্প বা স্ক্রু দিয়ে সেট করা যায়।",
+      "category": "GENERAL",
+      "id": "faq_1790878359919_25_298",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট কি শুধু বাইকে লাগানো যায়?"
+    },
+    {
+      "answer": "সাধারণত বাইকের ফ্রেম, গার্ডবার অথবা বডির নিচের দিকে সেট করা হয়, যাতে আলো দুই পাশে রাস্তার ওপর প্রজেক্ট হতে পারে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359919_26_444",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট বাইকের কোথায় লাগাতে হয়?"
+    },
+    {
+      "answer": "এটি ৯V থেকে ৪৫V DC ভোল্টেজ সাপোর্ট করে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359919_27_885",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট কত ভোল্টে চলে?"
+    },
+    {
+      "answer": "জি, ১২ ভোল্টের বাইক বা ব্যাটারিতে চলবে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359919_28_881",
+      "question": "১২ ভোল্টের বাইকে Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট চলবে?"
+    },
+    {
+      "answer": "এটি ৩ ওয়াটের লাইট।",
+      "category": "GENERAL",
+      "id": "faq_1790878359919_29_479",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট কত ওয়াট?"
+    },
+    {
+      "answer": "এটি মাত্র ৩ ওয়াটের লাইট, তাই ব্যবহারে বাইকের ব্যাটারির ওপর কোনো প্রভাব বা চাপ পড়বে না।",
+      "category": "GENERAL",
+      "id": "faq_1790878359920_30_338",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট লাগালে বাইকের Battery-তে চাপ পড়বে?"
+    },
+    {
+      "answer": "জি, এটি Waterproof ডিজাইনে তৈরি এবং ভারী বৃষ্টি বা কাদাপানিতেও নিরাপদ থাকবে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359920_31_688",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট কি Waterproof?"
+    },
+    {
+      "answer": "এর গড় আয়ুষ্কাল প্রায় ১০,০০০ ঘণ্টা পর্যন্ত।\n🔹60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট সম্পর্কিত FAQ",
+      "category": "GENERAL",
+      "id": "faq_1790878359920_32_592",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা লাইট-এর Lifespan কত?"
+    },
+    {
+      "answer": "60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট-এর দাম ১০৯৯ টাকা।",
+      "category": "GENERAL",
+      "id": "faq_1790878359920_33_915",
+      "question": "Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট এর দাম কত?"
+    },
+    {
+      "answer": "এটি 60W 8000. Lumen red/Blue Devil Eye Headlight।",
+      "category": "GENERAL",
+      "id": "faq_1790878359920_34_826",
+      "question": "Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট কত ওয়াট?"
+    },
+    {
+      "answer": "Red/Blue Devil EyeBulb,হেডলাইট H4 Plug Devil Eye Headlight, 60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট— Bike Fitment",
+      "category": "GENERAL",
+      "id": "faq_1790878359921_35_841",
+      "question": "Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট-এর কালার কী?"
+    },
+    {
+      "answer": "আপনার বাইকের নির্দিষ্ট ব্র্যান্ড ও মডেলটি জানালে দেখে বলতে পারব। কারণ এই Headlight,হেডলাইট এর Plug হলো H4 Plug। আপনার বাইকের কোম্পানি থেকে দেওয়া Original Headlight-এ H4 Plug/Socket ব্যবহার করা হয়েছে কি না, সেটি যাচাই করে তারপর Fitment সম্পর্কে নিশ্চিতভাবে জানাতে হবে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359921_36_970",
+      "question": "H4 Plug Devil Eye Headlight,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট কি আমার বাইকে লাগবে?"
+    },
+    {
+      "answer": "AI নির্দেশনা:\nকাস্টমার নির্দিষ্ট বাইকের ব্র্যান্ড ও মডেল দিলে প্রথমে যাচাই করতে হবে ওই বাইকের Original/Factory Headlight Bulb বা Headlight Socket H4 কি না।\n- যদি নির্ভরযোগ্য তথ্য থেকে নিশ্চিত হওয়া যায় যে ওই বাইকের Original Headlight-এ H4 Plug/Socket আছে, তাহলে বলবে:\n“জি, আপনার [বাইকের মডেল]-এর Original Headlight,হেডলাইট -এ H4 Plug/Socket ব্যবহার করা হয়েছে। তাই এই H4 Plug Devil Eye Headlight আপনার বাইকে Plug and Play হিসেবে ব্যবহার করা যাবে।”\n- যদি নিশ্চিত হওয়া যায় যে বাইকটিতে H4 Plug/Socket নেই, তাহলে বলবে:\n“আপনার [বাইকের মডেল]-এর Original Headlight-এ H4 Plug/Socket ব্যবহার করা হয়নি। তাই এই H4 Plug Devil Eye Headlight সরাসরি Plug and Play হিসেবে ব্যবহার করা যাবে না।”\n- যদি নির্ভরযোগ্য তথ্য পাওয়া না যায়, তাহলে কোনো অনুমান করা যাবে না। বলবে:\n“আপনার [বাইকের মডেল]-এর Original Headlight-এ H4 Plug/Socket আছে কি না নিশ্চিতভাবে যাচাই করা যাচ্ছে না। বিস্তারিত জানতে আমাদের একজন এডমিন বা প্রতিনিধি খুব শীঘ্রই আপনার সাথে সরাসরি যোগাযোগ করবেন।”\nগুরুত্বপূর্ণ নিয়ম:\n1. কাস্টমার শুধু “আমার বাইকে হবে?” বললে প্রথমে বাইকের ব্র্যান্ড + নির্দিষ্ট মডেল জানতে হবে।\n2. মডেল পাওয়ার পর যাচাই করতে হবে ওই মডেলের Factory/Original Headlight-এ H4 Plug/Socket আছে কি না।\n3. শুধু বাইকের মডেল দেখে অনুমান করে H4 বলা যাবে না।\n4. H4 Plug নিশ্চিত হলেই Plug and Play compatibility সম্পর্কে উত্তর দেওয়া যাবে।\n5. H4 Plug না থাকলে সরাসরি Plug and Play হবে বলা যাবে না।\n6. তথ্য নিশ্চিতভাবে যাচাই করা না গেলে কোনো অনুমান করা যাবে না এবং Admin/Representative-এর কাছে পাঠাতে হবে।\n7. H4 Plug/Socket থাকলেই শুধু এই FAQ অনুযায়ী Fitment নিশ্চিত করা যাবে; অন্য কোনো অতিরিক্ত modification-এর প্রয়োজন আছে কি না সে বিষয়ে তথ্য না থাকলে অনুমান করা যাবে না।\n🔹 H4 Mini Projector Bulb,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট সম্পর্কিত আরও FAQ",
+      "category": "GENERAL",
+      "id": "faq_1790878359922_37_155",
+      "question": "আমার বাইকের মডেল [নির্দিষ্ট মডেল]। এতে কি H4 Plug Devil Eye Headlight, 60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট লাগবে?"
+    },
+    {
+      "answer": "জি, আপনার বাইক বা গাড়ির প্রধান হেডলাইটে H4 Socket থাকলে এটি সরাসরি Plug and Play ফিট হবে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359922_38_578",
+      "question": "H4 Mini Projector Bulb,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট কি H4 Plug-এ সরাসরি লাগানো যায়?"
+    },
+    {
+      "answer": "না, H4 Socket থাকলে কোনো তার কাটাকাটি ছাড়াই Plug and Play ফিট করা যায়।",
+      "category": "GENERAL",
+      "id": "faq_1790878359922_39_594",
+      "question": "H4 Mini Projector Bulb,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট লাগাতে তার কাটতে হবে?"
+    },
+    {
+      "answer": "না, অরিজিনাল Halogen Headlight Bulb-এর জায়গায় কোনো Modification ছাড়া বসানো যায়।",
+      "category": "GENERAL",
+      "id": "faq_1790878359922_40_984",
+      "question": "H4 Mini Projector Bulb,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট-এর জন্য Headlight কাটতে হবে?"
+    },
+    {
+      "answer": "জি, এই প্রোডাক্টটির সাথে ২০০ দিনের ফুল রিপ্লেসমেন্ট ওয়ারেন্টি দেওয়া হচ্ছে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359922_41_689",
+      "question": "H4 projector headlight /60w red colour Devil eye / 60w blue colour Devil eye,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট-এর Warranty আছে?"
+    },
+    {
+      "answer": "এই Projector Bulb-এর Diameter ৩৭ মিমি। তাই Headlight Assembly-এর ভেতরে ৩৭–৪৭ মিমি Space আছে কিনা দেখে নেওয়া ভালো।",
+      "category": "GENERAL",
+      "id": "faq_1790878359923_42_684",
+      "question": "H4 Projector Bulb,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট বসানোর আগে কী মাপ দেখতে হবে?"
+    },
+    {
+      "answer": "জি, এটি H4 Dual Beam Projector Headlight Bulb। এতে High Beam এবং Low Beam দুটোই রয়েছে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359923_43_267",
+      "question": "H4 Projector Bulb,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট-এ High Beam আছে?"
+    },
+    {
+      "answer": "জি, এতে High Beam এবং Low Beam দুটোই রয়েছে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359923_44_252",
+      "question": "H4 Projector Bulb,60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট-এ Low Beam আছে?"
+    },
+    {
+      "answer": "এতে Dual-Lens Magnifying Projector রয়েছে, যা শার্প Cut-off Line-সহ সুনির্দিষ্ট ও দূরগামী Headlight Beam তৈরি করে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359923_45_926",
+      "question": "60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট এর আলো কি চারদিকে ছড়িয়ে যায়?"
+    },
+    {
+      "answer": "এটি Projector Headlight-এর বিশেষ Red/Blue Devil's Eye Feature। লাইট অন করলে Projector Lens-এর ভেতরে Red বা Blue Glow তৈরি হয়।",
+      "category": "GENERAL",
+      "id": "faq_1790878359923_46_552",
+      "question": "H4 Projector Bulb-এ Red/Blue Devil Eye কেন দেখা যায়?"
+    },
+    {
+      "answer": "এটি Full Aluminum Alloy Body দিয়ে তৈরি এবং এতে 12,000/15,000 RPM High-Speed Turbo Silent Cooling Fan রয়েছে, যা উত্তাপ দ্রুত বের করে লাইট ঠাণ্ডা রাখে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359924_47_492",
+      "question": "H4 Projector Bulb কি বেশি গরম হয়?"
+    },
+    {
+      "answer": "LED Projector Headlight Chip-এর আয়ু প্রায় ৩০,০০০+ ঘণ্টা।",
+      "category": "GENERAL",
+      "id": "faq_1790878359924_48_103",
+      "question": "H4 Projector Bulb-এর Lifespan কত?"
+    },
+    {
+      "answer": "এতে Upgraded Canbus Ready Driver ব্যবহার করা হয়েছে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359924_49_705",
+      "question": "H4 Projector Bulb-এ Canbus আছে?"
+    },
+    {
+      "answer": "এতে Upgraded Canbus Ready Driver ব্যবহার করা হয়েছে, যা Dashboard Error Warning বা Light Flicker প্রতিরোধ করে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359924_50_848",
+      "question": "H4 Projector Bulb লাগালে Dashboard-এ Error দেখাবে?"
+    },
+    {
+      "answer": "জি, এটি IP68 Waterproof Rating-যুক্ত।\n🔹 Product Selection / Comparison-এর সম্ভাব্য প্রশ্ন",
+      "category": "GENERAL",
+      "id": "faq_1790878359924_51_355",
+      "question": "H4 Projector Bulb কি Waterproof?"
+    },
+    {
+      "answer": "আমাদের কাছে Angel Wings, 60W Red/Blue Devil Eye Headlight, 12 Lens Fog Light এবং 5 Lens Fog Light রয়েছে।",
+      "category": "GENERAL",
+      "id": "faq_1790878359925_52_465",
+      "question": "আপনারা কী কী লাইট বিক্রি করেন?"
+    },
+    {
+      "answer": "5 Lens Fog Light,৫ লেন্স ফগ লাইট এর দাম ৪৫০ টাকা পিস।",
+      "category": "GENERAL",
+      "id": "faq_1790878359925_53_469",
+      "question": "সবচেয়ে কম দামের প্রোডাক্ট কোনটি?"
+    },
+    {
+      "answer": "Angel Wings ৬৫০ টাকা জোড়া।",
+      "category": "GENERAL",
+      "id": "faq_1790878359925_54_564",
+      "question": "Angel Wings,মোটরসাইকেল এঞ্জেল উইংস,ডানা  লাইট এর দাম কত এবং কয়টি পাব?"
+    },
+    {
+      "answer": "12 Lens Fog Light,১২ লেন্স ফগ লাইট ৭৫০ টাকা পিস এবং 5 Lens Fog Light ৪৫০ টাকা পিস।",
+      "category": "GENERAL",
+      "id": "faq_1790878359925_55_550",
+      "question": "12 Lens আর 5 Lens Fog Light,৫ লেন্স ফগ লাইট এর দাম কত?"
     }
-  ],
-  "faqs": []
+  ]
 }
