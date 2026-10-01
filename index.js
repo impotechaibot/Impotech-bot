@@ -5,7 +5,7 @@
  *   gemini-3.1-flash-lite
  *
  * VOICE:
- *   gemini-3.8-flash
+ *   gemini-flash-latest
  *   Interactions API
  *
  * GitHub:
