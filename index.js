@@ -1,16 +1,21 @@
 /**
  * ==============================================================================
- * IMPOTECH AI ASSISTANT - COMPLETE PRODUCTION BACKEND
+ * IMPOTECH AI ASSISTANT - COMPLETE PRODUCTION BACKEND (WITH FULL APP SYNC)
  * ==============================================================================
  * Features strictly implemented as per all 17 requirements:
  * 1. Admin Dot (.) Human Takeover & (.on / .start) Resume
  * 2. Smart Billing Engine (Gazipur Inside: +50 TK, Gazipur Outside: +100 TK, COD Memo)
  * 3. OpenRouter Gemini AI Sales Engine (Multilingual Bangla/English/Banglish)
- * 4. Steadfast Courier 1-Click Parcel Booking API (/api/courier/book)
+ * 4. Steadfast Courier 1-Click Parcel Booking API (/api/courier/book & /api/v1/create_order)
  * 5. Meta Messenger & Make.com Webhooks (Live Echo Tracking & Graph API Sender)
- * 6. Product Catalog & Media Manager APIs (/api/catalog, /api/catalog/update)
- * 7. Android App Remote Takeover Control (/api/takeover/toggle)
- * 8. Server Health & Uptime Check (/health)
+ * 6. Android App Live Sync APIs:
+ *    - POST /api/training (Syncs products, faqs, delivery rules directly from App)
+ *    - GET /api/training
+ *    - GET /api/status
+ *    - POST /api/takeover
+ *    - GET /api/catalog, POST /api/catalog/update
+ * 7. Android App Remote Takeover Control (/api/takeover/toggle & /api/takeover)
+ * 8. Server Health & Uptime Check (/health & /)
  * 9. Gemini Multimodal Vision (Understands Customer Photos & Screenshots)
  * 10. Showroom Address: গাজীপুর, ভবানীপুর | WhatsApp: 01884332067
  * 11. Comprehensive FAQs & Cross-lingual intelligence
@@ -74,6 +79,20 @@ let productCatalog = [
   }
 ];
 
+let faqCatalog = [
+  {
+    question: "ডেলিভারি চার্জ কত?",
+    answer: "গাজীপুরের ভেতরে ডেলিভারি চার্জ ৫০ টাকা এবং গাজীপুরের বাইরে ১০০ টাকা।"
+  },
+  {
+    question: "দোকানের ঠিকানা কোথায়?",
+    answer: "আমাদের শোরুমের ঠিকানা: গাজীপুর, ভবানীপুর। WhatsApp: 01884332067"
+  }
+];
+
+let deliveryRulesList = [];
+let isGlobalHumanTakeoverActive = false;
+
 // In-Memory Fallback for Human Takeover State & Local History
 const humanTakeoverMap = new Map(); // customer_id -> { paused: boolean, pausedAt: number }
 const localMemoryMap = new Map(); // fallback if DB is not attached
@@ -86,7 +105,6 @@ if (DATABASE_URL) {
     ssl: { rejectUnauthorized: false }
   });
 
-  // Create Table if not exists
   dbPool.query(`
     CREATE TABLE IF NOT EXISTS conversation_history (
       id SERIAL PRIMARY KEY,
@@ -99,7 +117,7 @@ if (DATABASE_URL) {
     CREATE INDEX IF NOT EXISTS idx_customer_created ON conversation_history(customer_id, created_at);
   `).then(() => {
     console.log('[DATABASE] PostgreSQL conversation_history table ready.');
-    runAutoCleanup(); // Run cleanup on server boot
+    runAutoCleanup();
   }).catch(err => {
     console.error('[DATABASE INIT ERROR]', err.message);
   });
@@ -107,7 +125,7 @@ if (DATABASE_URL) {
   console.log('[DATABASE] Running in In-Memory mode. Attach PostgreSQL DATABASE_URL for permanent persistence.');
 }
 
-// --- 17. AUTO CLEANUP CRON / INTERVAL (Runs every 24 hours) ---
+// --- 17. AUTO CLEANUP CRON (Runs every 24 hours) ---
 async function runAutoCleanup() {
   if (!dbPool) return;
   try {
@@ -121,7 +139,6 @@ async function runAutoCleanup() {
     console.error('[AUTO CLEANUP ERROR]', e.message);
   }
 }
-// Schedule daily cleanup check (every 24 hours)
 setInterval(runAutoCleanup, 24 * 60 * 60 * 1000);
 
 // Helper: Save message to history
@@ -166,6 +183,7 @@ async function getCustomerRecentHistory(customerId, limit = 10) {
 
 // --- 1. HELPER: CHECK HUMAN TAKEOVER STATUS ---
 function isAiPausedForCustomer(customerId) {
+  if (isGlobalHumanTakeoverActive) return true;
   if (!humanTakeoverMap.has(customerId)) return false;
   const data = humanTakeoverMap.get(customerId);
   const twentyFourHours = 24 * 60 * 60 * 1000;
@@ -176,7 +194,115 @@ function isAiPausedForCustomer(customerId) {
   return data.paused;
 }
 
-// --- 5 & 8. META WEBHOOK VERIFICATION & HEALTH ENDPOINT ---
+// --- ROOT & STATUS ENDPOINTS ---
+app.get('/', (req, res) => {
+  res.send('Impotech AI Assistant & Automation Hub is Live!');
+});
+
+app.get('/api/status', (req, res) => {
+  res.json({
+    isOnline: true,
+    productsCount: productCatalog.length,
+    faqsCount: faqCatalog.length,
+    activeModel: 'google/gemini-2.0-flash-001'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'online',
+    app: 'Impotech AI Assistant',
+    retention_days: DATA_RETENTION_DAYS,
+    products_in_catalog: productCatalog.length,
+    faqs_in_catalog: faqCatalog.length
+  });
+});
+
+// --- 6. 🔄 ANDROID APP LIVE SYNC ENDPOINT (POST /api/training) ---
+app.post('/api/training', (req, res) => {
+  try {
+    const { products, faqs, deliveryRules, isHumanTakeoverGlobal } = req.body;
+    
+    if (Array.isArray(products)) {
+      productCatalog = products.map(p => ({
+        id: p.id || `prod_${Date.now()}`,
+        name: p.name || p.title || '',
+        price: Number(p.price || 0),
+        warranty: p.warranty || '',
+        description: p.description || '',
+        photo_url: p.photo_url || p.imageUrl || p.photoUrl || '',
+        video_url: p.video_url || p.videoUrl || ''
+      }));
+    }
+
+    if (Array.isArray(faqs)) {
+      faqCatalog = faqs;
+    }
+
+    if (Array.isArray(deliveryRules)) {
+      deliveryRulesList = deliveryRules;
+    }
+
+    if (typeof isHumanTakeoverGlobal === 'boolean') {
+      isGlobalHumanTakeoverActive = isHumanTakeoverGlobal;
+    }
+
+    console.log(`[TRAINING SYNCED] Successfully synced ${productCatalog.length} products & ${faqCatalog.length} FAQs from App.`);
+
+    res.json({
+      success: true,
+      message: "সফলভাবে এআই ট্রেইনিং ও প্রোডাক্ট ক্যাটালগ সিঙ্ক হয়েছে!",
+      count: productCatalog.length
+    });
+  } catch (err) {
+    console.error('[TRAINING SYNC ERROR]', err.message);
+    res.status(500).json({ success: false, message: `Sync failed: ${err.message}` });
+  }
+});
+
+app.get('/api/training', (req, res) => {
+  res.json({
+    products: productCatalog,
+    faqs: faqCatalog,
+    deliveryRules: deliveryRulesList,
+    isHumanTakeoverGlobal: isGlobalHumanTakeoverActive
+  });
+});
+
+// --- 7. ANDROID APP TAKEOVER ENDPOINTS ---
+app.post('/api/takeover', (req, res) => {
+  const { isGlobal, enabled, pause, customerId } = req.body;
+  if (typeof isGlobal === 'boolean') {
+    isGlobalHumanTakeoverActive = isGlobal;
+  }
+  if (typeof enabled === 'boolean') {
+    isGlobalHumanTakeoverActive = enabled;
+  }
+  if (customerId) {
+    if (pause) {
+      humanTakeoverMap.set(customerId, { paused: true, pausedAt: Date.now() });
+    } else {
+      humanTakeoverMap.delete(customerId);
+    }
+  }
+  res.json({ success: true, isGlobalHumanTakeoverActive });
+});
+
+app.post('/api/takeover/toggle', (req, res) => {
+  const { customerId, pause } = req.body;
+  if (!customerId) return res.status(400).json({ success: false, message: "customerId is required" });
+
+  if (pause) {
+    humanTakeoverMap.set(customerId, { paused: true, pausedAt: Date.now() });
+    console.log(`[APP TAKEOVER] AI paused for customer: ${customerId}`);
+  } else {
+    humanTakeoverMap.delete(customerId);
+    console.log(`[APP TAKEOVER] AI resumed for customer: ${customerId}`);
+  }
+  res.json({ success: true, isPaused: pause, customerId });
+});
+
+// --- 5. META WEBHOOK VERIFICATION (GET) ---
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -190,16 +316,7 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'online',
-    app: 'Impotech AI Assistant',
-    retention_days: DATA_RETENTION_DAYS,
-    products_in_catalog: productCatalog.length
-  });
-});
-
-// --- 1, 5, 9, 15, 16. LIVE META / MAKE.COM WEBHOOK EVENT HANDLER ---
+// --- 1, 5, 9, 15, 16. LIVE META / MAKE.COM WEBHOOK EVENT HANDLER (POST) ---
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
@@ -212,14 +329,11 @@ app.post('/webhook', async (req, res) => {
         const senderId = webhook_event.sender.id;
         const recipientId = webhook_event.recipient.id;
 
-        // -------------------------------------------------------------
         // A. 🛑 1. ADMIN HUMAN TAKEOVER (MESSAGE ECHOES WITH DOT)
-        // -------------------------------------------------------------
         if (webhook_event.message && webhook_event.message.is_echo) {
           const adminText = (webhook_event.message.text || '').trim();
           console.log(`[ADMIN ECHO] Admin sent to ${recipientId}: "${adminText}"`);
 
-          // Only triggers when ADMIN sends dot or commands
           if (adminText.startsWith('.') || adminText.includes('.') || adminText === '..') {
             if (['.on', '.start', '.ai', '.open', '.resume'].includes(adminText.toLowerCase())) {
               humanTakeoverMap.delete(recipientId);
@@ -229,16 +343,13 @@ app.post('/webhook', async (req, res) => {
               console.log(`[TAKEOVER] AI PAUSED (Human Takeover) for customer: ${recipientId}`);
             }
           }
-          continue; // Do not trigger AI reply on echo
+          continue;
         }
 
-        // -------------------------------------------------------------
-        // B. 📩 CUSTOMER INCOMING MESSAGE (TEXT, VOICE OR IMAGE/SCREENSHOT)
-        // -------------------------------------------------------------
+        // B. 📩 CUSTOMER INCOMING MESSAGE (TEXT OR IMAGE/SCREENSHOT)
         if (webhook_event.message) {
           const customerText = webhook_event.message.text || '';
           
-          // 9. Extract customer image / screenshot if sent
           let imageUrl = null;
           if (webhook_event.message.attachments && webhook_event.message.attachments.length > 0) {
             const att = webhook_event.message.attachments[0];
@@ -250,29 +361,21 @@ app.post('/webhook', async (req, res) => {
 
           console.log(`[CUSTOMER MESSAGE] From ${senderId}: "${customerText}" (Image: ${!!imageUrl})`);
 
-          // 1. Check if AI is paused for this customer
           if (isAiPausedForCustomer(senderId)) {
             console.log(`[AI BLOCKED] Customer ${senderId} is in Human Takeover. AI will not reply.`);
             continue;
           }
 
-          // 16. Save customer message to history
           await saveMessageToMemory(senderId, 'user', customerText || '[Customer sent image/screenshot]', imageUrl);
 
-          // Retrieve previous conversation context
           const previousHistory = await getCustomerRecentHistory(senderId, 8);
 
-          // 3, 9, 11, 12, 15. Generate AI Reply with Memory & Auto-Retry
           const aiResponseData = await generateAiReplyWithRetry(customerText, imageUrl, previousHistory);
 
           if (aiResponseData && PAGE_ACCESS_TOKEN) {
-            // Save AI reply to memory
             await saveMessageToMemory(senderId, 'assistant', aiResponseData.replyText);
-
-            // Send Text Reply to Messenger
             await sendMessengerTextMessage(senderId, aiResponseData.replyText);
 
-            // 15. Send Media (Photo/Video) Attachment if requested and available
             if (aiResponseData.mediaUrlToSend) {
               await sendMessengerMedia(senderId, aiResponseData.mediaTypeToSend, aiResponseData.mediaUrlToSend);
             }
@@ -309,6 +412,7 @@ BUSINESS & SHOP DETAILS:
 - Delivery Outside Gazipur: ${SHOP_INFO.delivery_outside_gazipur} BDT
 - Payment: 100% Cash on Delivery (COD) - কোনো অগ্রিম টাকা লাগবে না।
 - Products in Stock: ${JSON.stringify(productCatalog)}
+- Frequently Asked Questions (FAQs): ${JSON.stringify(faqCatalog)}
 
 CORE INSTRUCTIONS:
 1. 🧮 SMART BILLING & CALCULATIONS (CRITICAL):
@@ -342,10 +446,8 @@ CORE INSTRUCTIONS:
    - If asked in English or Banglish, reply in the same language.
    - Always end with helpful next steps or offering WhatsApp (${SHOP_INFO.whatsapp}) for direct help.`;
 
-    // Construct Messages Array with History Context
     const messages = [{ role: 'system', content: systemPrompt }];
 
-    // Inject Recent History
     if (Array.isArray(conversationHistory)) {
       for (const hist of conversationHistory) {
         if (hist.role === 'user') {
@@ -356,7 +458,6 @@ CORE INSTRUCTIONS:
       }
     }
 
-    // Build Current User Message (Multimodal support)
     let currentContent = [];
     if (userPrompt && userPrompt.trim().length > 0) {
       currentContent.push({ type: 'text', text: userPrompt });
@@ -373,7 +474,6 @@ CORE INSTRUCTIONS:
 
     messages.push({ role: 'user', content: currentContent });
 
-    // Call OpenRouter Gemini API
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
@@ -391,7 +491,6 @@ CORE INSTRUCTIONS:
 
     const replyText = response.data.choices[0].message.content;
 
-    // Check if media URL should be attached
     let mediaUrlToSend = null;
     let mediaTypeToSend = 'image';
 
@@ -419,14 +518,12 @@ CORE INSTRUCTIONS:
   } catch (err) {
     console.error(`[OPENROUTER ATTEMPT ${attempt} FAILED]:`, err.response?.data || err.message);
 
-    // 12. Auto Retry Mechanism: Wait 3-4 seconds and retry up to 3 times
     if (attempt < MAX_ATTEMPTS) {
       console.log(`[RETRY] Waiting 3.5s before attempt ${attempt + 1}...`);
       await new Promise(r => setTimeout(r, 3500));
       return await generateAiReplyWithRetry(userPrompt, imageUrl, conversationHistory, attempt + 1);
     }
 
-    // Polite fallback if all attempts fail
     return {
       replyText: `ধন্যবাদ ভাইয়া! সাময়িক প্রযুক্তিগত সমস্যার কারণে একটু বিলম্ব হচ্ছে। আমাদের শোরুম: ${SHOP_INFO.address}, WhatsApp: ${SHOP_INFO.whatsapp}। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন অথবা সরাসরি WhatsApp-এ মেসেজ দিন। ধন্যবাদ! ❤️`
     };
@@ -483,7 +580,7 @@ app.post('/api/courier/book', async (req, res) => {
     }
 
     const response = await axios.post(
-      'https://portal.steadfast.com.bd/api/v1/create_order',
+      'https://portal.packzy.com/api/v1/create_order',
       {
         invoice: invoice || `INV-${Date.now()}`,
         recipient_name,
@@ -508,7 +605,27 @@ app.post('/api/courier/book', async (req, res) => {
   }
 });
 
-// --- 6 & 13. 📦 PRODUCT CATALOG & MEDIA MANAGER APIS ---
+// Backward compatibility for Steadfast create_order
+app.post('/api/v1/create_order', async (req, res) => {
+  try {
+    const response = await axios.post(
+      'https://portal.packzy.com/api/v1/create_order',
+      req.body,
+      {
+        headers: {
+          'Api-Key': STEADFAST_API_KEY,
+          'Secret-Key': STEADFAST_SECRET_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// --- 6. CATALOG APIS ---
 app.get('/api/catalog', (req, res) => {
   res.json({ success: true, catalog: productCatalog });
 });
@@ -517,25 +634,9 @@ app.post('/api/catalog/update', (req, res) => {
   const { catalog } = req.body;
   if (Array.isArray(catalog)) {
     productCatalog = catalog;
-    console.log(`[CATALOG UPDATED] Catalog now has ${productCatalog.length} items.`);
     return res.json({ success: true, message: "Catalog updated successfully", count: productCatalog.length });
   }
-  res.status(400).json({ success: false, message: "Invalid catalog format. Must be an array." });
-});
-
-// --- 7. 📱 MANUAL TAKEOVER TOGGLE API (FROM ANDROID APP) ---
-app.post('/api/takeover/toggle', (req, res) => {
-  const { customerId, pause } = req.body;
-  if (!customerId) return res.status(400).json({ success: false, message: "customerId is required" });
-
-  if (pause) {
-    humanTakeoverMap.set(customerId, { paused: true, pausedAt: Date.now() });
-    console.log(`[APP TAKEOVER] AI paused for customer: ${customerId}`);
-  } else {
-    humanTakeoverMap.delete(customerId);
-    console.log(`[APP TAKEOVER] AI resumed for customer: ${customerId}`);
-  }
-  res.json({ success: true, isPaused: pause, customerId });
+  res.status(400).json({ success: false, message: "Invalid catalog format" });
 });
 
 // --- START SERVER ---
