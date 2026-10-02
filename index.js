@@ -1,589 +1,338 @@
 /**
- * ImpoTech Bd - Smart Messenger AI Assistant (OpenRouter Edition)
- * Models: Gemini 3.5 Flash / Gemini 3.1 Flash-Lite
- * Features: PostgreSQL Memory, Auto Cleanup, Steadfast Courier, Vision AI,
- * Human Takeover, Media Sync & Dynamic Catalog Indexing.
+ * ==============================================================================
+ * IMPOTECH AI ASSISTANT - PRODUCTION BACKEND (WITH APP SYNC & VISION AI)
+ * ==============================================================================
  */
 
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
+const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
 
-// =========================
-// ENVIRONMENT VARIABLES
-// =========================
-const PORT = process.env.PORT || 10000;
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'impotech_secure_token';
+const PORT = process.env.PORT || 3000;
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const TEXT_MODEL = process.env.OPENROUTER_TEXT_MODEL || 'google/gemini-3.5-flash';
-const VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || 'google/gemini-3.5-flash';
+// Flexible OpenRouter API Key Detection
+const OPENROUTER_API_KEY = (
+  process.env.OPENROUTER_API_KEY ||
+  process.env.OPEN_ROUTER_API_KEY ||
+  process.env.OPENROUTER_KEY ||
+  process.env.OPENROUTER_TOKEN ||
+  process.env.GEMINI_API_KEY ||
+  ''
+).trim();
 
-const STEADFAST_API_KEY = process.env.STEADFAST_API_KEY;
-const STEADFAST_SECRET_KEY = process.env.STEADFAST_SECRET_KEY;
+// Models
+const DEFAULT_TEXT_MODEL = (
+  process.env.OPENROUTER_TEXT_MODEL ||
+  process.env.OPENROUTER_MODEL ||
+  process.env.AI_MODEL ||
+  'google/gemini-3.5-flash-001'
+).trim();
 
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_REPO = process.env.GITHUB_REPO || 'impotechaibot/Impotech-bot';
-const CATALOG_FILE = 'catalog.json';
+const DEFAULT_VISION_MODEL = (
+  process.env.OPENROUTER_VISION_MODEL ||
+  process.env.OPENROUTER_MODEL ||
+  process.env.AI_MODEL ||
+  'google/gemini-3.5-flash-001'
+).trim();
 
+const STEADFAST_API_KEY = (process.env.STEADFAST_API_KEY || '').trim();
+const STEADFAST_SECRET_KEY = (process.env.STEADFAST_SECRET_KEY || '').trim();
+const PAGE_ACCESS_TOKEN = (process.env.PAGE_ACCESS_TOKEN || '').trim();
+const VERIFY_TOKEN = (process.env.VERIFY_TOKEN || 'impotech_secure_token').trim();
+const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
 const DATA_RETENTION_DAYS = parseInt(process.env.DATA_RETENTION_DAYS || '20', 10);
 
-// =========================
-// POSTGRESQL DATABASE SETUP
-// =========================
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('localhost') 
-    ? { rejectUnauthorized: false } 
-    : false,
-});
+console.log(`[CONFIG] OPENROUTER_API_KEY: ${OPENROUTER_API_KEY ? '✅ FOUND' : '❌ MISSING (401 RISK)'}`);
+console.log(`[CONFIG] Models: Text=${DEFAULT_TEXT_MODEL} | Vision=${DEFAULT_VISION_MODEL}`);
 
-async function initDB() {
+// Shop Info
+const SHOP_INFO = {
+  name: "Impotech BD",
+  address: "গাজীপুর, ভবানীপুর",
+  whatsapp: "01884332067",
+  delivery_inside_gazipur: 50,
+  delivery_outside_gazipur: 100,
+  payment_method: "100% Cash on Delivery (COD) - কোনো অগ্রিম টাকা লাগবে না"
+};
+
+// Disk Catalogs
+const CATALOG_FILE_PATH = path.join(__dirname, 'catalog.json');
+const FAQS_FILE_PATH = path.join(__dirname, 'faqs.json');
+let productCatalog = [];
+let faqCatalog = [];
+let deliveryRulesList = [];
+let isGlobalHumanTakeoverActive = false;
+
+function loadCatalogFromDisk() {
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS conversations (
-        id SERIAL PRIMARY KEY,
-        psid VARCHAR(100) NOT NULL,
-        role VARCHAR(20) NOT NULL,
-        message TEXT NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE INDEX IF NOT EXISTS idx_psid_created ON conversations(psid, created_at);
-    `);
-    console.log('[DB] PostgreSQL initialized successfully.');
+    if (fs.existsSync(CATALOG_FILE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(CATALOG_FILE_PATH, 'utf8'));
+      if (Array.isArray(data)) productCatalog = data;
+      else if (data.products && Array.isArray(data.products)) productCatalog = data.products;
+    }
+    if (fs.existsSync(FAQS_FILE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(FAQS_FILE_PATH, 'utf8'));
+      if (Array.isArray(data)) faqCatalog = data;
+    }
   } catch (err) {
-    console.error('[DB Init Error]', err.message);
+    console.error('[LOAD CATALOG ERROR]', err.message);
   }
 }
-initDB();
+loadCatalogFromDisk();
 
-// =========================
-// IN-MEMORY STATE & INDEX
-// =========================
-let products = [];
-let faqs = [];
-let catalogIndex = new Map(); // Dynamic Indexing
-const pausedCustomers = new Set();
-
-// =========================
-// HELPER FUNCTIONS
-// =========================
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function normalizeText(value = '') {
-  return String(value)
-    .toLowerCase()
-    .normalize('NFKC')
-    .replace(/[^\p{L}\p{N}\s৳$.-]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function tokenize(value = '') {
-  return normalizeText(value)
-    .split(/\s+/)
-    .filter(word => word.length >= 2);
-}
-
-function isValidHttpUrl(url) {
+function saveCatalogToDisk() {
   try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  } catch {
+    fs.writeFileSync(CATALOG_FILE_PATH, JSON.stringify(productCatalog, null, 2), 'utf8');
+    fs.writeFileSync(FAQS_FILE_PATH, JSON.stringify(faqCatalog, null, 2), 'utf8');
+    console.log(`[CATALOG SAVED] ${productCatalog.length} products & ${faqCatalog.length} FAQs saved.`);
+  } catch (err) {
+    console.error('[SAVE CATALOG ERROR]', err.message);
+  }
+}
+
+// Memory & Takeover
+const humanTakeoverMap = new Map();
+const localMemoryMap = new Map();
+
+function isAiPausedForCustomer(customerId) {
+  if (isGlobalHumanTakeoverActive) return true;
+  if (!humanTakeoverMap.has(customerId)) return false;
+  const data = humanTakeoverMap.get(customerId);
+  if (Date.now() - data.pausedAt > 24 * 60 * 60 * 1000) {
+    humanTakeoverMap.delete(customerId);
     return false;
   }
+  return data.paused;
 }
 
-// =========================
-// INDEX & CATALOG MANAGER
-// =========================
-function rebuildCatalogIndex() {
-  catalogIndex.clear();
-  
-  products.forEach(p => {
-    const keywords = [
-      p.name, p.brand, p.model, p.sku, p.category, 
-      ...(Array.isArray(p.keywords) ? p.keywords : [])
-    ];
-    keywords.forEach(kw => {
-      if (kw) {
-        const tokens = tokenize(kw);
-        tokens.forEach(token => {
-          if (!catalogIndex.has(token)) catalogIndex.set(token, new Set());
-          catalogIndex.get(token).add(p);
-        });
-      }
+// -------------------------------------------------------------
+// 🚀 অ্যাপ সিঙ্ক এন্ডপয়েন্ট (যা মিসিং থাকার কারণে ৪০৪ আসছিল)
+// -------------------------------------------------------------
+app.post('/api/training', (req, res) => {
+  try {
+    const { products, faqs, deliveryRules, isHumanTakeoverGlobal } = req.body;
+    
+    if (Array.isArray(products)) {
+      productCatalog = products.map(p => ({
+        id: p.id || `prod_${Date.now()}`,
+        name: p.name || p.title || '',
+        price: Number(p.price || 0),
+        warranty: p.warranty || '',
+        description: p.description || '',
+        photo_url: p.photo_url || p.fileUri || p.imageUrl || '',
+        video_url: p.video_url || p.videoUrl || ''
+      }));
+    }
+
+    if (Array.isArray(faqs)) {
+      faqCatalog = faqs;
+    }
+
+    if (typeof isHumanTakeoverGlobal === 'boolean') {
+      isGlobalHumanTakeoverActive = isHumanTakeoverGlobal;
+    }
+
+    saveCatalogToDisk();
+
+    res.json({
+      success: true,
+      message: "সফলভাবে ক্যাটালগ ও এআই ট্রেইনিং সিঙ্ক হয়েছে!",
+      productsCount: productCatalog.length,
+      faqsCount: faqCatalog.length
     });
-  });
-  console.log(`[INDEX] Catalog index updated with ${catalogIndex.size} active tokens.`);
-}
-
-function searchCatalog(query) {
-  const tokens = tokenize(query);
-  if (!tokens.length) return products.slice(0, 3);
-
-  const productScores = new Map();
-
-  tokens.forEach(token => {
-    if (catalogIndex.has(token)) {
-      catalogIndex.get(token).forEach(product => {
-        const currentScore = productScores.get(product) || 0;
-        productScores.set(product, currentScore + 10);
-      });
-    }
-  });
-
-  products.forEach(p => {
-    const normName = normalizeText(p.name || '');
-    const normQuery = normalizeText(query);
-    if (normName.includes(normQuery)) {
-      const current = productScores.get(p) || 0;
-      productScores.set(p, current + 25);
-    }
-  });
-
-  return Array.from(productScores.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(entry => entry[0]);
-}
-
-// =========================
-// GITHUB CATALOG SYNC
-// =========================
-async function githubRequest(method, url, data = undefined) {
-  return axios({
-    method,
-    url,
-    data,
-    headers: {
-      Authorization: `Bearer ${GITHUB_TOKEN}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(data !== undefined ? { 'Content-Type': 'application/json' } : {})
-    },
-    timeout: 15000
-  });
-}
-
-async function pullCatalogFromGitHub() {
-  if (!GITHUB_TOKEN) return false;
-  try {
-    const url = `https://api.github.com/repos/${GITHUB_REPO}/contents/${CATALOG_FILE}`;
-    const response = await githubRequest('GET', url);
-    const json = JSON.parse(Buffer.from(response.data.content, 'base64').toString('utf8'));
-
-    products = Array.isArray(json.products) ? json.products : [];
-    faqs = Array.isArray(json.faqs) ? json.faqs : [];
-
-    rebuildCatalogIndex();
-    console.log(`[GITHUB] Catalog loaded: ${products.length} Products, ${faqs.length} FAQs`);
-    return true;
-  } catch (error) {
-    console.error('[GITHUB] Pull Error:', error.message);
-    return false;
-  }
-}
-
-async function syncCatalogToGitHub() {
-  if (!GITHUB_TOKEN) return false;
-  try {
-    const url = `https://api.github.com/repos/${GITHUB_REPO}/contents/${CATALOG_FILE}`;
-    const getResp = await githubRequest('GET', url);
-    const content = Buffer.from(JSON.stringify({ products, faqs }, null, 2)).toString('base64');
-
-    await githubRequest('PUT', url, {
-      message: 'Update catalog.json via API',
-      content,
-      sha: getResp.data.sha
-    });
-
-    rebuildCatalogIndex();
-    return true;
-  } catch (error) {
-    console.error('[GITHUB] Sync Error:', error.message);
-    return false;
-  }
-}
-
-pullCatalogFromGitHub();
-
-// =========================
-// POSTGRES MEMORY SERVICE
-// =========================
-async function saveConversation(psid, role, message) {
-  try {
-    await pool.query(
-      'INSERT INTO conversations (psid, role, message) VALUES ($1, $2, $3)',
-      [psid, role, message]
-    );
   } catch (err) {
-    console.error('[DB Save Error]', err.message);
-  }
-}
-
-async function getRecentConversation(psid, limit = 6) {
-  try {
-    const res = await pool.query(
-      'SELECT role, message FROM conversations WHERE psid = $1 ORDER BY created_at DESC LIMIT $2',
-      [psid, limit]
-    );
-    return res.rows.reverse();
-  } catch (err) {
-    console.error('[DB Fetch Error]', err.message);
-    return [];
-  }
-}
-
-// Auto Cleanup Routine (20 days old data)
-async function autoCleanupDB() {
-  try {
-    const result = await pool.query(
-      `DELETE FROM conversations WHERE created_at < NOW() - INTERVAL '${DATA_RETENTION_DAYS} days'`
-    );
-    console.log(`[DB CLEANUP] Automatically deleted ${result.rowCount} records older than ${DATA_RETENTION_DAYS} days.`);
-  } catch (err) {
-    console.error('[DB Cleanup Error]', err.message);
-  }
-}
-setInterval(autoCleanupDB, 24 * 60 * 60 * 1000);
-
-// =========================
-// OPENROUTER AI ENGINE (WITH RETRY & MODEL SWITCHING)
-// =========================
-async function callOpenRouterWithRetry(messages, modelName = TEXT_MODEL, retries = 3) {
-  const url = 'https://openrouter.ai/api/v1/chat/completions';
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      console.log(`[OPENROUTER API] Calling model: ${modelName} (Attempt ${attempt})`);
-      const response = await axios.post(
-        url,
-        {
-          model: modelName,
-          messages,
-          max_tokens: 350,
-          temperature: 0.3
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-            'HTTP-Referer': 'https://impotechbd.com',
-            'X-Title': 'ImpoTech AI Assistant',
-            'Content-Type': 'application/json'
-          },
-          timeout: 25000
-        }
-      );
-
-      const reply = response.data?.choices?.[0]?.message?.content?.trim();
-      if (reply) return reply;
-    } catch (err) {
-      console.error(`[OPENROUTER API ERR - Attempt ${attempt}/${retries}]:`, err.response?.data || err.message);
-      if (attempt < retries) await sleep(3500); // 3.5 sec delay before retry
-    }
-  }
-
-  return 'সাময়িক প্রযুক্তিগত সমস্যা হচ্ছে, অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।';
-}
-
-function buildSystemPrompt(relevantProducts, historyText) {
-  const productText = relevantProducts.map(p => 
-    `পণ্য: ${p.name} | মূল্য: ${p.price} টাকা | ওয়ারেন্টি: ${p.warranty || 'N/A'} | বিবরণ: ${p.description || 'N/A'}`
-  ).join('\n');
-
-  return `
-তুমি ImpoTech Bd-এর Facebook Messenger Sales & Support Assistant।
-
-📍 ব্যবসার বিবরণ ও শোরুমের তথ্য:
-- শোরুম/দোকানের ঠিকানা: গাজীপুর, ভবানীপুর।
-- WhatsApp: 01884332067 (যেকোনো তথ্যের জন্য WhatsApp-এ যোগাযোগ করতে বলবে)।
-
-🧮 অটোমেটিক বিল ও ডেলিভারি হিসাব নিয়ম:
-- গাজীপুর শহরের ভেতরে: পণ্যের মোট দাম + ৫০ টাকা ডেলিভারি চার্জ।
-- গাজীপুর শহরের বাইরে: পণ্যের মোট দাম + ১০০ টাকা ডেলিভারি চার্জ।
-- একাধিক প্রোডাক্ট হলে: (পণ্যের দাম × সংখ্যা) + ডেলিভারি চার্জ = মোট বিল।
-- ক্যাশ অন ডেলিভারি (COD): কাস্টমারকে স্পট বিল/মেমো আকারে পরিষ্কার জানাবে: "কোনো অগ্রিম টাকা লাগবে না, ডেলিভারিম্যান পৌঁছালে মোট টাকা পরিশোধ করবেন।"
-
-📜 সাধারণ নিয়মাবলী:
-১. শুধুমাত্র দেওয়া ক্যাটালগ ও FAQ থেকে সঠিক দাম ও স্পেসিফিকেশন বলবে। নিজের থেকে দাম বানিয়ে বলবে না।
-২. কাস্টমার কিনতে চাইলে তার নাম, মোবাইল নম্বর এবং সম্পূর্ণ ঠিকানা আনন্দের সাথে চেয়ে নেবে।
-৩. কাস্টমার বাংলা, ইংরেজি বা বাংলিশে কথা বললে সেই ভাষাতেই সুন্দর ও সাবলীল উত্তর দেবে।
-৪. উত্তর সংক্ষিপ্ত, স্পষ্ট ও ফ্রেন্ডলি রাখবে (২-৪ বাক্য)।
-
-প্রাসঙ্গিক পণ্যসমূহ:
-${productText || 'ক্যাটালগে নির্দিষ্ট পণ্য খুঁজে পাওয়া যায়নি।'}
-
-পূর্ববর্তী কথোপকথন মেমোরি:
-${historyText || 'কোনো পূর্ববর্তী কনভারসেশন নেই।'}
-`.trim();
-}
-
-// =========================
-// META MESSENGER API
-// =========================
-async function sendMessengerText(recipientId, text) {
-  if (!PAGE_ACCESS_TOKEN) return;
-  try {
-    await axios.post(
-      'https://graph.facebook.com/v23.0/me/messages',
-      { recipient: { id: recipientId }, message: { text } },
-      { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 15000 }
-    );
-  } catch (err) {
-    console.error('[MESSENGER SEND ERR]', err.response?.data || err.message);
-  }
-}
-
-async function sendMessengerMedia(recipientId, type, url) {
-  if (!PAGE_ACCESS_TOKEN || !isValidHttpUrl(url)) return false;
-  try {
-    await axios.post(
-      'https://graph.facebook.com/v23.0/me/messages',
-      {
-        recipient: { id: recipientId },
-        message: {
-          attachment: { type, payload: { url, is_reusable: true } }
-        }
-      },
-      { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 15000 }
-    );
-    return true;
-  } catch (err) {
-    console.error('[MEDIA SEND ERR]', err.message);
-    return false;
-  }
-}
-
-function checkMediaRequestAndSend(senderId, text, matchedProducts) {
-  const norm = normalizeText(text);
-  const mediaKeywords = ['ছবি', 'পিক', 'ভিডিও', 'photo', 'picture', 'image', 'video', 'শো'];
-  const isAskingMedia = mediaKeywords.some(kw => norm.includes(kw));
-
-  if (isAskingMedia && matchedProducts.length > 0) {
-    const p = matchedProducts[0];
-    if (norm.includes('ভিডিও') && p.video_url) {
-      sendMessengerMedia(senderId, 'video', p.video_url);
-    } else if (p.image_url) {
-      sendMessengerMedia(senderId, 'image', p.image_url);
-    }
-  }
-}
-
-// =========================
-// WEBHOOK HANDLING
-// =========================
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  if (mode && token === VERIFY_TOKEN) {
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
+    res.status(500).json({ success: false, message: `Sync failed: ${err.message}` });
   }
 });
 
-app.post('/webhook', async (req, res) => {
-  res.status(200).send('EVENT_RECEIVED');
-
-  const body = req.body;
-  if (body.object !== 'page') return;
-
-  for (const entry of body.entry) {
-    const webhookEvent = entry.messaging?.[0];
-    if (!webhookEvent) continue;
-
-    const senderId = webhookEvent.sender.id;
-    const message = webhookEvent.message;
-
-    if (!message) continue;
-
-    // 1. 🛑 Admin Human Takeover Check (. dot command)
-    if (webhookEvent.is_echo) {
-      const adminText = message.text?.trim();
-      if (adminText === '.') {
-        pausedCustomers.add(senderId);
-        console.log(`[TAKEOVER] AI PAUSED for PSID: ${senderId}`);
-      } else if (adminText === '.on' || adminText === '.start') {
-        pausedCustomers.delete(senderId);
-        console.log(`[TAKEOVER] AI RESUMED for PSID: ${senderId}`);
-      }
-      continue;
-    }
-
-    if (pausedCustomers.has(senderId)) continue;
-
-    const history = await getRecentConversation(senderId, 6);
-    const historyFormatted = history.map(h => `${h.role}: ${h.message}`).join('\n');
-
-    // 2. 👁️ Image / Gemini Vision Request
-    const imageAttachment = message.attachments?.find(a => a.type === 'image');
-    if (imageAttachment) {
-      const imageUrl = imageAttachment.payload.url;
-      await saveConversation(senderId, 'customer', '[Sent an Image]');
-
-      const visionPrompt = `
-তুমি ImpoTech Bd-এর AI Vision System। 
-কাস্টমারের পাঠানো ছবিটি দেখে আমাদের ক্যাটালগ থেকে সঠিক পণ্যটি চিনে নাও।
-পণ্যের নাম, নিখুঁত দাম, বৈশিষ্ট্য, ওয়ারেন্টি এবং ডেলিভারি চার্জ (গাজীপুর ৫০ টাকা, বাইরে ১০০ টাকা) সহ সুন্দরভাবে উত্তর দাও।
-শোরুম: গাজীপুর, ভবানীপুর | WhatsApp: 01884332067।
-      `.trim();
-
-      const messages = [
-        { role: 'system', content: visionPrompt },
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: 'এই ছবিটি দেখে পণ্যটি শনাক্ত করো এবং বিবরণ দাও।' },
-            { type: 'image_url', image_url: { url: imageUrl } }
-          ]
-        }
-      ];
-
-      const aiReply = await callOpenRouterWithRetry(messages, VISION_MODEL);
-      await sendMessengerText(senderId, aiReply);
-      await saveConversation(senderId, 'assistant', aiReply);
-      continue;
-    }
-
-    // 3. 💬 Text Message Handling
-    if (message.text) {
-      const userText = message.text;
-      await saveConversation(senderId, 'customer', userText);
-
-      const matchedProducts = searchCatalog(userText);
-      const systemPrompt = buildSystemPrompt(matchedProducts, historyFormatted);
-
-      const messages = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userText }
-      ];
-
-      const aiReply = await callOpenRouterWithRetry(messages, TEXT_MODEL);
-      await sendMessengerText(senderId, aiReply);
-      await saveConversation(senderId, 'assistant', aiReply);
-
-      checkMediaRequestAndSend(senderId, userText, matchedProducts);
-    }
-  }
-});
-
-// =========================
-// API ENDPOINTS
-// =========================
-
-// 4. 🚚 Steadfast Courier 1-Click Booking
-app.post('/api/courier/book', async (req, res) => {
-  const { invoice, recipient_name, recipient_phone, recipient_address, cod_amount, note } = req.body;
-
-  if (!STEADFAST_API_KEY || !STEADFAST_SECRET_KEY) {
-    return res.status(500).json({ success: false, message: 'Steadfast credentials missing.' });
-  }
-
-  try {
-    const response = await axios.post(
-      'https://portal.steadfast.com.bd/api/v1/create_order',
-      {
-        invoice,
-        recipient_name,
-        recipient_phone,
-        recipient_address,
-        cod_amount,
-        note: note || 'Deliver carefully by ImpoTech'
-      },
-      {
-        headers: {
-          'Api-Key': STEADFAST_API_KEY,
-          'Secret-Key': STEADFAST_SECRET_KEY,
-          'Content-Type': 'application/json'
-        },
-        timeout: 15000
-      }
-    );
-
-    res.json({ success: true, data: response.data });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.response?.data || error.message
-    });
-  }
-});
-
-// 6 & 13. 📦 Catalog GET & UPDATE Endpoint
-app.get('/api/catalog', (req, res) => {
-  res.json({ products, faqs });
-});
-
-app.post('/api/catalog/update', async (req, res) => {
-  const { products: newProducts, faqs: newFaqs } = req.body;
-
-  if (Array.isArray(newProducts)) products = newProducts;
-  if (Array.isArray(newFaqs)) faqs = newFaqs;
-
-  rebuildCatalogIndex();
-  const synced = await syncCatalogToGitHub();
-
+app.get('/api/training', (req, res) => {
+  loadCatalogFromDisk();
   res.json({
-    success: true,
-    message: 'Catalog updated and dynamic index rebuilt successfully.',
-    github_synced: synced,
-    total_products: products.length
+    products: productCatalog,
+    faqs: faqCatalog,
+    deliveryRules: deliveryRulesList,
+    isHumanTakeoverGlobal: isGlobalHumanTakeoverActive
   });
 });
 
-// 7. 📱 Android App Remote Control Sync API
-app.post('/api/takeover/toggle', (req, res) => {
-  const { psid, pause } = req.body;
-  if (!psid) return res.status(400).json({ success: false, message: 'PSID required' });
-
-  if (pause) {
-    pausedCustomers.add(psid);
-  } else {
-    pausedCustomers.delete(psid);
-  }
-
+app.get('/api/status', (req, res) => {
+  loadCatalogFromDisk();
   res.json({
-    success: true,
-    psid,
-    is_paused: pausedCustomers.has(psid)
+    isOnline: true,
+    hasOpenRouterKey: !!OPENROUTER_API_KEY,
+    productsCount: productCatalog.length,
+    faqsCount: faqCatalog.length
   });
 });
 
-// 8. 🩺 Server Health Check
-app.get('/health', async (req, res) => {
-  let dbStatus = 'Disconnected';
-  try {
-    await pool.query('SELECT 1');
-    dbStatus = 'Connected';
-  } catch (e) {
-    dbStatus = 'Error: ' + e.message;
-  }
-
-  res.json({
+app.get('/health', (req, res) => {
+  loadCatalogFromDisk();
+  res.status(200).json({
     status: 'Healthy',
-    uptime: process.uptime(),
-    database: dbStatus,
-    text_model: TEXT_MODEL,
-    vision_model: VISION_MODEL,
-    active_products: products.length,
-    active_index_tokens: catalogIndex.size,
-    paused_customers: pausedCustomers.size
+    hasOpenRouterKey: !!OPENROUTER_API_KEY,
+    products: productCatalog.length,
+    faqs: faqCatalog.length
   });
 });
 
 app.get('/', (req, res) => {
-  res.send('ImpoTech Bd AI Engine (Gemini 3.5 & 3.1 OpenRouter) is Running 🚀');
+  res.send('ImpoTech Bd AI Engine is Online & Running! 🚀');
 });
 
+// Webhook for Messenger
+app.get('/webhook', (req, res) => {
+  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) {
+    res.status(200).send(req.query['hub.challenge']);
+  } else res.sendStatus(403);
+});
+
+app.post('/webhook', async (req, res) => {
+  try {
+    const body = req.body;
+    if (body.object === 'page') {
+      for (const entry of body.entry) {
+        const event = entry.messaging ? entry.messaging[0] : null;
+        if (!event) continue;
+
+        const senderId = event.sender.id;
+        const recipientId = event.recipient.id;
+
+        // ডট (.) হিউম্যান টেকওভার
+        if (event.message && event.message.is_echo) {
+          const adminText = (event.message.text || '').trim();
+          if (adminText.startsWith('.') || adminText.includes('.')) {
+            if (['.on', '.start', '.ai', '.resume'].includes(adminText.toLowerCase())) {
+              humanTakeoverMap.delete(recipientId);
+              console.log(`[AI RESUMED] Customer: ${recipientId}`);
+            } else {
+              humanTakeoverMap.set(recipientId, { paused: true, pausedAt: Date.now() });
+              console.log(`[AI PAUSED] Customer: ${recipientId}`);
+            }
+          }
+          continue;
+        }
+
+        if (event.message) {
+          const customerText = event.message.text || '';
+          let imageUrl = null;
+          if (event.message.attachments && event.message.attachments.length > 0) {
+            const att = event.message.attachments[0];
+            if (att.type === 'image' && att.payload && att.payload.url) imageUrl = att.payload.url;
+          }
+
+          if (isAiPausedForCustomer(senderId)) continue;
+
+          // এআই সেলস ও ভিশন রিপ্লাই তৈরি
+          const aiResponse = await generateAiReply(customerText, imageUrl);
+
+          if (aiResponse && PAGE_ACCESS_TOKEN) {
+            await sendMessengerTextMessage(senderId, aiResponse.replyText);
+          }
+        }
+      }
+      res.status(200).send('EVENT_RECEIVED');
+    } else res.sendStatus(404);
+  } catch (e) {
+    res.status(200).send('ERROR_HANDLED');
+  }
+});
+
+// এআই জেমিনি ও ভিশন সেলস ইঞ্জিন
+async function generateAiReply(userPrompt, imageUrl, attempt = 1) {
+  try {
+    if (!OPENROUTER_API_KEY) {
+      console.error('[OPENROUTER ERROR] OPENROUTER_API_KEY is missing!');
+      return {
+        replyText: `ধন্যবাদ আপনার বার্তার জন্য! আমাদের শোরুম: ${SHOP_INFO.address}, WhatsApp: ${SHOP_INFO.whatsapp}। আমরা দ্রুত যোগাযোগ করছি। ❤️`
+      };
+    }
+
+    loadCatalogFromDisk();
+
+    const systemPrompt = `You are the expert sales AI for "${SHOP_INFO.name}".
+Showroom: ${SHOP_INFO.address} | WhatsApp: ${SHOP_INFO.whatsapp}
+Delivery Inside Gazipur: 50 TK | Outside Gazipur: 100 TK
+100% Cash on Delivery (COD) - কোনো অগ্রিম টাকা লাগবে না।
+Products: ${JSON.stringify(productCatalog)}
+FAQs: ${JSON.stringify(faqCatalog)}
+
+RULES:
+1. কাস্টমার যদি ছবি/স্ক্রিনশট দেয়, ছবির ভেতরের লেখা ও প্রডাক্ট চিনে দাম, ওয়ারেন্টি ও ডেলিভারি চার্জসহ সুন্দর উত্তর দিন।
+2. কাস্টমার মোট বিল জানতে চাইলে পণ্যের দামের সাথে ৫০ বা ১০০ যোগ করে মেমো আকারে বলুন।
+3. অর্ডার করতে চাইলে নাম, মোবাইল নম্বর এবং সম্পূর্ণ ঠিকানা চান।`;
+
+    const messages = [{ role: 'system', content: systemPrompt }];
+
+    let currentContent = [];
+    if (userPrompt && userPrompt.trim().length > 0) {
+      currentContent.push({ type: 'text', text: userPrompt });
+    } else if (imageUrl) {
+      currentContent.push({
+        type: 'text',
+        text: 'কাস্টমার এই ছবিটি/স্ক্রিনশটটি পাঠিয়েছেন। ছবিটি দেখে ক্যাটালগ থেকে পণ্যটির নাম, দাম ও ডেলিভারি চার্জসহ সুন্দরভাবে উত্তর দিন।'
+      });
+    }
+
+    if (imageUrl) {
+      currentContent.push({ type: 'image_url', image_url: { url: imageUrl } });
+    }
+
+    messages.push({ role: 'user', content: currentContent });
+
+    const targetModel = imageUrl ? DEFAULT_VISION_MODEL : DEFAULT_TEXT_MODEL;
+
+    // ওপেনরাউটার কল (নিশ্চিত হেডারসহ)
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: targetModel,
+        messages: messages
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://impotechbd.com',
+          'X-Title': 'Impotech AI Bot'
+        },
+        timeout: 25000
+      }
+    );
+
+    const replyText = response.data.choices[0].message.content;
+    return { replyText };
+
+  } catch (err) {
+    console.error(`[OPENROUTER API ERR - Attempt ${attempt}]:`, err.response?.data || err.message);
+    if (attempt < 3) {
+      await new Promise(r => setTimeout(r, 2000));
+      return await generateAiReply(userPrompt, imageUrl, attempt + 1);
+    }
+    return {
+      replyText: `ধন্যবাদ ভাইয়া! শোরুম: ${SHOP_INFO.address}, WhatsApp: ${SHOP_INFO.whatsapp}। সাময়িক সমস্যার জন্য দুঃখিত, আমরা দ্রুত উত্তর দিচ্ছি।`
+    };
+  }
+}
+
+async function sendMessengerTextMessage(recipientId, text) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+      { recipient: { id: recipientId }, message: { text } }
+    );
+  } catch (e) {
+    console.error('[MESSENGER SEND ERR]:', e.response?.data?.error?.message || e.message);
+  }
+}
+
 app.listen(PORT, () => {
-  console.log(`[SERVER] ImpoTech Bot listening on port ${PORT}`);
+  console.log(`[SERVER RUNNING] Port: ${PORT}`);
 });
