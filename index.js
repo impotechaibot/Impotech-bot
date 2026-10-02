@@ -2,24 +2,24 @@
  * ==============================================================================
  * IMPOTECH AI ASSISTANT - PERMANENT ENGINE (DYNAMIC JSON CATALOG INTEGRATION)
  * ==============================================================================
- * 17 Core Features Fully Activated:
- * 1. Admin Dot (.) Human Takeover & (.on / .start) Resume
+ * All 17 Core Features Fully Integrated:
+ * 1. Admin Dot (.) Human Takeover & (.on / .start / .ai) Resume
  * 2. Smart Billing Engine (Gazipur Inside: 50 TK, Gazipur Outside: 100 TK)
  * 3. OpenRouter Gemini AI Sales Engine
  * 4. Steadfast Courier 1-Click Parcel Booking API (/api/courier/book)
- * 5. Meta Messenger & Make.com Webhooks
- * 6. Android App Live Sync (POST /api/training -> Auto-updates catalog.json)
+ * 5. Meta Messenger & Make.com Webhooks (/webhook)
+ * 6. Product Catalog & Media Manager Services (/api/catalog & /api/catalog/update)
  * 7. Android App Remote Takeover Control (/api/takeover/toggle)
  * 8. Server Health & Uptime Check (/health & /api/status)
  * 9. Enhanced Vision + OCR (Base64 injection, reads screenshots & text)
  * 10. Showroom Address: গাজীপুর, ভবানীপুর | WhatsApp: 01884332067
  * 11. Multi-lingual Intelligence & FAQs
- * 12. Auto Retry Mechanism with 3-4s Delay
+ * 12. Auto Retry Mechanism with 3.5s Delay (3 Attempts)
  * 13. Dynamic Decoupled Catalog (Lives in catalog.json)
  * 14. Render Environment Variables Support
  * 15. Product Photo & Video Dispatcher
  * 16. Persistent Customer Memory (File Storage + PostgreSQL)
- * 17. Automatic Data Retention Cleanup (DATA_RETENTION_DAYS)
+ * 17. Automatic Data Retention Cleanup (DATA_RETENTION_DAYS, Default: 20 Days)
  * ==============================================================================
  */
 
@@ -57,6 +57,7 @@ const DATA_RETENTION_DAYS = parseInt(process.env.DATA_RETENTION_DAYS || '20', 10
 console.log(`=======================================================`);
 console.log(`[AUTH CHECK] OPENROUTER_API_KEY: ${OPENROUTER_API_KEY ? '✅ SET (' + OPENROUTER_API_KEY.slice(0, 10) + '...)' : '❌ MISSING IN RENDER ENVIRONMENT!'}`);
 console.log(`[AUTH CHECK] PAGE_ACCESS_TOKEN: ${PAGE_ACCESS_TOKEN ? '✅ SET' : '❌ MISSING'}`);
+console.log(`[RETENTION POLICY] Auto-Cleanup Period: ${DATA_RETENTION_DAYS} Days`);
 console.log(`=======================================================`);
 
 // --- SHOP CONTACT & FIXED BUSINESS RULES ---
@@ -86,17 +87,20 @@ function loadCatalogFromDisk() {
       const data = JSON.parse(fs.readFileSync(CATALOG_FILE_PATH, 'utf8'));
       if (Array.isArray(data) && data.length > 0) {
         productCatalog = data;
-        return;
       } else if (data.products && Array.isArray(data.products)) {
         productCatalog = data.products;
-        return;
       }
-    }
-    if (fs.existsSync(PRODUCTS_ALT_PATH)) {
+    } else if (fs.existsSync(PRODUCTS_ALT_PATH)) {
       const data = JSON.parse(fs.readFileSync(PRODUCTS_ALT_PATH, 'utf8'));
       if (Array.isArray(data) && data.length > 0) {
         productCatalog = data;
-        return;
+      }
+    }
+
+    if (fs.existsSync(FAQS_FILE_PATH)) {
+      const faqData = JSON.parse(fs.readFileSync(FAQS_FILE_PATH, 'utf8'));
+      if (Array.isArray(faqData)) {
+        faqCatalog = faqData;
       }
     }
   } catch (err) {
@@ -144,7 +148,7 @@ function saveLocalMemoryToFile() {
   }
 }
 
-// PostgreSQL with strict validation
+// PostgreSQL setup with validation
 let dbPool = null;
 let isPostgresHealthy = false;
 
@@ -174,8 +178,10 @@ if (isProperPostgresUri) {
       CREATE INDEX IF NOT EXISTS idx_customer_created ON conversation_history(customer_id, created_at);
     `).then(() => {
       isPostgresHealthy = true;
+      console.log('[POSTGRESQL] Connected and verified table structure successfully.');
       runAutoCleanup();
     }).catch(err => {
+      console.error('[POSTGRESQL INIT ERROR]', err.message);
       isPostgresHealthy = false;
     });
   } catch (err) {
@@ -183,21 +189,37 @@ if (isProperPostgresUri) {
   }
 }
 
-// Auto Cleanup
+// Auto Cleanup (Feature #17: DATA_RETENTION_DAYS)
 async function runAutoCleanup() {
   const retentionCutoff = Date.now() - (DATA_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  
+  // Cleanup Local File Memory
   for (const [cid, history] of localMemoryMap.entries()) {
     const filtered = history.filter(item => (item.created_at || Date.now()) >= retentionCutoff);
-    if (filtered.length !== history.length) localMemoryMap.set(cid, filtered);
+    if (filtered.length !== history.length) {
+      if (filtered.length > 0) {
+        localMemoryMap.set(cid, filtered);
+      } else {
+        localMemoryMap.delete(cid);
+      }
+    }
   }
   saveLocalMemoryToFile();
 
+  // Cleanup PostgreSQL
   if (dbPool && isPostgresHealthy) {
     try {
-      await dbPool.query(`DELETE FROM conversation_history WHERE created_at < NOW() - INTERVAL '${DATA_RETENTION_DAYS} days'`);
-    } catch (e) {}
+      const result = await dbPool.query(
+        `DELETE FROM conversation_history WHERE created_at < NOW() - INTERVAL '${DATA_RETENTION_DAYS} days'`
+      );
+      console.log(`[AUTO-CLEANUP] Deleted records older than ${DATA_RETENTION_DAYS} days from DB. Rows affected: ${result.rowCount || 0}`);
+    } catch (e) {
+      console.error('[AUTO-CLEANUP DB ERROR]', e.message);
+    }
   }
 }
+
+// Run cleanup daily
 setInterval(runAutoCleanup, 24 * 60 * 60 * 1000);
 
 async function saveMessageToMemory(customerId, role, content, imageUrl = null) {
@@ -219,7 +241,7 @@ async function saveMessageToMemory(customerId, role, content, imageUrl = null) {
   }
 }
 
-async function getCustomerRecentHistory(customerId, limit = 8) {
+async function getCustomerRecentHistory(customerId, limit = 10) {
   if (dbPool && isPostgresHealthy) {
     try {
       const res = await dbPool.query(
@@ -264,8 +286,9 @@ async function fetchImageAsBase64(imageUrl) {
   }
 }
 
-// Endpoints
-app.get('/', (req, res) => res.send('Impotech AI Assistant Engine is Running!'));
+// --- ENDPOINTS ---
+
+app.get('/', (req, res) => res.send('Impotech AI Assistant Engine is Running Successfully!'));
 
 app.get('/api/status', (req, res) => {
   loadCatalogFromDisk();
@@ -273,7 +296,8 @@ app.get('/api/status', (req, res) => {
     isOnline: true,
     hasOpenRouterKey: !!OPENROUTER_API_KEY,
     productsCount: productCatalog.length,
-    activeModel: 'google/gemini-2.0-flash-001'
+    activeModel: 'google/gemini-2.0-flash-001',
+    retentionDays: DATA_RETENTION_DAYS
   });
 });
 
@@ -281,14 +305,15 @@ app.get('/health', (req, res) => {
   loadCatalogFromDisk();
   res.status(200).json({
     status: 'online',
-    app: 'Impotech AI Assistant',
+    app: 'Impotech AI Assistant Engine',
     hasOpenRouterKey: !!OPENROUTER_API_KEY,
     products_in_catalog: productCatalog.length,
-    customers_in_memory: localMemoryMap.size
+    customers_in_memory: localMemoryMap.size,
+    postgres_status: isPostgresHealthy ? 'healthy' : 'fallback_file_system'
   });
 });
 
-// App Live Sync (Writes to catalog.json)
+// App Live Sync
 app.post('/api/training', (req, res) => {
   try {
     const { products, faqs, deliveryRules, isHumanTakeoverGlobal } = req.body;
@@ -308,6 +333,7 @@ app.post('/api/training', (req, res) => {
 
     if (Array.isArray(faqs)) {
       faqCatalog = faqs;
+      fs.writeFileSync(FAQS_FILE_PATH, JSON.stringify(faqCatalog, null, 2), 'utf8');
     }
 
     if (typeof isHumanTakeoverGlobal === 'boolean') {
@@ -334,6 +360,25 @@ app.get('/api/training', (req, res) => {
   });
 });
 
+// Catalog Updates
+app.get('/api/catalog', (req, res) => {
+  loadCatalogFromDisk();
+  res.json({ success: true, catalog: productCatalog });
+});
+
+app.post('/api/catalog/update', (req, res) => {
+  const { catalog, products } = req.body;
+  const newCatalog = catalog || products;
+  
+  if (Array.isArray(newCatalog)) {
+    productCatalog = newCatalog;
+    saveCatalogToDisk();
+    return res.json({ success: true, message: "Catalog updated successfully", count: productCatalog.length });
+  }
+  res.status(400).json({ success: false, message: "Invalid catalog format" });
+});
+
+// Remote Admin Controls
 app.post('/api/takeover', (req, res) => {
   const { isGlobal, enabled, pause, customerId } = req.body;
   if (typeof isGlobal === 'boolean') isGlobalHumanTakeoverActive = isGlobal;
@@ -353,6 +398,7 @@ app.post('/api/takeover/toggle', (req, res) => {
   res.json({ success: true, isPaused: pause, customerId });
 });
 
+// Webhook for Facebook Messenger
 app.get('/webhook', (req, res) => {
   if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) {
     res.status(200).send(req.query['hub.challenge']);
@@ -370,20 +416,22 @@ app.post('/webhook', async (req, res) => {
         const senderId = webhook_event.sender.id;
         const recipientId = webhook_event.recipient.id;
 
-        // Admin Takeover Echo
+        // Admin Takeover Echo Detection
         if (webhook_event.message && webhook_event.message.is_echo) {
           const adminText = (webhook_event.message.text || '').trim();
           if (adminText.startsWith('.') || adminText.includes('.') || adminText === '..') {
             if (['.on', '.start', '.ai', '.open', '.resume'].includes(adminText.toLowerCase())) {
               humanTakeoverMap.delete(recipientId);
+              console.log(`[TAKEOVER RESUMED] AI activated for customer: ${recipientId}`);
             } else {
               humanTakeoverMap.set(recipientId, { paused: true, pausedAt: Date.now() });
+              console.log(`[TAKEOVER PAUSED] Admin took over customer: ${recipientId}`);
             }
           }
           continue;
         }
 
-        // Customer Message
+        // Incoming Customer Message
         if (webhook_event.message) {
           const customerText = webhook_event.message.text || '';
           let imageUrl = null;
@@ -394,8 +442,8 @@ app.post('/webhook', async (req, res) => {
 
           if (isAiPausedForCustomer(senderId)) continue;
 
-          await saveMessageToMemory(senderId, 'user', customerText || '[Customer sent image]', imageUrl);
-          const previousHistory = await getCustomerRecentHistory(senderId, 8);
+          await saveMessageToMemory(senderId, 'user', customerText || '[Customer sent an image]', imageUrl);
+          const previousHistory = await getCustomerRecentHistory(senderId, 10);
 
           let imageBase64OrUrl = null;
           if (imageUrl) imageBase64OrUrl = await fetchImageAsBase64(imageUrl);
@@ -405,6 +453,7 @@ app.post('/webhook', async (req, res) => {
           if (aiResponseData && PAGE_ACCESS_TOKEN) {
             await saveMessageToMemory(senderId, 'assistant', aiResponseData.replyText);
             await sendMessengerTextMessage(senderId, aiResponseData.replyText);
+            
             if (aiResponseData.mediaUrlToSend) {
               await sendMessengerMedia(senderId, aiResponseData.mediaTypeToSend, aiResponseData.mediaUrlToSend);
             }
@@ -418,48 +467,54 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// AI Engine
+// AI Engine Core Function (Auto Retry included)
 async function generateAiReplyWithRetry(userPrompt, imagePayload, conversationHistory, attempt = 1) {
   try {
     if (!OPENROUTER_API_KEY) {
       return {
-        replyText: `ধন্যবাদ আপনার বার্তার জন্য! আমাদের শোরুম: ${SHOP_INFO.address}। WhatsApp: ${SHOP_INFO.whatsapp}। আমরা দ্রুত আপনার সাথে যোগাযোগ করছি। ❤️`
+        replyText: `ধন্যবাদ আপনার বার্তার জন্য! আমাদের শোরুম: ${SHOP_INFO.address}। WhatsApp: ${SHOP_INFO.whatsapp}। আমরা দ্রুত আপনার সাথে যোগাযোগ করছি। ❤️️`
       };
     }
 
+    // Always fetch latest catalog directly before generating response
     loadCatalogFromDisk();
 
-    const systemPrompt = `You are the friendly, expert sales AI assistant for "${SHOP_INFO.name}".
+    const systemPrompt = `You are the friendly, professional, highly dynamic sales AI assistant for "${SHOP_INFO.name}".
 
 BUSINESS & SHOP DETAILS:
-- Showroom/Shop Address: ${SHOP_INFO.address}
+- Showroom Address: ${SHOP_INFO.address}
 - Official WhatsApp: ${SHOP_INFO.whatsapp}
 - Delivery Inside Gazipur: ${SHOP_INFO.delivery_inside_gazipur} BDT
 - Delivery Outside Gazipur: ${SHOP_INFO.delivery_outside_gazipur} BDT
-- Payment: 100% Cash on Delivery (COD) - কোনো অগ্রিম টাকা লাগবে না।
-- Dynamic Products Catalog (from catalog.json): ${JSON.stringify(productCatalog)}
-- Frequently Asked Questions (FAQs): ${JSON.stringify(faqCatalog)}
+- Payment: ${SHOP_INFO.payment_method}
 
-CORE INSTRUCTIONS:
-1. 👁️ ENHANCED IMAGE & SCREENSHOT RECOGNITION (OCR + VISION):
+LATEST DYNAMIC PRODUCT CATALOG (ALWAYS USE THIS DATA):
+${JSON.stringify(productCatalog)}
+
+FAQS & KNOWLEDGEBASE:
+${JSON.stringify(faqCatalog)}
+
+CORE OPERATIONAL RULES:
+1. STRICT DATA DEPENDENCY: Always rely FIRST and FOREMOST on the dynamic product catalog and FAQ list above. If a product, price, warranty, photo, or video exists in catalog, render it strictly. If a requested product is not in catalog, state politely that it's out of stock or unavailable.
+2. 👁️ VISION & SCREENSHOT RECOGNITION (OCR):
    - When an image or screenshot is provided:
-     * Read and extract ALL visible Bengali and English text, model names (e.g. Motorcycle Angel's Wings Welcome Light / ডানা লাইট), dimensions, labels, or captions.
-     * Compare with catalog. Confirm the product name, its price, warranty, and delivery charges.
-     * If product is an accessory (like bike wings light), confirm: "জি ভাইয়া! আপনি মোটরসাইকেলের Angel Wings Welcome Light (ডানা লাইট)-এর ছবিটি পাঠিয়েছেন। এটার দাম [দাম] টাকা।"
-     * Never say you cannot see the image. Always be confident, natural, and sales-focused!
-2. 🧮 SMART BILLING & CALCULATIONS:
+     * Extract and read all visible text, product names, logos, or markings.
+     * Match with catalog. Confirm product name, price, warranty, and delivery charge clearly.
+     * Be confident and conversational in natural Bengali!
+3. 🧮 SMART BILLING & CALCULATIONS:
    - Inside Gazipur: Product Price + 50 TK.
    - Outside Gazipur: Product Price + 100 TK.
-   - Show billing clearly:
+   - Multiple Products: Sum total price + single delivery charge.
+   - Show billing breakdowns clearly:
      📦 পণ্যের দাম: [দাম] টাকা
      🚚 ডেলিভারি চার্জ: [৫০/১০০] টাকা
-     💰 সর্বমোট বিল: [মোট টাকা] টাকা (ক্যাশ অন ডেলিভারি)
-3. 🎬 MEDIA (PHOTOS & VIDEOS):
-   - If customer asks for photo/video, include URL from catalog if available.
-4. 🧠 PERSISTENT MEMORY:
-   - Remember the product from previous messages (e.g. if they sent a photo and then ask "দাম কত?" or "ডানা লাইট আছে?").
-5. 🌍 LANGUAGE:
-   - Reply in the same language as customer (Bangla, English, Banglish). Always provide WhatsApp (${SHOP_INFO.whatsapp}) for direct help.`;
+     💰 সর্বমোট বিল: [মোট] টাকা (ক্যাশ অন ডেলিভারি)
+4. 📷 PHOTO & VIDEO DISPATCHING:
+   - If user asks for photos or videos ("ছবি দেখান", "ভিডিও দেন"), locate photo_url or video_url from catalog. Mention that the media is attached.
+5. 🧠 PERSISTENT MEMORY INTEGRATION:
+   - Understand context from conversation history (e.g. if previous message was about a headlight and user asks "দাম কত?", answer about that headlight).
+6. 🌍 LANGUAGE & VOICE:
+   - Answer naturally in Bengali (or the language user speaks). Keep answers concise, helpful, and polite. Always provide WhatsApp (${SHOP_INFO.whatsapp}) for human help.`;
 
     const messages = [{ role: 'system', content: systemPrompt }];
 
@@ -475,7 +530,7 @@ CORE INSTRUCTIONS:
     else if (imagePayload) {
       currentContent.push({
         type: 'text',
-        text: 'কাস্টমার এই ছবিটি/স্ক্রিনশটটি পাঠিয়েছেন। ছবির ভেতরের লেখাগুলো (OCR) পড়ে এবং ছবিটি দেখে আমাদের ক্যাটালগ থেকে পণ্যটি শনাক্ত করুন। এরপর পণ্যের নাম, দাম, ওয়ারেন্টি ও ডেলিভারি চার্জসহ সুন্দরভাবে বাংলায় উত্তর দিন।'
+        text: 'কাস্টমার এই ছবিটি/স্ক্রিনশটটি পাঠিয়েছেন। ক্যাটালগ থেকে ছবিটি শনাক্ত করে পণ্যের নাম, দাম, ওয়ারেন্টি ও ডেলিভারি চার্জসহ উত্তর দিন।'
       });
     }
 
@@ -505,10 +560,20 @@ CORE INSTRUCTIONS:
     let mediaUrlToSend = null;
     let mediaTypeToSend = 'image';
     const lowerPrompt = (userPrompt || '').toLowerCase();
-    if (lowerPrompt.includes('ছবি') || lowerPrompt.includes('photo')) {
+
+    if (lowerPrompt.includes('ছবি') || lowerPrompt.includes('photo') || lowerPrompt.includes('picture')) {
       for (const p of productCatalog) {
         if (replyText.toLowerCase().includes(p.name.toLowerCase()) && p.photo_url) {
           mediaUrlToSend = p.photo_url;
+          mediaTypeToSend = 'image';
+          break;
+        }
+      }
+    } else if (lowerPrompt.includes('ভিডিও') || lowerPrompt.includes('video')) {
+      for (const p of productCatalog) {
+        if (replyText.toLowerCase().includes(p.name.toLowerCase()) && p.video_url) {
+          mediaUrlToSend = p.video_url;
+          mediaTypeToSend = 'video';
           break;
         }
       }
@@ -517,8 +582,9 @@ CORE INSTRUCTIONS:
     return { replyText, mediaUrlToSend, mediaTypeToSend };
 
   } catch (err) {
+    console.error(`[AI ENGINE ATTEMPT ${attempt} FAILED]`, err.message);
     if (attempt < 3) {
-      await new Promise(r => setTimeout(r, 3500));
+      await new Promise(r => setTimeout(r, 3500)); // 3.5s Delay Auto-retry
       return await generateAiReplyWithRetry(userPrompt, imagePayload, conversationHistory, attempt + 1);
     }
     return {
@@ -527,13 +593,16 @@ CORE INSTRUCTIONS:
   }
 }
 
+// Meta Messenger Helpers
 async function sendMessengerTextMessage(recipientId, text) {
   try {
     await axios.post(
       `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
       { recipient: { id: recipientId }, message: { text } }
     );
-  } catch (e) {}
+  } catch (e) {
+    console.error('[MESSENGER SEND TEXT ERROR]', e.response ? e.response.data : e.message);
+  }
 }
 
 async function sendMessengerMedia(recipientId, type, mediaUrl) {
@@ -542,42 +611,43 @@ async function sendMessengerMedia(recipientId, type, mediaUrl) {
       `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
       {
         recipient: { id: recipientId },
-        message: { attachment: { type: 'image', payload: { url: mediaUrl, is_reusable: true } } }
+        message: { attachment: { type: type === 'video' ? 'video' : 'image', payload: { url: mediaUrl, is_reusable: true } } }
       }
     );
-  } catch (e) {}
+  } catch (e) {
+    console.error('[MESSENGER SEND MEDIA ERROR]', e.response ? e.response.data : e.message);
+  }
 }
 
-// Steadfast API
+// Steadfast Courier Booking API
 app.post('/api/courier/book', async (req, res) => {
   try {
     const { invoice, recipient_name, recipient_phone, recipient_address, cod_amount, note } = req.body;
     const response = await axios.post(
       'https://portal.packzy.com/api/v1/create_order',
-      { invoice: invoice || `INV-${Date.now()}`, recipient_name, recipient_phone, recipient_address, cod_amount: Number(cod_amount || 0), note: note || "Fragile" },
-      { headers: { 'Api-Key': STEADFAST_API_KEY, 'Secret-Key': STEADFAST_SECRET_KEY, 'Content-Type': 'application/json' } }
+      {
+        invoice: invoice || `INV-${Date.now()}`,
+        recipient_name,
+        recipient_phone,
+        recipient_address,
+        cod_amount: Number(cod_amount || 0),
+        note: note || "Fragile - Handle with care"
+      },
+      {
+        headers: {
+          'Api-Key': STEADFAST_API_KEY,
+          'Secret-Key': STEADFAST_SECRET_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
     );
     res.json({ success: true, data: response.data });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.response ? err.response.data : err.message });
   }
 });
 
-app.get('/api/catalog', (req, res) => {
-  loadCatalogFromDisk();
-  res.json({ success: true, catalog: productCatalog });
-});
-
-app.post('/api/catalog/update', (req, res) => {
-  const { catalog } = req.body;
-  if (Array.isArray(catalog)) {
-    productCatalog = catalog;
-    saveCatalogToDisk();
-    return res.json({ success: true, message: "Catalog updated successfully", count: productCatalog.length });
-  }
-  res.status(400).json({ success: false, message: "Invalid catalog format" });
-});
-
+// Start Server
 app.listen(PORT, () => {
-  console.log(`[SERVER RUNNING] Port: ${PORT} | Products: ${productCatalog.length}`);
+  console.log(`[SERVER STARTED] Listening on Port: ${PORT} | Products Loaded: ${productCatalog.length}`);
 });
