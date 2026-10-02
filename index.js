@@ -1,5 +1,6 @@
 /**
  * ImpoTech Bd - Smart Messenger AI Assistant (OpenRouter Edition)
+ * Models: Gemini 3.5 Flash / Gemini 3.1 Flash-Lite
  * Features: PostgreSQL Memory, Auto Cleanup, Steadfast Courier, Vision AI,
  * Human Takeover, Media Sync & Dynamic Catalog Indexing.
  */
@@ -17,8 +18,10 @@ app.use(express.json({ limit: '25mb' }));
 const PORT = process.env.PORT || 10000;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'impotech_secure_token';
+
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash';
+const TEXT_MODEL = process.env.OPENROUTER_TEXT_MODEL || 'google/gemini-3.5-flash';
+const VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || 'google/gemini-3.5-flash';
 
 const STEADFAST_API_KEY = process.env.STEADFAST_API_KEY;
 const STEADFAST_SECRET_KEY = process.env.STEADFAST_SECRET_KEY;
@@ -209,7 +212,6 @@ async function syncCatalogToGitHub() {
   }
 }
 
-// Initial catalog pull
 pullCatalogFromGitHub();
 
 // =========================
@@ -250,21 +252,21 @@ async function autoCleanupDB() {
     console.error('[DB Cleanup Error]', err.message);
   }
 }
-// Run cleanup every 24 hours
 setInterval(autoCleanupDB, 24 * 60 * 60 * 1000);
 
 // =========================
-// OPENROUTER AI ENGINE (WITH RETRY)
+// OPENROUTER AI ENGINE (WITH RETRY & MODEL SWITCHING)
 // =========================
-async function callOpenRouterWithRetry(messages, retries = 3) {
+async function callOpenRouterWithRetry(messages, modelName = TEXT_MODEL, retries = 3) {
   const url = 'https://openrouter.ai/api/v1/chat/completions';
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      console.log(`[OPENROUTER API] Calling model: ${modelName} (Attempt ${attempt})`);
       const response = await axios.post(
         url,
         {
-          model: OPENROUTER_MODEL,
+          model: modelName,
           messages,
           max_tokens: 350,
           temperature: 0.3
@@ -283,7 +285,7 @@ async function callOpenRouterWithRetry(messages, retries = 3) {
       const reply = response.data?.choices?.[0]?.message?.content?.trim();
       if (reply) return reply;
     } catch (err) {
-      console.error(`[OPENROUTER API ERR - Attempt ${attempt}/${retries}]:`, err.message);
+      console.error(`[OPENROUTER API ERR - Attempt ${attempt}/${retries}]:`, err.response?.data || err.message);
       if (attempt < retries) await sleep(3500); // 3.5 sec delay before retry
     }
   }
@@ -359,7 +361,6 @@ async function sendMessengerMedia(recipientId, type, url) {
   }
 }
 
-// Media request check
 function checkMediaRequestAndSend(senderId, text, matchedProducts) {
   const norm = normalizeText(text);
   const mediaKeywords = ['ছবি', 'পিক', 'ভিডিও', 'photo', 'picture', 'image', 'video', 'শো'];
@@ -418,14 +419,12 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
-    // Ignore if AI is paused for this customer
     if (pausedCustomers.has(senderId)) continue;
 
-    // Retrieve Past Conversation History from PostgreSQL
     const history = await getRecentConversation(senderId, 6);
     const historyFormatted = history.map(h => `${h.role}: ${h.message}`).join('\n');
 
-    // 2. 👁️ Image / Vision Request
+    // 2. 👁️ Image / Gemini Vision Request
     const imageAttachment = message.attachments?.find(a => a.type === 'image');
     if (imageAttachment) {
       const imageUrl = imageAttachment.payload.url;
@@ -438,7 +437,6 @@ app.post('/webhook', async (req, res) => {
 শোরুম: গাজীপুর, ভবানীপুর | WhatsApp: 01884332067।
       `.trim();
 
-      const matchedProducts = searchCatalog('product');
       const messages = [
         { role: 'system', content: visionPrompt },
         {
@@ -450,7 +448,7 @@ app.post('/webhook', async (req, res) => {
         }
       ];
 
-      const aiReply = await callOpenRouterWithRetry(messages);
+      const aiReply = await callOpenRouterWithRetry(messages, VISION_MODEL);
       await sendMessengerText(senderId, aiReply);
       await saveConversation(senderId, 'assistant', aiReply);
       continue;
@@ -469,11 +467,10 @@ app.post('/webhook', async (req, res) => {
         { role: 'user', content: userText }
       ];
 
-      const aiReply = await callOpenRouterWithRetry(messages);
+      const aiReply = await callOpenRouterWithRetry(messages, TEXT_MODEL);
       await sendMessengerText(senderId, aiReply);
       await saveConversation(senderId, 'assistant', aiReply);
 
-      // Check and send product images/videos automatically if requested
       checkMediaRequestAndSend(senderId, userText, matchedProducts);
     }
   }
@@ -575,20 +572,18 @@ app.get('/health', async (req, res) => {
     status: 'Healthy',
     uptime: process.uptime(),
     database: dbStatus,
+    text_model: TEXT_MODEL,
+    vision_model: VISION_MODEL,
     active_products: products.length,
     active_index_tokens: catalogIndex.size,
     paused_customers: pausedCustomers.size
   });
 });
 
-// Root Route
 app.get('/', (req, res) => {
-  res.send('ImpoTech Bd AI Engine (OpenRouter) is Running 🚀');
+  res.send('ImpoTech Bd AI Engine (Gemini 3.5 & 3.1 OpenRouter) is Running 🚀');
 });
 
-// =========================
-// START SERVER
-// =========================
 app.listen(PORT, () => {
   console.log(`[SERVER] ImpoTech Bot listening on port ${PORT}`);
 });
