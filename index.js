@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * IMPOTECH AI ASSISTANT - COMPLETE PRODUCTION BACKEND (WITH FULL APP SYNC)
+ * IMPOTECH AI ASSISTANT - ENHANCED VISION & OCR MULTIMODAL SALES ENGINE
  * ==============================================================================
  * Features strictly implemented as per all 17 requirements:
  * 1. Admin Dot (.) Human Takeover & (.on / .start) Resume
@@ -16,19 +16,24 @@
  *    - GET /api/catalog, POST /api/catalog/update
  * 7. Android App Remote Takeover Control (/api/takeover/toggle & /api/takeover)
  * 8. Server Health & Uptime Check (/health & /)
- * 9. Gemini Multimodal Vision (Understands Customer Photos & Screenshots)
+ * 9. ENHANCED VISION + OCR:
+ *    - Base64 direct image injection (prevents CDN 403 blocks)
+ *    - Reads ALL Bengali & English text, prices, labels inside screenshots/photos (OCR)
+ *    - Accurately matches screenshots to product catalog
  * 10. Showroom Address: গাজীপুর, ভবানীপুর | WhatsApp: 01884332067
  * 11. Comprehensive FAQs & Cross-lingual intelligence
  * 12. Auto Retry Mechanism with 3-4s Delay (2-3 Attempts) on API/Server Errors
  * 13. Dynamic Realtime Product Catalog with Media Links
  * 14. Full Render Environment Variables Setup
  * 15. Intelligent Product Photo & Video Media Dispatcher
- * 16. Persistent Customer Conversation Memory (PostgreSQL via DATABASE_URL)
+ * 16. Persistent Customer Conversation Memory (File System + PostgreSQL Auto-failover)
  * 17. Automatic Data Retention Cleanup (DATA_RETENTION_DAYS, Default: 20 Days)
  * ==============================================================================
  */
 
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -45,7 +50,7 @@ const STEADFAST_API_KEY = process.env.STEADFAST_API_KEY || '';
 const STEADFAST_SECRET_KEY = process.env.STEADFAST_SECRET_KEY || '';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || '';
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'impotech_secure_token';
-const DATABASE_URL = process.env.DATABASE_URL || '';
+const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
 const DATA_RETENTION_DAYS = parseInt(process.env.DATA_RETENTION_DAYS || '20', 10);
 
 // --- 10 & 13. SHOP CONTACT, BUSINESS INFO & PRODUCT CATALOG ---
@@ -93,76 +98,140 @@ let faqCatalog = [
 let deliveryRulesList = [];
 let isGlobalHumanTakeoverActive = false;
 
-// In-Memory Fallback for Human Takeover State & Local History
-const humanTakeoverMap = new Map(); // customer_id -> { paused: boolean, pausedAt: number }
-const localMemoryMap = new Map(); // fallback if DB is not attached
+// In-Memory Storage for Human Takeover State & Fallback History
+const humanTakeoverMap = new Map();
+const localMemoryMap = new Map();
 
-// --- 16 & 17. POSTGRESQL DATABASE INITIALIZATION & AUTO CLEANUP ---
+// Persistent local file path for zero-loss memory
+const MEMORY_FILE_PATH = path.join(__dirname, 'conversations_memory.json');
+
+function loadLocalMemoryFromFile() {
+  try {
+    if (fs.existsSync(MEMORY_FILE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(MEMORY_FILE_PATH, 'utf8'));
+      for (const [cid, history] of Object.entries(data)) {
+        if (Array.isArray(history)) {
+          localMemoryMap.set(cid, history);
+        }
+      }
+      console.log(`[FILE MEMORY] Loaded existing conversations for ${localMemoryMap.size} customers from disk.`);
+    }
+  } catch (err) {
+    console.error('[FILE MEMORY LOAD ERROR]', err.message);
+  }
+}
+loadLocalMemoryFromFile();
+
+function saveLocalMemoryToFile() {
+  try {
+    const memoryObj = {};
+    for (const [cid, history] of localMemoryMap.entries()) {
+      memoryObj[cid] = history;
+    }
+    fs.writeFileSync(MEMORY_FILE_PATH, JSON.stringify(memoryObj, null, 2), 'utf8');
+  } catch (err) {
+    console.error('[FILE MEMORY SAVE ERROR]', err.message);
+  }
+}
+
+// --- 16 & 17. POSTGRESQL DATABASE WITH STRICT VALIDATION ---
 let dbPool = null;
-if (DATABASE_URL) {
-  dbPool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-  });
+let isPostgresHealthy = false;
 
-  dbPool.query(`
-    CREATE TABLE IF NOT EXISTS conversation_history (
-      id SERIAL PRIMARY KEY,
-      customer_id VARCHAR(100) NOT NULL,
-      role VARCHAR(20) NOT NULL,
-      content TEXT NOT NULL,
-      image_url TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_customer_created ON conversation_history(customer_id, created_at);
-  `).then(() => {
-    console.log('[DATABASE] PostgreSQL conversation_history table ready.');
-    runAutoCleanup();
-  }).catch(err => {
-    console.error('[DATABASE INIT ERROR]', err.message);
-  });
+const isProperPostgresUri = 
+  (DATABASE_URL.startsWith('postgres://') || DATABASE_URL.startsWith('postgresql://')) &&
+  DATABASE_URL.length > 20 &&
+  !DATABASE_URL.includes('@base') &&
+  DATABASE_URL !== 'base';
+
+if (isProperPostgresUri) {
+  try {
+    dbPool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+      connectionTimeoutMillis: 5000
+    });
+
+    dbPool.query(`
+      CREATE TABLE IF NOT EXISTS conversation_history (
+        id SERIAL PRIMARY KEY,
+        customer_id VARCHAR(100) NOT NULL,
+        role VARCHAR(20) NOT NULL,
+        content TEXT NOT NULL,
+        image_url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_customer_created ON conversation_history(customer_id, created_at);
+    `).then(() => {
+      isPostgresHealthy = true;
+      console.log('[DATABASE] PostgreSQL connected & conversation_history table ready.');
+      runAutoCleanup();
+    }).catch(err => {
+      isPostgresHealthy = false;
+      console.log(`[DATABASE NOTICE] PostgreSQL connection skipped (${err.message}). Using Persistent File Memory.`);
+    });
+  } catch (err) {
+    isPostgresHealthy = false;
+    console.log(`[DATABASE NOTICE] Could not initialize PostgreSQL. Using Persistent File Memory.`);
+  }
 } else {
-  console.log('[DATABASE] Running in In-Memory mode. Attach PostgreSQL DATABASE_URL for permanent persistence.');
+  console.log('[DATABASE] Running in Persistent File Memory mode. (No valid external PostgreSQL provided).');
 }
 
 // --- 17. AUTO CLEANUP CRON (Runs every 24 hours) ---
 async function runAutoCleanup() {
-  if (!dbPool) return;
-  try {
-    const query = `
-      DELETE FROM conversation_history 
-      WHERE created_at < NOW() - INTERVAL '${DATA_RETENTION_DAYS} days';
-    `;
-    const result = await dbPool.query(query);
-    console.log(`[AUTO CLEANUP] Cleaned up ${result.rowCount} messages older than ${DATA_RETENTION_DAYS} days.`);
-  } catch (e) {
-    console.error('[AUTO CLEANUP ERROR]', e.message);
+  const retentionCutoff = Date.now() - (DATA_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+
+  let cleanedCount = 0;
+  for (const [cid, history] of localMemoryMap.entries()) {
+    const filtered = history.filter(item => (item.created_at || Date.now()) >= retentionCutoff);
+    if (filtered.length !== history.length) {
+      cleanedCount += (history.length - filtered.length);
+      localMemoryMap.set(cid, filtered);
+    }
+  }
+  saveLocalMemoryToFile();
+  console.log(`[AUTO CLEANUP] Cleaned ${cleanedCount} expired records from local memory.`);
+
+  if (dbPool && isPostgresHealthy) {
+    try {
+      const query = `
+        DELETE FROM conversation_history 
+        WHERE created_at < NOW() - INTERVAL '${DATA_RETENTION_DAYS} days';
+      `;
+      const result = await dbPool.query(query);
+      console.log(`[AUTO CLEANUP] Cleaned ${result.rowCount} messages older than ${DATA_RETENTION_DAYS} days from PostgreSQL.`);
+    } catch (e) {
+      console.error('[AUTO CLEANUP DB ERROR]', e.message);
+    }
   }
 }
 setInterval(runAutoCleanup, 24 * 60 * 60 * 1000);
 
-// Helper: Save message to history
+// Helper: Save message to history (Dual Storage: File + DB)
 async function saveMessageToMemory(customerId, role, content, imageUrl = null) {
-  if (dbPool) {
+  if (!localMemoryMap.has(customerId)) localMemoryMap.set(customerId, []);
+  const localHistory = localMemoryMap.get(customerId);
+  localHistory.push({ role, content, imageUrl, created_at: Date.now() });
+  if (localHistory.length > 30) localHistory.shift();
+  saveLocalMemoryToFile();
+
+  if (dbPool && isPostgresHealthy) {
     try {
       await dbPool.query(
         'INSERT INTO conversation_history (customer_id, role, content, image_url) VALUES ($1, $2, $3, $4)',
         [customerId, role, content, imageUrl]
       );
     } catch (err) {
-      console.error('[SAVE MEMORY ERROR]', err.message);
+      isPostgresHealthy = false;
+      console.error('[SAVE MEMORY DB WARNING]', err.message);
     }
-  } else {
-    if (!localMemoryMap.has(customerId)) localMemoryMap.set(customerId, []);
-    const history = localMemoryMap.get(customerId);
-    history.push({ role, content, imageUrl, created_at: Date.now() });
-    if (history.length > 20) history.shift();
   }
 }
 
-// Helper: Get recent conversation context for customer
-async function getCustomerRecentHistory(customerId, limit = 10) {
-  if (dbPool) {
+// Helper: Get recent conversation context for customer (Dual Storage: DB -> File fallback)
+async function getCustomerRecentHistory(customerId, limit = 8) {
+  if (dbPool && isPostgresHealthy) {
     try {
       const res = await dbPool.query(
         `SELECT role, content, image_url FROM conversation_history 
@@ -170,15 +239,17 @@ async function getCustomerRecentHistory(customerId, limit = 10) {
          ORDER BY created_at DESC LIMIT $2`,
         [customerId, limit]
       );
-      return res.rows.reverse();
+      if (res.rows && res.rows.length > 0) {
+        return res.rows.reverse();
+      }
     } catch (err) {
-      console.error('[GET MEMORY ERROR]', err.message);
-      return [];
+      isPostgresHealthy = false;
+      console.error('[GET MEMORY DB WARNING]', err.message);
     }
-  } else {
-    const list = localMemoryMap.get(customerId) || [];
-    return list.slice(-limit);
   }
+  
+  const list = localMemoryMap.get(customerId) || [];
+  return list.slice(-limit);
 }
 
 // --- 1. HELPER: CHECK HUMAN TAKEOVER STATUS ---
@@ -192,6 +263,28 @@ function isAiPausedForCustomer(customerId) {
     return false;
   }
   return data.paused;
+}
+
+// --- 9. HELPER: FETCH IMAGE AS BASE64 TO PREVENT CDN 403 BLOCKS ---
+async function fetchImageAsBase64(imageUrl) {
+  if (!imageUrl) return null;
+  try {
+    console.log(`[IMAGE DOWNLOAD] Fetching image from Meta CDN for Vision OCR...`);
+    const response = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      timeout: 12000
+    });
+    const contentType = response.headers['content-type'] || 'image/jpeg';
+    const base64Data = Buffer.from(response.data, 'binary').toString('base64');
+    console.log(`[IMAGE DOWNLOAD SUCCESS] Converted to base64 (${contentType}, ${Math.round(base64Data.length / 1024)} KB)`);
+    return `data:${contentType};base64,${base64Data}`;
+  } catch (err) {
+    console.error(`[IMAGE DOWNLOAD FAILED] ${err.message}. Falling back to direct URL.`);
+    return imageUrl;
+  }
 }
 
 // --- ROOT & STATUS ENDPOINTS ---
@@ -212,9 +305,11 @@ app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'online',
     app: 'Impotech AI Assistant',
+    database_mode: isPostgresHealthy ? 'PostgreSQL' : 'Persistent File Storage (Active)',
     retention_days: DATA_RETENTION_DAYS,
     products_in_catalog: productCatalog.length,
-    faqs_in_catalog: faqCatalog.length
+    faqs_in_catalog: faqCatalog.length,
+    customers_in_memory: localMemoryMap.size
   });
 });
 
@@ -370,7 +465,13 @@ app.post('/webhook', async (req, res) => {
 
           const previousHistory = await getCustomerRecentHistory(senderId, 8);
 
-          const aiResponseData = await generateAiReplyWithRetry(customerText, imageUrl, previousHistory);
+          // Convert image to Base64 to ensure OpenRouter Gemini Vision receives it reliably
+          let imageBase64OrUrl = null;
+          if (imageUrl) {
+            imageBase64OrUrl = await fetchImageAsBase64(imageUrl);
+          }
+
+          const aiResponseData = await generateAiReplyWithRetry(customerText, imageBase64OrUrl, previousHistory);
 
           if (aiResponseData && PAGE_ACCESS_TOKEN) {
             await saveMessageToMemory(senderId, 'assistant', aiResponseData.replyText);
@@ -392,8 +493,8 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// --- 2, 3, 9, 10, 11, 12, 15, 16. OPENROUTER AI ENGINE WITH AUTO-RETRY ---
-async function generateAiReplyWithRetry(userPrompt, imageUrl, conversationHistory, attempt = 1) {
+// --- 2, 3, 9, 10, 11, 12, 15, 16. OPENROUTER AI ENGINE WITH ADVANCED OCR VISION ---
+async function generateAiReplyWithRetry(userPrompt, imagePayload, conversationHistory, attempt = 1) {
   const MAX_ATTEMPTS = 3;
 
   try {
@@ -411,11 +512,19 @@ BUSINESS & SHOP DETAILS:
 - Delivery Inside Gazipur: ${SHOP_INFO.delivery_inside_gazipur} BDT
 - Delivery Outside Gazipur: ${SHOP_INFO.delivery_outside_gazipur} BDT
 - Payment: 100% Cash on Delivery (COD) - কোনো অগ্রিম টাকা লাগবে না।
-- Products in Stock: ${JSON.stringify(productCatalog)}
+- Products in Stock Catalog: ${JSON.stringify(productCatalog)}
 - Frequently Asked Questions (FAQs): ${JSON.stringify(faqCatalog)}
 
 CORE INSTRUCTIONS:
-1. 🧮 SMART BILLING & CALCULATIONS (CRITICAL):
+
+1. 👁️ ENHANCED IMAGE & SCREENSHOT RECOGNITION (OCR + VISION):
+   - When an image or screenshot is provided by the customer:
+     * STEP A (OCR - READ ALL TEXT): Read and extract ALL visible Bengali and English text, titles, subtitles, product names, model numbers (e.g. T900 Ultra, Mini Fog Light, etc.), prices, discount stickers, or captions written anywhere in the photo/screenshot.
+     * STEP B (VISUAL MATCHING): Examine the visual design, shape, packaging, and colors in the image.
+     * STEP C (CATALOG MATCH): Compare the extracted text and visual features with our stock catalog above.
+     * STEP D (ACCURATE CONFIRMATION): State clearly and politely which product it is (e.g. "জি ভাইয়া! আপনি আমাদের [পণ্যের নাম]-এর ছবিটি পাঠিয়েছেন।"). State its exact price, warranty, and delivery charges. Never say you cannot see the image or that you are just a text model. Always be confident and sales-focused.
+
+2. 🧮 SMART BILLING & CALCULATIONS:
    - Total Bill = (Product Price * Quantity) + Delivery Charge.
    - Gazipur Inside: Product Price + 50 TK.
    - Gazipur Outside (All other districts/areas): Product Price + 100 TK.
@@ -427,10 +536,6 @@ CORE INSTRUCTIONS:
      💰 সর্বমোট বিল: [মোট টাকা] টাকা (ক্যাশ অন ডেলিভারি)
      "কোনো অগ্রিম টাকা লাগবে না, ডেলিভারিম্যান পৌঁছালে মোট টাকা পরিশোধ করবেন।"
 
-2. 👁️ IMAGE / SCREENSHOT RECOGNITION (VISION):
-   - If customer sends an image/screenshot (even with no text), analyze it carefully.
-   - Identify the matched product from our stock catalog. Greet politely, confirm product name, price, warranty, delivery charges, and ask if they would like to order.
-
 3. 🎬 MEDIA (PHOTOS & VIDEOS) REQUESTS:
    - If customer asks to see photo/video of a product:
      * Check if catalog has photo_url/video_url.
@@ -438,8 +543,8 @@ CORE INSTRUCTIONS:
      * If photo/video is not available, explicitly state: "দুঃখিত ভাইয়া, এই মুহূর্তে এই পণ্যটির ভিডিও/ছবি ক্যাটালগে নেই।" Never provide incorrect/unrelated media.
 
 4. 🧠 PERSISTENT CONVERSATION MEMORY:
-   - Understand context from previous dialogue. If customer asks "এটার ওয়ারেন্টি কত দিন?" or "এটার দাম কত?" after previously discussing a specific product, seamlessly refer to that product without asking repeatedly.
-   - If stock/price changed, prioritize the latest catalog data.
+   - Always connect current query with previous dialogue context. If customer previously asked about a specific product (e.g. headlight or smartwatch) and now simply asks "এটার ওয়ারেন্টি কত দিন?" or "এটার দাম কত?", immediately identify that previous product and provide warranty/details without asking which product.
+   - Prioritize latest catalog information if prices changed.
 
 5. 🌍 MULTILINGUAL & FAQS:
    - If asked in Bangla, reply in natural Bengali.
@@ -461,14 +566,17 @@ CORE INSTRUCTIONS:
     let currentContent = [];
     if (userPrompt && userPrompt.trim().length > 0) {
       currentContent.push({ type: 'text', text: userPrompt });
-    } else if (imageUrl) {
-      currentContent.push({ type: 'text', text: 'কাস্টমার এই ছবিটি/স্ক্রিনশটটি পাঠিয়েছেন। ছবিটি দেখে পণ্য শনাক্ত করে দাম, ওয়ারেন্টি ও ডেলিভারি চার্জসহ বাংলায় উত্তর দিন।' });
+    } else if (imagePayload) {
+      currentContent.push({
+        type: 'text',
+        text: 'কাস্টমার এই ছবিটি/স্ক্রিনশটটি পাঠিয়েছেন। ছবির ভেতরের লেখাগুলো (OCR) পড়ে এবং ছবিটি দেখে আমাদের ক্যাটালগ থেকে পণ্যটি শনাক্ত করুন। এরপর পণ্যের নাম, দাম, ওয়ারেন্টি ও ডেলিভারি চার্জসহ সুন্দরভাবে বাংলায় উত্তর দিন।'
+      });
     }
 
-    if (imageUrl) {
+    if (imagePayload) {
       currentContent.push({
         type: 'image_url',
-        image_url: { url: imageUrl }
+        image_url: { url: imagePayload }
       });
     }
 
@@ -485,7 +593,7 @@ CORE INSTRUCTIONS:
           'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 18000
+        timeout: 20000
       }
     );
 
@@ -521,11 +629,11 @@ CORE INSTRUCTIONS:
     if (attempt < MAX_ATTEMPTS) {
       console.log(`[RETRY] Waiting 3.5s before attempt ${attempt + 1}...`);
       await new Promise(r => setTimeout(r, 3500));
-      return await generateAiReplyWithRetry(userPrompt, imageUrl, conversationHistory, attempt + 1);
+      return await generateAiReplyWithRetry(userPrompt, imagePayload, conversationHistory, attempt + 1);
     }
 
     return {
-      replyText: `ধন্যবাদ ভাইয়া! সাময়িক প্রযুক্তিগত সমস্যার কারণে একটু বিলম্ব হচ্ছে। আমাদের শোরুম: ${SHOP_INFO.address}, WhatsApp: ${SHOP_INFO.whatsapp}। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন অথবা সরাসরি WhatsApp-এ মেসেজ দিন। ধন্যবাদ! ❤️`
+      replyText: `ধন্যবাদ ভাইয়া! আপনার ছবিটি পেয়েছি। আমাদের শোরুম: ${SHOP_INFO.address}, WhatsApp: ${SHOP_INFO.whatsapp}। সাময়িক প্রযুক্তিগত সমস্যার কারণে একটু বিলম্ব হচ্ছে, দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন অথবা সরাসরি WhatsApp-এ যোগাযোগ করুন। ধন্যবাদ! ❤️`
     };
   }
 }
@@ -605,7 +713,6 @@ app.post('/api/courier/book', async (req, res) => {
   }
 });
 
-// Backward compatibility for Steadfast create_order
 app.post('/api/v1/create_order', async (req, res) => {
   try {
     const response = await axios.post(
@@ -645,5 +752,6 @@ app.listen(PORT, () => {
   console.log(`🚀 Impotech AI Assistant Server running on Port ${PORT}`);
   console.log(`📍 Showroom: ${SHOP_INFO.address} | 📞 WA: ${SHOP_INFO.whatsapp}`);
   console.log(`🚚 Delivery: Gazipur Inside 50 TK, Gazipur Outside 100 TK`);
+  console.log(`👁️ Multimodal Vision & OCR Engine Activated`);
   console.log(`=======================================================`);
 });
