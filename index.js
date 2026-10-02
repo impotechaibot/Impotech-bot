@@ -6,7 +6,6 @@
  *
  * VOICE:
  *   gemini-3.5-flash-lite
- *   Interactions API
  *
  * GitHub:
  *   catalog.json = products + FAQs
@@ -42,20 +41,13 @@ const GITHUB_REPO =
   process.env.GITHUB_REPO || 'impotechaibot/Impotech-bot';
 
 // =========================
-// GEMINI MODELS
+// GEMINI MODELS & OPENROUTER
 // =========================
 
 const TEXT_MODEL = 'gemini-3.1-flash-lite';
-
-// Google currently documents audio understanding
-// with the Interactions API.
 const VOICE_MODEL = 'gemini-3.5-flash-lite';
 
-const TEXT_GEMINI_URL =
-  `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent`;
-
-const INTERACTIONS_URL =
-  'https://generativelanguage.googleapis.com/v1beta/interactions';
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 // =========================
 // CATALOG
@@ -459,7 +451,7 @@ ${customerText || '[Customer voice/media message]'}
 }
 
 // =========================
-// TEXT GEMINI
+// TEXT GEMINI (OPENROUTER)
 // =========================
 
 async function callTextGemini(parts) {
@@ -469,36 +461,35 @@ async function callTextGemini(parts) {
     );
   }
 
+  const promptText = parts.map(part => part.text || '').join('\n');
+
   const body = {
-    contents: [
+    model: TEXT_MODEL,
+    messages: [
       {
         role: 'user',
-        parts
+        content: promptText
       }
     ],
-
-    generationConfig: {
-      maxOutputTokens:
-        MAX_OUTPUT_TOKENS
-    }
+    max_tokens: MAX_OUTPUT_TOKENS
   };
 
   try {
     console.log(
-      `[GEMINI TEXT] ${TEXT_MODEL}`
+      `[OPENROUTER TEXT] ${TEXT_MODEL}`
     );
 
     const response =
       await axios.post(
-        TEXT_GEMINI_URL,
+        OPENROUTER_URL,
         body,
         {
           headers: {
             'Content-Type':
               'application/json',
 
-            'x-goog-api-key':
-              GEMINI_API_KEY
+            'Authorization':
+              `Bearer ${GEMINI_API_KEY}`
           },
 
           timeout: 30000
@@ -506,16 +497,11 @@ async function callTextGemini(parts) {
       );
 
     const text =
-      response.data
-        ?.candidates?.[0]
-        ?.content?.parts
-        ?.map(part => part.text || '')
-        .join('')
-        .trim();
+      response.data?.choices?.[0]?.message?.content?.trim();
 
     if (!text) {
       throw new Error(
-        'Gemini returned an empty response'
+        'OpenRouter returned an empty response'
       );
     }
 
@@ -523,7 +509,7 @@ async function callTextGemini(parts) {
 
   } catch (error) {
     console.error(
-      '[GEMINI TEXT] Error:',
+      '[OPENROUTER TEXT] Error:',
       error.response?.data?.error?.message ||
       error.message
     );
@@ -533,22 +519,7 @@ async function callTextGemini(parts) {
 }
 
 // =========================
-// VOICE GEMINI
-// =========================
-//
-// IMPORTANT:
-// Voice is NOT sent through generateContent.
-//
-// We use:
-// POST /v1beta/interactions
-//
-// Audio format:
-// {
-//   type: "audio",
-//   data: BASE64,
-//   mime_type: "audio/aac"
-// }
-//
+// VOICE GEMINI (OPENROUTER)
 // =========================
 
 async function callVoiceGemini(
@@ -568,274 +539,70 @@ async function callVoiceGemini(
     );
   }
 
-  const audioBuffer =
-    Buffer.from(
-      audioBase64,
-      'base64'
-    );
-
-  const fileSize =
-    audioBuffer.length;
-
-  console.log(
-    `[GEMINI VOICE] Uploading audio | ${mimeType} | ${fileSize} bytes`
-  );
-
-  // =========================
-  // STEP 1: START FILE UPLOAD
-  // =========================
-
-  const startResponse =
-    await axios.post(
-      'https://generativelanguage.googleapis.com/upload/v1beta/files',
-
-      {
-        file: {
-          display_name:
-            `messenger_voice_${Date.now()}`
-        }
-      },
-
-      {
-        headers: {
-          'x-goog-api-key':
-            GEMINI_API_KEY,
-
-          'X-Goog-Upload-Protocol':
-            'resumable',
-
-          'X-Goog-Upload-Command':
-            'start',
-
-          'X-Goog-Upload-Header-Content-Length':
-            String(fileSize),
-
-          'X-Goog-Upload-Header-Content-Type':
-            mimeType,
-
-          'Content-Type':
-            'application/json'
-        },
-
-        timeout: 30000,
-
-        validateStatus:
-          () => true
-      }
-    );
-
-  if (
-    startResponse.status < 200 ||
-    startResponse.status >= 300
-  ) {
-    console.error(
-      '[GEMINI VOICE] Upload start failed:',
-      startResponse.status,
-      startResponse.data
-    );
-
-    throw new Error(
-      `Gemini upload start failed with status ${startResponse.status}`
-    );
+  let format = 'aac';
+  if (mimeType && mimeType.includes('/')) {
+    format = mimeType.split('/')[1].toLowerCase().replace('mpeg', 'mp3');
   }
-
-  const uploadUrl =
-    startResponse.headers[
-      'x-goog-upload-url'
-    ];
-
-  if (!uploadUrl) {
-    console.error(
-      '[GEMINI VOICE] Upload headers:',
-      startResponse.headers
-    );
-
-    throw new Error(
-      'Gemini Files API upload URL was not returned'
-    );
-  }
-
-  console.log(
-    '[GEMINI VOICE] Upload URL received'
-  );
-
-  // =========================
-  // STEP 2: UPLOAD AUDIO
-  // =========================
-
-  const uploadResponse =
-    await axios.post(
-      uploadUrl,
-
-      audioBuffer,
-
-      {
-        headers: {
-          'Content-Length':
-            String(fileSize),
-
-          'X-Goog-Upload-Offset':
-            '0',
-
-          'X-Goog-Upload-Command':
-            'upload, finalize'
-        },
-
-        timeout: 60000,
-
-        maxContentLength:
-          MAX_ATTACHMENT_BYTES,
-
-        maxBodyLength:
-          MAX_ATTACHMENT_BYTES,
-
-        validateStatus:
-          () => true
-      }
-    );
-
-  if (
-    uploadResponse.status < 200 ||
-    uploadResponse.status >= 300
-  ) {
-    console.error(
-      '[GEMINI VOICE] File upload failed:',
-      uploadResponse.status,
-      uploadResponse.data
-    );
-
-    throw new Error(
-      `Gemini file upload failed with status ${uploadResponse.status}`
-    );
-  }
-
-  const fileUri =
-    uploadResponse.data?.file?.uri;
-
-  const uploadedMimeType =
-    uploadResponse.data?.file?.mimeType ||
-    mimeType;
-
-  if (!fileUri) {
-    console.error(
-      '[GEMINI VOICE] Upload response:',
-      uploadResponse.data
-    );
-
-    throw new Error(
-      'Gemini Files API did not return file URI'
-    );
-  }
-
-  console.log(
-    '[GEMINI VOICE] File uploaded successfully'
-  );
-
-  // =========================
-  // STEP 3: INTERACTIONS API
-  // =========================
 
   const body = {
-    model:
-      VOICE_MODEL,
-
-    input: [
+    model: VOICE_MODEL,
+    messages: [
       {
-        type: 'text',
-
-        text:
-          `${prompt}
-
-গুরুত্বপূর্ণ:
-Customer-এর voice message শুনে তার বক্তব্য বুঝে সরাসরি customer-এর প্রশ্নের উত্তর দাও।
-Voice message-এর transcript customer-কে আলাদাভাবে দেখাবে না।`
-      },
-
-      {
-        type: 'audio',
-
-        uri:
-          fileUri,
-
-        mime_type:
-          uploadedMimeType
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `${prompt}\n\nগুরুত্বপূর্ণ:\nCustomer-এর voice message শুনে তার বক্তব্য বুঝে সরাসরি customer-এর প্রশ্নের উত্তর দাও। Voice message-এর transcript customer-কে আলাদাভাবে দেখাবে না।`
+          },
+          {
+            type: 'input_audio',
+            input_audio: {
+              data: audioBase64,
+              format: format
+            }
+          }
+        ]
       }
     ],
-
-    store:
-      false,
-
-    generation_config: {
-      max_output_tokens:
-        MAX_OUTPUT_TOKENS,
-
-      thinking_level:
-        'minimal'
-    }
+    max_tokens: MAX_OUTPUT_TOKENS
   };
 
   try {
 
     console.log(
-      `[GEMINI VOICE] Sending audio to ${VOICE_MODEL}`
+      `[OPENROUTER VOICE] Sending audio to ${VOICE_MODEL}`
     );
 
     const response =
       await axios.post(
-        INTERACTIONS_URL,
-
+        OPENROUTER_URL,
         body,
-
         {
           headers: {
             'Content-Type':
               'application/json',
 
-            'x-goog-api-key':
-              GEMINI_API_KEY
+            'Authorization':
+              `Bearer ${GEMINI_API_KEY}`
           },
 
           timeout: 60000
         }
       );
 
-    console.log(
-      '[GEMINI VOICE] Interaction completed'
-    );
-
     const outputText =
-      response.data?.output_text ||
-      response.data?.steps
-        ?.filter(
-          step =>
-            step?.type ===
-            'model_output'
-        )
-        ?.flatMap(
-          step =>
-            step.content || []
-        )
-        ?.filter(
-          item =>
-            item?.type === 'text'
-        )
-        ?.map(
-          item =>
-            item.text || ''
-        )
-        ?.join('')
-        ?.trim();
+      response.data?.choices?.[0]?.message?.content?.trim();
 
     if (!outputText) {
       console.error(
-        '[GEMINI VOICE] Full response:',
+        '[OPENROUTER VOICE] Full response:',
         JSON.stringify(
           response.data
         )
       );
 
       throw new Error(
-        'Gemini voice returned empty response'
+        'OpenRouter voice returned empty response'
       );
     }
 
@@ -844,19 +611,15 @@ Voice message-এর transcript customer-কে আলাদাভাবে দ�
   } catch (error) {
 
     console.error(
-      '[GEMINI VOICE] Interaction error:',
-      error.response?.status || ''
-    );
-
-    console.error(
-      '[GEMINI VOICE] Message:',
+      '[OPENROUTER VOICE] Error:',
       error.response?.data?.error?.message ||
       error.message
     );
 
     throw error;
   }
-  }
+}
+
 // =========================
 // DOWNLOAD MESSENGER MEDIA
 // =========================
@@ -910,16 +673,8 @@ async function downloadMessengerAttachment(
         'content-type'
       ]?.split(';')[0];
 
-    if (!mimeType) {
-      mimeType =
-        guessMimeType(
-          attachment.type,
-          url
-        );
-    }
-
     return {
-      mimeType,
+      mimeType: mimeType || 'audio/aac',
       base64:
         buffer.toString('base64')
     };
@@ -1491,7 +1246,6 @@ app.post(
   '/webhook',
   async (req, res) => {
 
-    // Respond immediately to Facebook.
     res.sendStatus(200);
 
     try {
@@ -1527,10 +1281,6 @@ app.post(
             continue;
           }
 
-          // =========================
-          // DUPLICATE MESSAGE CHECK
-          // =========================
-
           const messageId =
             message.mid;
 
@@ -1548,7 +1298,6 @@ app.post(
               messageId
             );
 
-            // Keep memory bounded.
             if (
               processedMessageIds.size >
               5000
@@ -1691,9 +1440,6 @@ app.get(
       voiceModel:
         VOICE_MODEL,
 
-      voiceApi:
-        'Interactions API',
-
       products:
         products.length,
 
@@ -1735,7 +1481,6 @@ app.get(
 
 async function startServer() {
 
-  // Pull latest catalog before traffic.
   await pullCatalogFromGitHub();
 
   app.listen(
@@ -1746,15 +1491,11 @@ async function startServer() {
       );
 
       console.log(
-        `[GEMINI TEXT] ${TEXT_MODEL}`
+        `[OPENROUTER TEXT] ${TEXT_MODEL}`
       );
 
       console.log(
-        `[GEMINI VOICE] ${VOICE_MODEL}`
-      );
-
-      console.log(
-        '[GEMINI VOICE] API: Interactions'
+        `[OPENROUTER VOICE] ${VOICE_MODEL}`
       );
 
       console.log(
@@ -1763,7 +1504,6 @@ async function startServer() {
     }
   );
 
-  // Refresh GitHub catalog every 60 seconds.
   setInterval(
     async () => {
       await pullCatalogFromGitHub();
