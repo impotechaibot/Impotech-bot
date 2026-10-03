@@ -14,7 +14,7 @@ const CATALOG_FILE = process.env.CATALOG_FILE || 'catalog.json';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const TEXT_MODEL = 'google/gemini-3.1-flash-lite';
-const VOICE_MODEL = 'google/gemini-3.5-flash-lite';
+const VOICE_MODEL = 'google/gemini-3.1-flash-lite';
 
 const MAX_PRODUCTS_TO_AI = 3;
 const MAX_FAQS_TO_AI = 4;
@@ -446,28 +446,28 @@ function getHistory(senderId) {
 }
 
 function addHistory(senderId, role, text) {
-  if (!text) return;
-  let record = customerHistory.get(senderId);
-  if (!record) {
-    record = { messages: [], updatedAt: Date.now() };
-  }
-  record.messages.push({
-    role,
-    text: String(text).slice(0, 2000)
-  });
-  record.messages = record.messages.slice(-MAX_HISTORY_ITEMS);
-  record.updatedAt = Date.now();
-  customerHistory.set(senderId, record);
+function isPaused(senderId) {
+  return pausedCustomers.has(senderId);
+}
+
+function pauseCustomer(senderId) {
+  pausedCustomers.add(senderId);
+  console.log(`[HUMAN] Paused customer: ${senderId}`);
+}
+
+function resumeCustomer(senderId) {
+  pausedCustomers.delete(senderId);
+  console.log(`[HUMAN] Resumed customer: ${senderId}`);
 }
 
 function handleAdminCommand(senderId, text) {
   const q = normalizeText(text);
   if (q === 'pause' || q === '.human' || q === 'stop') {
-    pausedCustomers.add(senderId);
+    pauseCustomer(senderId);
     return { handled: true, response: 'Human support mode চালু হয়েছে। AI reply বন্ধ রাখা হয়েছে।' };
   }
   if (q === '.resume' || q === '.ai' || q === 'start') {
-    pausedCustomers.delete(senderId);
+    resumeCustomer(senderId);
     return { handled: true, response: 'AI support mode আবার চালু হয়েছে।' };
   }
   return { handled: false };
@@ -485,7 +485,7 @@ async function handleTextMessage(senderId, text) {
   }
 
   // 2. Check Human Pause
-  if (pausedCustomers.has(senderId)) {
+  if (isPaused(senderId)) {
     console.log(`[HUMAN] Ignoring AI for ${senderId}`);
     return;
   }
@@ -527,7 +527,7 @@ async function handleTextMessage(senderId, text) {
 }
 
 async function handleImageMessage(senderId, attachment, caption) {
-  if (pausedCustomers.has(senderId)) return;
+  if (isPaused(senderId)) return;
 
   const media = await downloadMessengerAttachment(attachment);
   if (!media) {
@@ -548,7 +548,7 @@ async function handleImageMessage(senderId, attachment, caption) {
 }
 
 async function handleVoiceMessage(senderId, attachment) {
-  if (pausedCustomers.has(senderId)) return;
+  if (isPaused(senderId)) return;
 
   const media = await downloadMessengerAttachment(attachment);
   if (!media) {
