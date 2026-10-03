@@ -33,14 +33,14 @@ const DEFAULT_TEXT_MODEL = (
   process.env.OPENROUTER_TEXT_MODEL ||
   process.env.OPENROUTER_MODEL ||
   process.env.AI_MODEL ||
-  'google/gemini-3.5-flash-001'
+  'google/gemini-3.1-flash-001'
 ).trim();
 
 const DEFAULT_VISION_MODEL = (
   process.env.OPENROUTER_VISION_MODEL ||
   process.env.OPENROUTER_MODEL ||
   process.env.AI_MODEL ||
-  'google/gemini-3.5-flash-001'
+  'google/gemini-3.1-flash-001'
 ).trim();
 
 const STEADFAST_API_KEY = (process.env.STEADFAST_API_KEY || '').trim();
