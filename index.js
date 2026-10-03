@@ -41,7 +41,7 @@ const AI_MODEL = cleanKey(
   process.env.OPENROUTER_MODEL ||
   process.env.OPENROUTER_TEXT_MODEL ||
   process.env.AI_MODEL ||
-  'google/gemini-2.5-flash'
+  'google/gemini-flash-latest'
 );
 
 const PAGE_ACCESS_TOKEN = cleanKey(process.env.PAGE_ACCESS_TOKEN);
