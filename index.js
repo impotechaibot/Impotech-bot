@@ -25,7 +25,7 @@ const HISTORY_TTL = 20 * 24 * 60 * 60 * 1000;
 
 let products = [];
 let faqs = [];
-let savedOrders = []; // Database/Memory to store captured survey/order information
+let savedOrders = [];
 
 const pausedCustomers = new Set();
 const processedMessageIds = new Set();
@@ -67,15 +67,12 @@ function extractOrderInformation(text) {
   const phoneMatch = text.match(phoneRegex);
 
   if (!phoneMatch) {
-    return null; // Phone number missing
+    return null;
   }
 
   const phone = phoneMatch[0];
-  
-  // Clean text to extract potential address
   let addressCandidate = text.replace(phone, '').trim();
 
-  // Basic validation check for address length or relevant keywords
   return {
     phone: phone,
     address: addressCandidate || 'ঠিকানা আলাদাভাবে প্রদান করা হয়নি',
@@ -265,7 +262,7 @@ async function callOpenRouter(messages, model) {
         model,
         messages,
         max_tokens: MAX_OUTPUT_TOKENS,
-        temperature: 0.2 // Reduced temperature for accurate factual responses
+        temperature: 0.2
       },
       {
         headers: {
@@ -413,28 +410,6 @@ async function sendMessengerText(recipientId, text) {
   return true;
 }
 
-async function sendMessengerMedia(recipientId, mediaType, mediaUrl) {
-  if (!PAGE_ACCESS_TOKEN || !isValidHttpUrl(mediaUrl)) return false;
-
-  await axios.post(
-    'https://graph.facebook.com/v23.0/me/messages',
-    {
-      recipient: { id: recipientId },
-      message: {
-        attachment: {
-          type: mediaType,
-          payload: { url: mediaUrl, is_reusable: true }
-        }
-      }
-    },
-    {
-      params: { access_token: PAGE_ACCESS_TOKEN },
-      timeout: 15000
-    }
-  );
-  return true;
-}
-
 function getHistory(senderId) {
   const record = customerHistory.get(senderId);
   if (!record) return [];
@@ -446,6 +421,23 @@ function getHistory(senderId) {
 }
 
 function addHistory(senderId, role, text) {
+  if (!text) return;
+  let record = customerHistory.get(senderId);
+  if (!record) {
+    record = {
+      messages: [],
+      updatedAt: Date.now()
+    };
+  }
+  record.messages.push({
+    role,
+    text: String(text).slice(0, 2000)
+  });
+  record.messages = record.messages.slice(-MAX_HISTORY_ITEMS);
+  record.updatedAt = Date.now();
+  customerHistory.set(senderId, record);
+}
+
 function isPaused(senderId) {
   return pausedCustomers.has(senderId);
 }
@@ -477,26 +469,24 @@ async function handleTextMessage(senderId, text) {
   const cleanText = String(text || '').trim();
   if (!cleanText) return;
 
-  // 1. Check Admin Commands
+  // 1. Admin Commands
   const adminResult = handleAdminCommand(senderId, cleanText);
   if (adminResult.handled) {
     await sendMessengerText(senderId, adminResult.response);
     return;
   }
 
-  // 2. Check Human Pause
+  // 2. Human Pause Check
   if (isPaused(senderId)) {
     console.log(`[HUMAN] Ignoring AI for ${senderId}`);
     return;
   }
 
-  // 3. Add to user history
   addHistory(senderId, 'user', cleanText);
 
-  // 4. SURVEY / ORDER DETECTION: Check if message contains address & phone number
+  // 3. Survey / Order Detection
   const orderDetails = extractOrderInformation(cleanText);
   if (orderDetails) {
-    // Save order data to array/memory
     savedOrders.push({
       senderId,
       phone: orderDetails.phone,
@@ -510,12 +500,10 @@ async function handleTextMessage(senderId, text) {
     const successMessage = 'আপনার অর্ডারটি সফলভাবে গ্রহণ হয়েছে। আমাদের একজন প্রতিনিধি শীঘ্রই আপনার সাথে যোগাযোগ করবেন। ধন্যবাদ!';
     addHistory(senderId, 'assistant', successMessage);
     await sendMessengerText(senderId, successMessage);
-    
-    // Stop here so AI doesn't give extra/unwanted response
     return;
   }
 
-  // 5. Generate AI Reply if not an order message
+  // 4. Generate AI Reply
   try {
     const reply = await generateTextReply(cleanText, senderId);
     addHistory(senderId, 'assistant', reply);
@@ -648,11 +636,14 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/orders', (req, res) => {
-  // Simple endpoint to view captured orders
   res.status(200).json({
     total: savedOrders.length,
     orders: savedOrders
   });
+});
+
+app.get('/', (req, res) => {
+  res.status(200).send('Impotech AI Bot is Running Successfully!');
 });
 
 async function startServer() {
