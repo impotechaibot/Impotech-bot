@@ -19,7 +19,7 @@ const VOICE_MODEL = 'google/gemini-3.1-flash-lite';
 const MAX_PRODUCTS_TO_AI = 3;
 const MAX_FAQS_TO_AI = 4;
 const MAX_OUTPUT_TOKENS = 220;
-const MAX_HISTORY_ITEMS = 4;
+const MAX_HISTORY_ITEMS = 8; // বাড়ানো হয়েছে যাতে নাম/ঠিকানা ভুলে না যায়
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const HISTORY_TTL = 20 * 24 * 60 * 60 * 1000;
 
@@ -233,7 +233,7 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
 1. শুধুমাত্র প্রদত্ত RELEVANT PRODUCTS এবং RELEVANT FAQs-এর উপর নির্ভর করে উত্তর দাও।
 2. ক্যাটালগে না থাকা কোনো দাম, ডিসকাউন্ট, স্টক, ওয়ারেন্টি বা স্পেসিফিকেশন নিজের থেকে অনুমান বা বানিয়ে বলবে না।
 3. যদি কাস্টমারের প্রশ্নের উত্তর ক্যাটালগে না থাকে, তাহলে স্পষ্ট ভাষায় বলো যে এই মুহূর্তের তথ্যটি নেই এবং মানব প্রতিনিধি (Human Support) বিষয়টি নিশ্চিত করবেন।
-4. কাস্টমার যদি ঠিকানা ও ফোন নাম্বার প্রদান করে, তাকে নিশ্চিত করো যে তার তথ্য গৃহীত হয়েছে।
+4. কাস্টমার যদি ঠিকানা ও ফোন নাম্বার প্রদান করে, তাকে নিশ্চিত করো যে তার তথ্য গৃহীত হয়েছে এবং অর্ডার কনফার্ম করো।
 5. Customer যে ভাষায় কথা বলেছে (যেমন বাংলা/ইংরেজি) সেই ভাষায় সংক্ষিপ্ত ও স্পষ্ট উত্তর দাও (১-৪ বাক্যের মধ্যে)।
 6. মনগড়া কোনো ফেক প্রতিশ্রুতি দেবে না।
 7. ছবির বিষয়বস্তু নিশ্চিত না হলে মনগড়া অনুমান করবে না।
@@ -444,47 +444,27 @@ function isPaused(senderId) {
 
 function pauseCustomer(senderId) {
   pausedCustomers.add(senderId);
-  console.log(`[HUMAN] Paused customer: ${senderId}`);
+  console.log(`[HUMAN TAKEOVER] AI Paused for customer: ${senderId}`);
 }
 
 function resumeCustomer(senderId) {
   pausedCustomers.delete(senderId);
-  console.log(`[HUMAN] Resumed customer: ${senderId}`);
-}
-
-function handleAdminCommand(senderId, text) {
-  const q = normalizeText(text);
-  if (q === 'pause' || q === '.human' || q === 'stop') {
-    pauseCustomer(senderId);
-    return { handled: true, response: 'Human support mode চালু হয়েছে। AI reply বন্ধ রাখা হয়েছে।' };
-  }
-  if (q === '.resume' || q === '.ai' || q === 'start') {
-    resumeCustomer(senderId);
-    return { handled: true, response: 'AI support mode আবার চালু হয়েছে।' };
-  }
-  return { handled: false };
+  console.log(`[HUMAN TAKEOVER] AI Resumed for customer: ${senderId}`);
 }
 
 async function handleTextMessage(senderId, text) {
   const cleanText = String(text || '').trim();
   if (!cleanText) return;
 
-  // 1. Admin Commands
-  const adminResult = handleAdminCommand(senderId, cleanText);
-  if (adminResult.handled) {
-    await sendMessengerText(senderId, adminResult.response);
-    return;
-  }
-
-  // 2. Human Pause Check
+  // Human Pause Check
   if (isPaused(senderId)) {
-    console.log(`[HUMAN] Ignoring AI for ${senderId}`);
+    console.log(`[HUMAN] AI Response skipped for paused customer: ${senderId}`);
     return;
   }
 
   addHistory(senderId, 'user', cleanText);
 
-  // 3. Survey / Order Detection
+  // Survey / Order Detection
   const orderDetails = extractOrderInformation(cleanText);
   if (orderDetails) {
     savedOrders.push({
@@ -495,22 +475,22 @@ async function handleTextMessage(senderId, text) {
       createdAt: orderDetails.timestamp
     });
 
-    console.log(`[ORDER SURVEY] New order captured from ${senderId}:`, orderDetails);
+    console.log(`[ORDER CAPTURED] Customer: ${senderId}`, orderDetails);
 
-    const successMessage = 'আপনার অর্ডারটি সফলভাবে গ্রহণ হয়েছে। আমাদের একজন প্রতিনিধি শীঘ্রই আপনার সাথে যোগাযোগ করবেন। ধন্যবাদ!';
+    const successMessage = 'আপনার অর্ডারটি সফলভাবে গ্রহণ করা হয়েছে। আমাদের একজন প্রতিনিধি শীঘ্রই আপনার সাথে যোগাযোগ করবেন। ধন্যবাদ!';
     addHistory(senderId, 'assistant', successMessage);
     await sendMessengerText(senderId, successMessage);
     return;
   }
 
-  // 4. Generate AI Reply
+  // Generate AI Reply
   try {
     const reply = await generateTextReply(cleanText, senderId);
     addHistory(senderId, 'assistant', reply);
     await sendMessengerText(senderId, reply);
   } catch (error) {
     console.error('[TEXT AI ERROR]', error.message);
-    await sendMessengerText(senderId, 'দুঃখিত, বর্তমানে সমস্যা হচ্ছে। আমাদের একজন মানব প্রতিনিধি শীঘ্রই সাহায্য করবেন।');
+    await sendMessengerText(senderId, 'দুঃখিত, বর্তমানে প্রসেস করতে সমস্যা হচ্ছে। আমাদের একজন মানব প্রতিনিধি শীঘ্রই সাহায্য করবেন।');
   }
 }
 
@@ -557,17 +537,40 @@ async function handleVoiceMessage(senderId, attachment) {
 }
 
 async function processMessagingEvent(event) {
-  const senderId = event?.sender?.id;
-  if (!senderId || event?.message?.is_echo) return;
+  const message = event?.message;
+  if (!message) return;
 
-  const messageId = event?.message?.mid;
+  // =========================================================
+  // 1. ADMIN HUMAN TAKEOVER (MESSAGE ECHOES HANDLER)
+  // =========================================================
+  if (message.is_echo) {
+    const customerId = event?.recipient?.id; // ইকো মেসেজে recipient-এ কাস্টমার আইডি থাকে
+    const adminText = String(message.text || '').trim().toLowerCase();
+
+    if (!customerId) return;
+
+    // অ্যাডমিন ডট (.) বা 'pause' দিলে AI পজ হবে
+    if (adminText === '.' || adminText === 'pause' || adminText === '.human' || adminText === 'stop') {
+      pauseCustomer(customerId);
+    } 
+    // অ্যাডমিন '.on', '.start', '.resume' বা '.ai' পাঠালে AI আবার চালু হবে
+    else if (adminText === '.on' || adminText === '.start' || adminText === '.resume' || adminText === '.ai') {
+      resumeCustomer(customerId);
+    }
+    return; // অ্যাডমিনের মেসেজে AI নিজে উত্তর দেবে না
+  }
+
+  // =========================================================
+  // 2. CUSTOMER MESSAGE PROCESSING
+  // =========================================================
+  const senderId = event?.sender?.id;
+  if (!senderId) return;
+
+  const messageId = message.mid;
   if (messageId) {
     if (processedMessageIds.has(messageId)) return;
     processedMessageIds.add(messageId);
   }
-
-  const message = event.message;
-  if (!message) return;
 
   if (typeof message.text === 'string' && message.text.trim()) {
     await handleTextMessage(senderId, message.text);
