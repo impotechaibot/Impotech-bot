@@ -9,14 +9,12 @@
  * DATABASE:
  *   PostgreSQL
  *
- * EXISTING customers columns:
- *   sender_id
- *   display_name
- *   last_message_text
- *   last_message_at
- *   created_at
- *   customer_id
- *   takeover
+ * AI:
+ *   OpenRouter
+ *
+ * CATALOG:
+ *   GitHub main branch -> catalog.json
+ *   GitHub API + RAW fallback
  *
  * HUMAN TAKEOVER:
  *
@@ -35,15 +33,6 @@
  * Android API:
  *   POST /api/takeover
  *   GET  /api/takeover/status
- *
- * AI:
- *   OpenRouter
- *
- * TEXT:
- *   google/gemini-3.1-flash-lite
- *
- * VISION:
- *   google/gemini-3.1-flash-lite
  *
  * ============================================================================
  */
@@ -81,12 +70,24 @@ const GITHUB_TOKEN =
   E.GITHUB_TOKEN || "";
 
 const GITHUB_REPO =
-  E.GITHUB_REPO ||
-  "impotechaibot/Impotech-bot";
+  String(
+    E.GITHUB_REPO ||
+    "impotechaibot/Impotech-bot"
+  ).trim();
+
+const GITHUB_BRANCH =
+  String(
+    E.GITHUB_BRANCH ||
+    "main"
+  ).trim();
 
 const CATALOG_FILE =
-  E.CATALOG_FILE ||
-  "catalog.json";
+  String(
+    E.CATALOG_FILE ||
+    "catalog.json"
+  )
+    .trim()
+    .replace(/^\/+/, "");
 
 const DATABASE_URL =
   E.DATABASE_URL || "";
@@ -109,13 +110,6 @@ const VOICE_MODEL =
 // ============================================================================
 // ADMIN IDS
 // ============================================================================
-//
-// If you have one or more admin IDs:
-//
-// ADMIN_IDS=123456789,987654321
-//
-// Leave empty only if you are not using echo-based admin commands.
-//
 
 const ADMIN_IDS = new Set(
   String(E.ADMIN_IDS || "")
@@ -151,7 +145,6 @@ if (DATABASE_URL) {
 // ============================================================================
 
 const customerLocks = new Map();
-
 const recentMessages = new Map();
 
 // ============================================================================
@@ -233,6 +226,7 @@ async function withCustomerLock(
     await previous;
 
     return await fn();
+
   } finally {
     release();
 
@@ -258,10 +252,6 @@ async function initDatabase() {
     return;
   }
 
-  // --------------------------------------------------------------------------
-  // EXISTING CUSTOMERS TABLE COMPATIBILITY
-  // --------------------------------------------------------------------------
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS customers (
       sender_id TEXT,
@@ -273,10 +263,6 @@ async function initDatabase() {
       takeover BOOLEAN NOT NULL DEFAULT FALSE
     );
   `);
-
-  // --------------------------------------------------------------------------
-  // ENSURE ALL EXISTING COLUMNS
-  // --------------------------------------------------------------------------
 
   await pool.query(`
     ALTER TABLE customers
@@ -316,10 +302,6 @@ async function initDatabase() {
     NOT NULL DEFAULT FALSE;
   `);
 
-  // --------------------------------------------------------------------------
-  // KEEP OLD sender_id / customer_id DATA COMPATIBLE
-  // --------------------------------------------------------------------------
-
   await pool.query(`
     UPDATE customers
     SET customer_id = sender_id
@@ -334,10 +316,6 @@ async function initDatabase() {
       AND customer_id IS NOT NULL;
   `);
 
-  // --------------------------------------------------------------------------
-  // MESSAGES
-  // --------------------------------------------------------------------------
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       id BIGSERIAL PRIMARY KEY,
@@ -348,10 +326,6 @@ async function initDatabase() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-
-  // --------------------------------------------------------------------------
-  // ORDERS
-  // --------------------------------------------------------------------------
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS orders (
@@ -365,10 +339,6 @@ async function initDatabase() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-
-  // --------------------------------------------------------------------------
-  // INDEXES
-  // --------------------------------------------------------------------------
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS
@@ -404,7 +374,6 @@ async function ensureCustomer(
 
   if (!id) return;
 
-  // First check if customer exists by either ID.
   const existing =
     await pool.query(
       `
@@ -442,7 +411,6 @@ async function ensureCustomer(
     return;
   }
 
-  // New customer
   await pool.query(
     `
     INSERT INTO customers (
@@ -512,7 +480,7 @@ async function updateCustomerLastMessage(
 }
 
 // ============================================================================
-// HUMAN TAKEOVER — GET
+// HUMAN TAKEOVER - GET
 // ============================================================================
 
 async function getTakeover(
@@ -544,7 +512,7 @@ async function getTakeover(
 }
 
 // ============================================================================
-// HUMAN TAKEOVER — SET
+// HUMAN TAKEOVER - SET
 // ============================================================================
 
 async function setTakeover(
@@ -735,25 +703,10 @@ async function cleanupOldData() {
       ]
     );
 
-    await pool.query(
-      `
-      DELETE FROM customers
-      WHERE updated_at IS NOT NULL
-      AND updated_at <
-      NOW() -
-      ($1 || ' days')::interval
-      `,
-      [
-        DATA_RETENTION_DAYS
-      ]
-    ).catch(() => {
-      // Existing customers table may not have updated_at.
-      // Ignore this optional cleanup.
-    });
-
     console.log(
       `Cleanup completed: ${DATA_RETENTION_DAYS} days`
     );
+
   } catch (err) {
     console.error(
       "Cleanup error:",
@@ -765,11 +718,25 @@ async function cleanupOldData() {
 // ============================================================================
 // LOAD GITHUB CATALOG
 // ============================================================================
+//
+// PRIMARY:
+//   GitHub Contents API
+//
+// FALLBACK:
+//   raw.githubusercontent.com
+//
+// ============================================================================
 
 async function loadCatalog() {
+  const startedAt =
+    Date.now();
+
   try {
     const parts =
-      GITHUB_REPO.split("/");
+      GITHUB_REPO
+        .split("/")
+        .map(x => x.trim())
+        .filter(Boolean);
 
     const owner =
       parts[0];
@@ -779,16 +746,50 @@ async function loadCatalog() {
 
     if (!owner || !repo) {
       throw new Error(
-        "Invalid GITHUB_REPO."
+        `Invalid GITHUB_REPO: ${GITHUB_REPO}`
       );
     }
 
-    const url =
-      `https://api.github.com/repos/${owner}/${repo}/contents/${CATALOG_FILE}`;
+    console.log(
+      "=========================================="
+    );
+
+    console.log(
+      "GITHUB CATALOG SYNC"
+    );
+
+    console.log(
+      `Repository: ${owner}/${repo}`
+    );
+
+    console.log(
+      `Branch: ${GITHUB_BRANCH}`
+    );
+
+    console.log(
+      `Catalog file: ${CATALOG_FILE}`
+    );
+
+    console.log(
+      `Expected source: https://github.com/${owner}/${repo}/blob/${GITHUB_BRANCH}/${CATALOG_FILE}`
+    );
+
+    // ========================================================================
+    // PRIMARY - GITHUB API
+    // ========================================================================
+
+    const apiUrl =
+      `https://api.github.com/repos/${owner}/${repo}/contents/${CATALOG_FILE}?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
 
     const headers = {
       Accept:
-        "application/vnd.github+json"
+        "application/vnd.github+json",
+
+      "X-GitHub-Api-Version":
+        "2022-11-28",
+
+      "User-Agent":
+        "Impotech-BD-AI-Messenger-Bot"
     };
 
     if (GITHUB_TOKEN) {
@@ -796,30 +797,150 @@ async function loadCatalog() {
         `Bearer ${GITHUB_TOKEN}`;
     }
 
-    const response =
-      await axios.get(
-        url,
-        {
-          headers,
-          timeout: 15000
-        }
+    let data = null;
+
+    try {
+      console.log(
+        `Trying GitHub API...`
       );
 
-    const content =
-      Buffer.from(
-        response.data.content,
-        "base64"
-      ).toString("utf8");
+      const response =
+        await axios.get(
+          apiUrl,
+          {
+            headers,
+            timeout: 15000
+          }
+        );
 
-    const data =
-      JSON.parse(content);
+      if (
+        !response.data ||
+        !response.data.content
+      ) {
+        throw new Error(
+          "GitHub API returned no file content."
+        );
+      }
+
+      const content =
+        Buffer.from(
+          response.data.content,
+          "base64"
+        ).toString("utf8");
+
+      data =
+        JSON.parse(content);
+
+      console.log(
+        "GitHub API catalog download: SUCCESS"
+      );
+
+    } catch (apiError) {
+
+      console.error(
+        "GitHub API catalog download failed."
+      );
+
+      console.error(
+        "Status:",
+        apiError.response?.status ||
+        "N/A"
+      );
+
+      console.error(
+        "Message:",
+        apiError.response?.data?.message ||
+        apiError.message
+      );
+
+      // ======================================================================
+      // FALLBACK - RAW GITHUB
+      // ======================================================================
+
+      const rawUrl =
+        `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(GITHUB_BRANCH)}/${CATALOG_FILE}`;
+
+      console.log(
+        `Trying GitHub RAW URL...`
+      );
+
+      try {
+
+        const rawResponse =
+          await axios.get(
+            rawUrl,
+            {
+              timeout: 15000,
+              responseType: "text",
+              headers: {
+                "User-Agent":
+                  "Impotech-BD-AI-Messenger-Bot"
+              }
+            }
+          );
+
+        if (
+          !rawResponse.data
+        ) {
+          throw new Error(
+            "Raw GitHub response is empty."
+          );
+        }
+
+        data =
+          typeof rawResponse.data ===
+          "string"
+            ? JSON.parse(
+                rawResponse.data
+              )
+            : rawResponse.data;
+
+        console.log(
+          "GitHub RAW catalog download: SUCCESS"
+        );
+
+      } catch (rawError) {
+
+        console.error(
+          "GitHub RAW catalog download failed."
+        );
+
+        console.error(
+          "Status:",
+          rawError.response?.status ||
+          "N/A"
+        );
+
+        console.error(
+          "Message:",
+          rawError.response?.data ||
+          rawError.message
+        );
+
+        throw new Error(
+          `Catalog not found: ${owner}/${repo}/${GITHUB_BRANCH}/${CATALOG_FILE}`
+        );
+      }
+    }
+
+    // ========================================================================
+    // NORMALIZE CATALOG
+    // ========================================================================
 
     let products = [];
     let faqs = [];
 
-    if (Array.isArray(data)) {
+    if (
+      Array.isArray(data)
+    ) {
+
       products = data;
-    } else {
+
+    } else if (
+      data &&
+      typeof data === "object"
+    ) {
+
       products =
         data.products ||
         data.items ||
@@ -829,35 +950,92 @@ async function loadCatalog() {
       faqs =
         data.faqs ||
         data.FAQs ||
+        data.faq ||
         [];
     }
 
+    if (
+      !Array.isArray(products)
+    ) {
+      products = [];
+    }
+
+    if (
+      !Array.isArray(faqs)
+    ) {
+      faqs = [];
+    }
+
+    // ========================================================================
+    // CACHE
+    // ========================================================================
+
     catalogCache = {
-      products:
-        Array.isArray(products)
-          ? products
-          : [],
-
-      faqs:
-        Array.isArray(faqs)
-          ? faqs
-          : [],
-
+      products,
+      faqs,
       updatedAt:
         Date.now()
     };
 
     console.log(
-      `Catalog loaded: ${catalogCache.products.length} products, ${catalogCache.faqs.length} FAQs`
+      `Catalog loaded successfully: ${products.length} products, ${faqs.length} FAQs`
+    );
+
+    console.log(
+      `Catalog sync completed in ${Date.now() - startedAt}ms`
+    );
+
+    console.log(
+      "=========================================="
     );
 
     return catalogCache;
+
   } catch (err) {
+
     console.error(
-      "Catalog load failed:",
-      err.response?.data ||
+      "=========================================="
+    );
+
+    console.error(
+      "CATALOG LOAD FAILED"
+    );
+
+    console.error(
       err.message
     );
+
+    console.error(
+      `Repository: ${GITHUB_REPO}`
+    );
+
+    console.error(
+      `Branch: ${GITHUB_BRANCH}`
+    );
+
+    console.error(
+      `File: ${CATALOG_FILE}`
+    );
+
+    console.error(
+      "=========================================="
+    );
+
+    if (
+      catalogCache.products.length > 0 ||
+      catalogCache.faqs.length > 0
+    ) {
+
+      console.log(
+        `Using existing catalog cache: ${catalogCache.products.length} products, ${catalogCache.faqs.length} FAQs`
+      );
+
+    } else {
+
+      console.warn(
+        "Catalog cache is empty."
+      );
+    }
 
     return catalogCache;
   }
@@ -908,6 +1086,7 @@ function findRelevantProducts(
 
   return catalogCache.products
     .map(product => {
+
       const text =
         productSearchText(
           product
@@ -915,8 +1094,13 @@ function findRelevantProducts(
 
       let score = 0;
 
-      for (const word of words) {
-        if (text.includes(word)) {
+      for (
+        const word of words
+      ) {
+
+        if (
+          text.includes(word)
+        ) {
           score++;
         }
       }
@@ -972,6 +1156,7 @@ function findRelevantFAQs(
 
   return catalogCache.faqs
     .map(faq => {
+
       const text =
         JSON.stringify(
           faq
@@ -979,8 +1164,13 @@ function findRelevantFAQs(
 
       let score = 0;
 
-      for (const word of words) {
-        if (text.includes(word)) {
+      for (
+        const word of words
+      ) {
+
+        if (
+          text.includes(word)
+        ) {
           score++;
         }
       }
@@ -1033,18 +1223,17 @@ function extractBDPhone(
     matches[0];
 
   if (
-    phone.startsWith(
-      "+88"
-    )
+    phone.startsWith("+88")
   ) {
+
     phone =
       phone.substring(3);
+
   } else if (
-    phone.startsWith(
-      "88"
-    ) &&
+    phone.startsWith("88") &&
     phone.length === 13
   ) {
+
     phone =
       phone.substring(2);
   }
@@ -1121,6 +1310,7 @@ function getProductMedia(
   for (
     const field of fields
   ) {
+
     const value =
       product[field];
 
@@ -1129,10 +1319,13 @@ function getProductMedia(
     if (
       Array.isArray(value)
     ) {
+
       media.push(
         ...value
       );
+
     } else {
+
       media.push(
         value
       );
@@ -1171,17 +1364,12 @@ async function callOpenRouter({
   const response =
     await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
-
       {
         model,
-
         messages,
-
         temperature,
-
         max_tokens: 700
       },
-
       {
         headers: {
           Authorization:
@@ -1204,8 +1392,7 @@ async function callOpenRouter({
   return (
     response.data
       ?.choices?.[0]
-      ?.message
-      ?.content ||
+      ?.message?.content ||
     ""
   );
 }
@@ -1346,6 +1533,7 @@ async function generateAIReply(
   for (
     const item of history
   ) {
+
     messages.push({
       role:
         item.role ===
@@ -1370,7 +1558,9 @@ async function generateAIReply(
     attempt <= 2;
     attempt++
   ) {
+
     try {
+
       const reply =
         await callOpenRouter({
           model:
@@ -1385,6 +1575,7 @@ async function generateAIReply(
         reply &&
         reply.trim()
       ) {
+
         return {
           reply:
             reply.trim(),
@@ -1396,7 +1587,9 @@ async function generateAIReply(
       throw new Error(
         "Empty AI response."
       );
+
     } catch (err) {
+
       lastError = err;
 
       console.error(
@@ -1630,21 +1823,12 @@ async function processMessengerEvent(
     isEcho &&
     text
   ) {
-    const command =
-      normalizeAdminCommand(
-        text
-      );
-
-    // ------------------------------------------------------------------------
-    // ADMIN TAKEOVER
-    // ------------------------------------------------------------------------
 
     if (
       isAdmin(senderId) &&
-      isTakeoverCommand(
-        text
-      )
+      isTakeoverCommand(text)
     ) {
+
       await setTakeover(
         recipientId,
         true
@@ -1657,16 +1841,11 @@ async function processMessengerEvent(
       return;
     }
 
-    // ------------------------------------------------------------------------
-    // ADMIN RESUME AI
-    // ------------------------------------------------------------------------
-
     if (
       isAdmin(senderId) &&
-      isResumeCommand(
-        text
-      )
+      isResumeCommand(text)
     ) {
+
       await setTakeover(
         recipientId,
         false
@@ -1678,10 +1857,6 @@ async function processMessengerEvent(
 
       return;
     }
-
-    // ------------------------------------------------------------------------
-    // Any admin echo should NOT trigger AI.
-    // ------------------------------------------------------------------------
 
     return;
   }
@@ -1740,6 +1915,7 @@ async function processMessengerEvent(
   // ==========================================================================
 
   if (text) {
+
     await updateCustomerLastMessage(
       customerId,
       text
@@ -1749,15 +1925,6 @@ async function processMessengerEvent(
   // ==========================================================================
   // HUMAN TAKEOVER CHECK
   // ==========================================================================
-  //
-  // THIS MUST HAPPEN BEFORE AI.
-  //
-  // If takeover = TRUE:
-  //    Save customer message
-  //    DO NOT call OpenRouter
-  //    DO NOT send AI response
-  //
-  // ==========================================================================
 
   const takeover =
     await getTakeover(
@@ -1765,11 +1932,13 @@ async function processMessengerEvent(
     );
 
   if (takeover) {
+
     console.log(
       `AI BLOCKED - HUMAN TAKEOVER ACTIVE: ${customerId}`
     );
 
     if (text) {
+
       await saveMessage(
         customerId,
         "user",
@@ -1804,12 +1973,14 @@ async function processMessengerEvent(
       ?.payload
       ?.url
   ) {
+
     const imageUrl =
       imageAttachment
         .payload
         .url;
 
     if (text) {
+
       await saveMessage(
         customerId,
         "user",
@@ -1821,6 +1992,7 @@ async function processMessengerEvent(
     }
 
     try {
+
       const result =
         await analyzeImage(
           imageUrl,
@@ -1841,7 +2013,9 @@ async function processMessengerEvent(
         customerId,
         result
       );
+
     } catch (err) {
+
       console.error(
         "Vision error:",
         err.response?.data ||
@@ -1868,10 +2042,8 @@ async function processMessengerEvent(
   const audioAttachment =
     attachments.find(
       a =>
-        a.type ===
-          "audio" ||
-        a.type ===
-          "file"
+        a.type === "audio" ||
+        a.type === "file"
     );
 
   if (
@@ -1880,6 +2052,7 @@ async function processMessengerEvent(
       ?.url &&
     !text
   ) {
+
     await sendMessengerMessage(
       customerId,
       "আপনার ভয়েস মেসেজটি পেয়েছি। ভয়েস থেকে তথ্য নেওয়ার পর উত্তর দেওয়ার ব্যবস্থা করা আছে।"
@@ -1911,11 +2084,14 @@ async function processMessengerEvent(
   // ==========================================================================
 
   try {
+
     await processOrderInformation(
       customerId,
       text
     );
+
   } catch (err) {
+
     console.error(
       "Order processing error:",
       err.message
@@ -1925,11 +2101,6 @@ async function processMessengerEvent(
   // ==========================================================================
   // FINAL TAKEOVER CHECK
   // ==========================================================================
-  //
-  // Extra protection against takeover being enabled
-  // while processing the message.
-  //
-  // ==========================================================================
 
   const takeoverBeforeAI =
     await getTakeover(
@@ -1937,6 +2108,7 @@ async function processMessengerEvent(
     );
 
   if (takeoverBeforeAI) {
+
     console.log(
       `AI BLOCKED BEFORE REQUEST: ${customerId}`
     );
@@ -1949,12 +2121,12 @@ async function processMessengerEvent(
   // ==========================================================================
 
   try {
+
     const result =
       await withCustomerLock(
         customerId,
         async () => {
 
-          // Re-check inside lock
           const lockedTakeover =
             await getTakeover(
               customerId
@@ -1973,8 +2145,8 @@ async function processMessengerEvent(
         }
       );
 
-    // Takeover could have become active
     if (!result) {
+
       console.log(
         `AI cancelled because human takeover became active: ${customerId}`
       );
@@ -2005,7 +2177,6 @@ async function processMessengerEvent(
       }
     );
 
-    // Final protection before sending.
     const finalTakeover =
       await getTakeover(
         customerId
@@ -2014,6 +2185,7 @@ async function processMessengerEvent(
     if (
       finalTakeover
     ) {
+
       console.log(
         `AI SEND BLOCKED - takeover active: ${customerId}`
       );
@@ -2027,6 +2199,7 @@ async function processMessengerEvent(
     );
 
   } catch (err) {
+
     console.error(
       "AI processing error:",
       err.response?.data ||
@@ -2038,8 +2211,7 @@ async function processMessengerEvent(
     );
 
     try {
-      // Do not send fallback if human takeover
-      // became active during the error period.
+
       const takeoverAfterError =
         await getTakeover(
           customerId
@@ -2055,7 +2227,9 @@ async function processMessengerEvent(
         customerId,
         "দুঃখিত, এই মুহূর্তে একটু টেকনিক্যাল সমস্যা হচ্ছে। অনুগ্রহ করে ১–২ মিনিট পরে আবার মেসেজ করুন।"
       );
+
     } catch (sendErr) {
+
       console.error(
         "Fallback send failed:",
         sendErr.message
@@ -2071,6 +2245,7 @@ async function processMessengerEvent(
 app.get(
   "/webhook",
   (req, res) => {
+
     const mode =
       req.query[
         "hub.mode"
@@ -2090,6 +2265,7 @@ app.get(
       mode === "subscribe" &&
       token === VERIFY_TOKEN
     ) {
+
       return res
         .status(200)
         .send(challenge);
@@ -2109,10 +2285,11 @@ app.post(
   "/webhook",
   async (req, res) => {
 
-    // Immediately acknowledge Meta
+    // Immediately acknowledge Meta.
     res.sendStatus(200);
 
     try {
+
       const body =
         req.body;
 
@@ -2127,16 +2304,21 @@ app.post(
         const entry of
         body.entry || []
       ) {
+
         for (
           const event of
           entry.messaging ||
           []
         ) {
+
           try {
+
             await processMessengerEvent(
               event
             );
+
           } catch (err) {
+
             console.error(
               "Webhook event error:",
               err.response?.data ||
@@ -2147,6 +2329,7 @@ app.post(
       }
 
     } catch (err) {
+
       console.error(
         "Webhook processing error:",
         err.response?.data ||
@@ -2163,18 +2346,23 @@ app.post(
 app.get(
   "/health",
   async (req, res) => {
+
     let database =
       "not_configured";
 
     if (pool) {
+
       try {
+
         await pool.query(
           "SELECT 1"
         );
 
         database =
           "connected";
+
       } catch (err) {
+
         database =
           "error";
       }
@@ -2202,6 +2390,17 @@ app.get(
           .faqs
           .length,
 
+      catalogSource: {
+        repository:
+          GITHUB_REPO,
+
+        branch:
+          GITHUB_BRANCH,
+
+        file:
+          CATALOG_FILE
+      },
+
       retentionDays:
         DATA_RETENTION_DAYS
     });
@@ -2215,18 +2414,23 @@ app.get(
 app.get(
   "/api/status",
   async (req, res) => {
+
     let database =
       "not_configured";
 
     if (pool) {
+
       try {
+
         await pool.query(
           "SELECT 1"
         );
 
         database =
           "connected";
+
       } catch {
+
         database =
           "error";
       }
@@ -2252,6 +2456,16 @@ app.get(
       },
 
       catalog: {
+
+        repository:
+          GITHUB_REPO,
+
+        branch:
+          GITHUB_BRANCH,
+
+        file:
+          CATALOG_FILE,
+
         products:
           catalogCache
             .products
@@ -2273,6 +2487,7 @@ app.get(
       },
 
       business: {
+
         shop:
           BUSINESS_INFO
             .shopName,
@@ -2307,12 +2522,23 @@ app.get(
 app.get(
   "/api/training",
   async (req, res) => {
+
     try {
+
       const catalog =
         await loadCatalog();
 
       res.json({
         success: true,
+
+        repository:
+          GITHUB_REPO,
+
+        branch:
+          GITHUB_BRANCH,
+
+        file:
+          CATALOG_FILE,
 
         products:
           catalog.products,
@@ -2325,8 +2551,10 @@ app.get(
       });
 
     } catch (err) {
+
       res.status(500).json({
         success: false,
+
         error:
           err.message
       });
@@ -2337,7 +2565,9 @@ app.get(
 app.post(
   "/api/training",
   async (req, res) => {
+
     try {
+
       const catalog =
         await loadCatalog();
 
@@ -2346,6 +2576,15 @@ app.post(
 
         message:
           "Catalog synchronized successfully.",
+
+        repository:
+          GITHUB_REPO,
+
+        branch:
+          GITHUB_BRANCH,
+
+        file:
+          CATALOG_FILE,
 
         products:
           catalog
@@ -2359,8 +2598,10 @@ app.post(
       });
 
     } catch (err) {
+
       res.status(500).json({
         success: false,
+
         error:
           err.message
       });
@@ -2371,30 +2612,11 @@ app.post(
 // ============================================================================
 // HUMAN TAKEOVER API
 // ============================================================================
-//
-// Android can use:
-//
-// POST /api/takeover
-//
-// Body:
-//
-// {
-//   "customerId": "FACEBOOK_CUSTOMER_ID",
-//   "enabled": true
-// }
-//
-// enabled=true  => HUMAN ON / AI OFF
-// enabled=false => AI ON
-//
-// Compatibility also accepts:
-// customer_id
-// sender_id
-//
-// ============================================================================
 
 app.post(
   "/api/takeover",
   async (req, res) => {
+
     try {
 
       const customerId =
@@ -2406,6 +2628,7 @@ app.post(
         ).trim();
 
       if (!customerId) {
+
         return res.status(400).json({
           success: false,
 
@@ -2465,16 +2688,11 @@ app.post(
 // ============================================================================
 // HUMAN TAKEOVER STATUS API
 // ============================================================================
-//
-// GET:
-//
-// /api/takeover/status?customerId=XXXXXXXX
-//
-// ============================================================================
 
 app.get(
   "/api/takeover/status",
   async (req, res) => {
+
     try {
 
       const customerId =
@@ -2486,6 +2704,7 @@ app.get(
         ).trim();
 
       if (!customerId) {
+
         return res.status(400).json({
           success: false,
 
@@ -2533,6 +2752,7 @@ app.get(
 app.get(
   "/api/customer/:customerId/history",
   async (req, res) => {
+
     try {
 
       const customerId =
@@ -2573,6 +2793,7 @@ app.get(
 app.post(
   "/api/cleanup",
   async (req, res) => {
+
     try {
 
       await cleanupOldData();
@@ -2603,6 +2824,7 @@ app.post(
 app.post(
   "/api/test/send",
   async (req, res) => {
+
     try {
 
       const recipientId =
@@ -2620,6 +2842,7 @@ app.post(
         !recipientId ||
         !message
       ) {
+
         return res.status(
           400
         ).json({
@@ -2685,6 +2908,34 @@ async function start() {
       "=========================================="
     );
 
+    console.log(
+      "CONFIGURATION:"
+    );
+
+    console.log(
+      `GitHub repository: ${GITHUB_REPO}`
+    );
+
+    console.log(
+      `GitHub branch: ${GITHUB_BRANCH}`
+    );
+
+    console.log(
+      `Catalog file: ${CATALOG_FILE}`
+    );
+
+    console.log(
+      `Text model: ${TEXT_MODEL}`
+    );
+
+    console.log(
+      `Vision model: ${VISION_MODEL}`
+    );
+
+    console.log(
+      "=========================================="
+    );
+
     await initDatabase();
 
     await loadCatalog();
@@ -2713,6 +2964,10 @@ async function start() {
         );
 
         console.log(
+          `Catalog: ${GITHUB_REPO}/${GITHUB_BRANCH}/${CATALOG_FILE}`
+        );
+
+        console.log(
           "Human Takeover API: /api/takeover"
         );
 
@@ -2720,6 +2975,9 @@ async function start() {
           "Takeover Status API: /api/takeover/status"
         );
 
+        console.log(
+          "=========================================="
+        );
       }
     );
 
