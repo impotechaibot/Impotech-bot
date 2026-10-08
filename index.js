@@ -3,7 +3,7 @@
  * IMPOTECH BD - AI MESSENGER SALES & SUPPORT BOT
  * ============================================================================
  *
- * SINGLE ROOT FILE:
+ * FILE:
  *   index.js
  *
  * DATABASE:
@@ -18,19 +18,19 @@
  *
  * HUMAN TAKEOVER:
  *
- *   Admin:
- *      .          -> HUMAN ON / AI OFF
- *      pause      -> HUMAN ON / AI OFF
- *      .human     -> HUMAN ON / AI OFF
- *      stop       -> HUMAN ON / AI OFF
+ *   HUMAN ON:
+ *      .
+ *      pause
+ *      .human
+ *      stop
  *
- *   Resume AI:
+ *   AI RESUME:
  *      .on
  *      .start
  *      .resume
  *      .ai
  *
- * Android API:
+ * API:
  *   POST /api/takeover
  *   GET  /api/takeover/status
  *
@@ -107,6 +107,18 @@ const VOICE_MODEL =
   E.VOICE_MODEL ||
   "google/gemini-3.1-flash-lite";
 
+/*
+ * Optional:
+ *
+ * If you know your Facebook Page ID, you may put it in Render:
+ *
+ * PAGE_ID=xxxxxxxxxxxxxxxx
+ *
+ * It is useful for debugging Messenger echo events.
+ */
+const PAGE_ID =
+  String(E.PAGE_ID || "").trim();
+
 // ============================================================================
 // ADMIN IDS
 // ============================================================================
@@ -127,6 +139,7 @@ let pool = null;
 if (DATABASE_URL) {
   pool = new Pool({
     connectionString: DATABASE_URL,
+
     ssl: {
       rejectUnauthorized: false
     }
@@ -141,10 +154,11 @@ if (DATABASE_URL) {
 }
 
 // ============================================================================
-// MEMORY / LOCKS
+// MEMORY
 // ============================================================================
 
 const customerLocks = new Map();
+
 const recentMessages = new Map();
 
 // ============================================================================
@@ -217,9 +231,12 @@ async function withCustomerLock(
       release = resolve;
     });
 
+  const queued =
+    previous.then(() => current);
+
   customerLocks.set(
     customerId,
-    previous.then(() => current)
+    queued
   );
 
   try {
@@ -232,9 +249,11 @@ async function withCustomerLock(
 
     if (
       customerLocks.get(customerId) ===
-      current
+      queued
     ) {
-      customerLocks.delete(customerId);
+      customerLocks.delete(
+        customerId
+      );
     }
   }
 }
@@ -525,14 +544,14 @@ async function setTakeover(
     );
   }
 
-  if (!customerId) {
+  const id =
+    String(customerId || "").trim();
+
+  if (!id) {
     throw new Error(
       "customerId is required."
     );
   }
-
-  const id =
-    String(customerId).trim();
 
   await ensureCustomer(id);
 
@@ -558,7 +577,7 @@ async function setTakeover(
 
   if (!result.rows.length) {
     throw new Error(
-      "Customer could not be updated."
+      `Customer ${id} could not be updated.`
     );
   }
 
@@ -716,15 +735,55 @@ async function cleanupOldData() {
 }
 
 // ============================================================================
-// LOAD GITHUB CATALOG
+// CATALOG JSON VALIDATION
 // ============================================================================
-//
-// PRIMARY:
-//   GitHub Contents API
-//
-// FALLBACK:
-//   raw.githubusercontent.com
-//
+
+function normalizeCatalogData(data) {
+  if (!data) {
+    throw new Error(
+      "Catalog file is empty."
+    );
+  }
+
+  let products = [];
+  let faqs = [];
+
+  if (Array.isArray(data)) {
+    products = data;
+  } else if (
+    typeof data === "object"
+  ) {
+    products =
+      data.products ||
+      data.items ||
+      data.catalog ||
+      [];
+
+    faqs =
+      data.faqs ||
+      data.FAQs ||
+      data.faq ||
+      [];
+  }
+
+  if (!Array.isArray(products)) {
+    throw new Error(
+      "Catalog 'products' must be an array."
+    );
+  }
+
+  if (!Array.isArray(faqs)) {
+    faqs = [];
+  }
+
+  return {
+    products,
+    faqs
+  };
+}
+
+// ============================================================================
+// LOAD GITHUB CATALOG
 // ============================================================================
 
 async function loadCatalog() {
@@ -775,11 +834,19 @@ async function loadCatalog() {
     );
 
     // ========================================================================
-    // PRIMARY - GITHUB API
+    // GITHUB API
     // ========================================================================
 
+    const encodedPath =
+      CATALOG_FILE
+        .split("/")
+        .map(part =>
+          encodeURIComponent(part)
+        )
+        .join("/");
+
     const apiUrl =
-      `https://api.github.com/repos/${owner}/${repo}/contents/${CATALOG_FILE}?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
+      `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
 
     const headers = {
       Accept:
@@ -801,7 +868,7 @@ async function loadCatalog() {
 
     try {
       console.log(
-        `Trying GitHub API...`
+        "Trying GitHub API..."
       );
 
       const response =
@@ -814,7 +881,14 @@ async function loadCatalog() {
         );
 
       if (
-        !response.data ||
+        !response.data
+      ) {
+        throw new Error(
+          "GitHub API returned empty response."
+        );
+      }
+
+      if (
         !response.data.content
       ) {
         throw new Error(
@@ -828,8 +902,20 @@ async function loadCatalog() {
           "base64"
         ).toString("utf8");
 
-      data =
-        JSON.parse(content);
+      if (!content.trim()) {
+        throw new Error(
+          "catalog.json is empty."
+        );
+      }
+
+      try {
+        data =
+          JSON.parse(content);
+      } catch (jsonError) {
+        throw new Error(
+          `Invalid catalog JSON: ${jsonError.message}`
+        );
+      }
 
       console.log(
         "GitHub API catalog download: SUCCESS"
@@ -854,14 +940,14 @@ async function loadCatalog() {
       );
 
       // ======================================================================
-      // FALLBACK - RAW GITHUB
+      // RAW GITHUB FALLBACK
       // ======================================================================
 
       const rawUrl =
-        `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(GITHUB_BRANCH)}/${CATALOG_FILE}`;
+        `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(GITHUB_BRANCH)}/${encodedPath}`;
 
       console.log(
-        `Trying GitHub RAW URL...`
+        "Trying GitHub RAW URL..."
       );
 
       try {
@@ -872,28 +958,41 @@ async function loadCatalog() {
             {
               timeout: 15000,
               responseType: "text",
+
               headers: {
                 "User-Agent":
-                  "Impotech-BD-AI-Messenger-Bot"
+                  "Impotech-BD-AI-Messenger-Bot",
+
+                "Cache-Control":
+                  "no-cache"
               }
             }
           );
 
         if (
-          !rawResponse.data
+          !rawResponse.data ||
+          !String(
+            rawResponse.data
+          ).trim()
         ) {
           throw new Error(
-            "Raw GitHub response is empty."
+            "Raw GitHub catalog is empty."
           );
         }
 
-        data =
-          typeof rawResponse.data ===
-          "string"
-            ? JSON.parse(
-                rawResponse.data
-              )
-            : rawResponse.data;
+        try {
+
+          data =
+            JSON.parse(
+              rawResponse.data
+            );
+
+        } catch (jsonError) {
+
+          throw new Error(
+            `Invalid catalog JSON: ${jsonError.message}`
+          );
+        }
 
         console.log(
           "GitHub RAW catalog download: SUCCESS"
@@ -913,72 +1012,44 @@ async function loadCatalog() {
 
         console.error(
           "Message:",
-          rawError.response?.data ||
-          rawError.message
+          typeof rawError.response?.data ===
+          "string"
+            ? rawError.response.data
+            : rawError.message
         );
 
         throw new Error(
-          `Catalog not found: ${owner}/${repo}/${GITHUB_BRANCH}/${CATALOG_FILE}`
+          `Catalog could not be loaded: ${owner}/${repo}/${GITHUB_BRANCH}/${CATALOG_FILE}`
         );
       }
     }
 
     // ========================================================================
-    // NORMALIZE CATALOG
+    // NORMALIZE
     // ========================================================================
 
-    let products = [];
-    let faqs = [];
-
-    if (
-      Array.isArray(data)
-    ) {
-
-      products = data;
-
-    } else if (
-      data &&
-      typeof data === "object"
-    ) {
-
-      products =
-        data.products ||
-        data.items ||
-        data.catalog ||
-        [];
-
-      faqs =
-        data.faqs ||
-        data.FAQs ||
-        data.faq ||
-        [];
-    }
-
-    if (
-      !Array.isArray(products)
-    ) {
-      products = [];
-    }
-
-    if (
-      !Array.isArray(faqs)
-    ) {
-      faqs = [];
-    }
+    const normalized =
+      normalizeCatalogData(
+        data
+      );
 
     // ========================================================================
     // CACHE
     // ========================================================================
 
     catalogCache = {
-      products,
-      faqs,
+      products:
+        normalized.products,
+
+      faqs:
+        normalized.faqs,
+
       updatedAt:
         Date.now()
     };
 
     console.log(
-      `Catalog loaded successfully: ${products.length} products, ${faqs.length} FAQs`
+      `Catalog loaded successfully: ${catalogCache.products.length} products, ${catalogCache.faqs.length} FAQs`
     );
 
     console.log(
@@ -1097,7 +1168,6 @@ function findRelevantProducts(
       for (
         const word of words
       ) {
-
         if (
           text.includes(word)
         ) {
@@ -1167,7 +1237,6 @@ function findRelevantFAQs(
       for (
         const word of words
       ) {
-
         if (
           text.includes(word)
         ) {
@@ -1262,6 +1331,7 @@ async function sendMessengerMessage(
 
   await axios.post(
     "https://graph.facebook.com/v23.0/me/messages",
+
     {
       recipient: {
         id: recipientId
@@ -1271,6 +1341,7 @@ async function sendMessengerMessage(
         text: message
       }
     },
+
     {
       params: {
         access_token:
@@ -1280,70 +1351,6 @@ async function sendMessengerMessage(
       timeout: 20000
     }
   );
-}
-
-// ============================================================================
-// PRODUCT MEDIA
-// ============================================================================
-
-function getProductMedia(
-  product
-) {
-  if (!product) {
-    return [];
-  }
-
-  const media = [];
-
-  const fields = [
-    "image",
-    "imageUrl",
-    "image_url",
-    "photo",
-    "photoUrl",
-    "video",
-    "videoUrl",
-    "video_url",
-    "media"
-  ];
-
-  for (
-    const field of fields
-  ) {
-
-    const value =
-      product[field];
-
-    if (!value) continue;
-
-    if (
-      Array.isArray(value)
-    ) {
-
-      media.push(
-        ...value
-      );
-
-    } else {
-
-      media.push(
-        value
-      );
-    }
-  }
-
-  return media
-    .filter(
-      x =>
-        typeof x ===
-        "string"
-    )
-    .filter(
-      x =>
-        /^https?:\/\//i.test(
-          x
-        )
-    );
 }
 
 // ============================================================================
@@ -1364,12 +1371,17 @@ async function callOpenRouter({
   const response =
     await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
+
       {
         model,
+
         messages,
+
         temperature,
+
         max_tokens: 700
       },
+
       {
         headers: {
           Authorization:
@@ -1442,7 +1454,7 @@ STRICT RULES:
 15. Never reveal API keys, database details or internal technical information.
 16. Never create fake product links.
 17. Never claim an order is confirmed unless actually confirmed.
-18. Remember the recent conversation context.
+18. Remember recent conversation context.
 19. Follow-up questions must use previous conversation context.
 20. If customer says "দাম কত?" after discussing a product, understand which product they mean.
 21. Delivery charges must use only the official business rules.
@@ -1717,7 +1729,7 @@ async function processOrderInformation(
 }
 
 // ============================================================================
-// ADMIN CHECK
+// ADMIN COMMANDS
 // ============================================================================
 
 function isAdmin(
@@ -1728,20 +1740,15 @@ function isAdmin(
   }
 
   return ADMIN_IDS.has(
-    String(senderId)
+    String(senderId).trim()
   );
 }
-
-// ============================================================================
-// ADMIN COMMANDS
-// ============================================================================
 
 function normalizeAdminCommand(
   text
 ) {
-  return normalizeText(
-    text
-  ).toLowerCase();
+  return normalizeText(text)
+    .toLowerCase();
 }
 
 function isTakeoverCommand(
@@ -1753,9 +1760,7 @@ function isTakeoverCommand(
     ".human",
     "stop"
   ].includes(
-    normalizeAdminCommand(
-      text
-    )
+    normalizeAdminCommand(text)
   );
 }
 
@@ -1768,9 +1773,7 @@ function isResumeCommand(
     ".resume",
     ".ai"
   ].includes(
-    normalizeAdminCommand(
-      text
-    )
+    normalizeAdminCommand(text)
   );
 }
 
@@ -1816,7 +1819,23 @@ async function processMessengerEvent(
     );
 
   // ==========================================================================
-  // ADMIN / ECHO
+  // FACEBOOK ECHO
+  // ==========================================================================
+  //
+  // For Page outgoing messages:
+  //
+  //   senderId    = Page
+  //   recipientId = Customer
+  //
+  // Therefore the old code incorrectly checked:
+  //
+  //   isAdmin(senderId)
+  //
+  // which normally fails because senderId is the Page ID.
+  //
+  // We now identify takeover commands from Page echo messages and apply the
+  // command to recipientId, which is the customer.
+  //
   // ==========================================================================
 
   if (
@@ -1824,40 +1843,140 @@ async function processMessengerEvent(
     text
   ) {
 
+    const command =
+      normalizeAdminCommand(
+        text
+      );
+
+    // ------------------------------------------------------------------------
+    // HUMAN TAKEOVER ON
+    // ------------------------------------------------------------------------
+
     if (
-      isAdmin(senderId) &&
-      isTakeoverCommand(text)
+      isTakeoverCommand(command)
     ) {
 
-      await setTakeover(
-        recipientId,
-        true
-      );
+      try {
 
-      console.log(
-        `HUMAN TAKEOVER ON: ${recipientId}`
-      );
+        const targetCustomerId =
+          String(
+            recipientId || ""
+          ).trim();
+
+        if (!targetCustomerId) {
+
+          console.error(
+            "HUMAN TAKEOVER FAILED: customer ID missing."
+          );
+
+          return;
+        }
+
+        await setTakeover(
+          targetCustomerId,
+          true
+        );
+
+        console.log(
+          "=========================================="
+        );
+
+        console.log(
+          "HUMAN TAKEOVER ACTIVATED"
+        );
+
+        console.log(
+          `Customer: ${targetCustomerId}`
+        );
+
+        console.log(
+          `Command: ${command}`
+        );
+
+        console.log(
+          "AI: OFF"
+        );
+
+        console.log(
+          "=========================================="
+        );
+
+      } catch (err) {
+
+        console.error(
+          "Human Takeover ON error:",
+          err.message
+        );
+      }
 
       return;
     }
 
+    // ------------------------------------------------------------------------
+    // AI RESUME
+    // ------------------------------------------------------------------------
+
     if (
-      isAdmin(senderId) &&
-      isResumeCommand(text)
+      isResumeCommand(command)
     ) {
 
-      await setTakeover(
-        recipientId,
-        false
-      );
+      try {
 
-      console.log(
-        `AI RESUMED: ${recipientId}`
-      );
+        const targetCustomerId =
+          String(
+            recipientId || ""
+          ).trim();
+
+        if (!targetCustomerId) {
+
+          console.error(
+            "AI RESUME FAILED: customer ID missing."
+          );
+
+          return;
+        }
+
+        await setTakeover(
+          targetCustomerId,
+          false
+        );
+
+        console.log(
+          "=========================================="
+        );
+
+        console.log(
+          "AI RESUMED"
+        );
+
+        console.log(
+          `Customer: ${targetCustomerId}`
+        );
+
+        console.log(
+          `Command: ${command}`
+        );
+
+        console.log(
+          "AI: ON"
+        );
+
+        console.log(
+          "=========================================="
+        );
+
+      } catch (err) {
+
+        console.error(
+          "AI Resume error:",
+          err.message
+        );
+      }
 
       return;
     }
 
+    // Other outgoing Page messages are ignored.
     return;
   }
 
@@ -1911,7 +2030,7 @@ async function processMessengerEvent(
   );
 
   // ==========================================================================
-  // SAVE LAST CUSTOMER MESSAGE
+  // UPDATE LAST CUSTOMER MESSAGE
   // ==========================================================================
 
   if (text) {
@@ -1923,7 +2042,7 @@ async function processMessengerEvent(
   }
 
   // ==========================================================================
-  // HUMAN TAKEOVER CHECK
+  // HUMAN TAKEOVER CHECK #1
   // ==========================================================================
 
   const takeover =
@@ -1999,6 +2118,21 @@ async function processMessengerEvent(
           text
         );
 
+      const takeoverBeforeVisionSend =
+        await getTakeover(
+          customerId
+        );
+
+      if (
+        takeoverBeforeVisionSend
+      ) {
+        console.log(
+          `VISION SEND BLOCKED - takeover active: ${customerId}`
+        );
+
+        return;
+      }
+
       await saveMessage(
         customerId,
         "assistant",
@@ -2026,6 +2160,17 @@ async function processMessengerEvent(
         3500
       );
 
+      const takeoverAfterError =
+        await getTakeover(
+          customerId
+        );
+
+      if (
+        takeoverAfterError
+      ) {
+        return;
+      }
+
       await sendMessengerMessage(
         customerId,
         "দুঃখিত, ছবিটি এখন ঠিকভাবে বিশ্লেষণ করতে পারছি না। একটু পরে আবার চেষ্টা করুন অথবা আমাদের সাথে যোগাযোগ করুন।"
@@ -2052,6 +2197,17 @@ async function processMessengerEvent(
       ?.url &&
     !text
   ) {
+
+    const currentTakeover =
+      await getTakeover(
+        customerId
+      );
+
+    if (
+      currentTakeover
+    ) {
+      return;
+    }
 
     await sendMessengerMessage(
       customerId,
@@ -2099,7 +2255,7 @@ async function processMessengerEvent(
   }
 
   // ==========================================================================
-  // FINAL TAKEOVER CHECK
+  // HUMAN TAKEOVER CHECK #2
   // ==========================================================================
 
   const takeoverBeforeAI =
@@ -2107,7 +2263,9 @@ async function processMessengerEvent(
       customerId
     );
 
-  if (takeoverBeforeAI) {
+  if (
+    takeoverBeforeAI
+  ) {
 
     console.log(
       `AI BLOCKED BEFORE REQUEST: ${customerId}`
@@ -2135,6 +2293,11 @@ async function processMessengerEvent(
           if (
             lockedTakeover
           ) {
+
+            console.log(
+              `AI REQUEST CANCELLED - takeover active: ${customerId}`
+            );
+
             return null;
           }
 
@@ -2161,6 +2324,26 @@ async function processMessengerEvent(
       return;
     }
 
+    // ========================================================================
+    // HUMAN TAKEOVER CHECK #3
+    // ========================================================================
+
+    const beforeSaveTakeover =
+      await getTakeover(
+        customerId
+      );
+
+    if (
+      beforeSaveTakeover
+    ) {
+
+      console.log(
+        `AI RESPONSE BLOCKED BEFORE SAVE: ${customerId}`
+      );
+
+      return;
+    }
+
     await saveMessage(
       customerId,
       "assistant",
@@ -2176,6 +2359,10 @@ async function processMessengerEvent(
           )
       }
     );
+
+    // ========================================================================
+    // HUMAN TAKEOVER CHECK #4
+    // ========================================================================
 
     const finalTakeover =
       await getTakeover(
@@ -2374,6 +2561,9 @@ app.get(
       service:
         "Impotech BD AI Messenger Bot",
 
+      version:
+        "human-takeover-v2",
+
       time:
         new Date()
           .toISOString(),
@@ -2390,6 +2580,13 @@ app.get(
           .faqs
           .length,
 
+      catalogUpdatedAt:
+        catalogCache.updatedAt
+          ? new Date(
+              catalogCache.updatedAt
+            ).toISOString()
+          : null,
+
       catalogSource: {
         repository:
           GITHUB_REPO,
@@ -2399,6 +2596,25 @@ app.get(
 
         file:
           CATALOG_FILE
+      },
+
+      humanTakeover: {
+        enabled:
+          Boolean(pool),
+
+        commands: [
+          ".",
+          "pause",
+          ".human",
+          "stop"
+        ],
+
+        resumeCommands: [
+          ".on",
+          ".start",
+          ".resume",
+          ".ai"
+        ]
       },
 
       retentionDays:
@@ -2438,6 +2654,9 @@ app.get(
 
     res.json({
       success: true,
+
+      version:
+        "human-takeover-v2",
 
       service:
         "Impotech BD AI Messenger Bot",
@@ -2486,6 +2705,23 @@ app.get(
             : null
       },
 
+      humanTakeover: {
+
+        commands: [
+          ".",
+          "pause",
+          ".human",
+          "stop"
+        ],
+
+        resumeCommands: [
+          ".on",
+          ".start",
+          ".resume",
+          ".ai"
+        ]
+      },
+
       business: {
 
         shop:
@@ -2516,7 +2752,7 @@ app.get(
 );
 
 // ============================================================================
-// TRAINING / CATALOG SYNC
+// CATALOG / TRAINING
 // ============================================================================
 
 app.get(
@@ -2594,7 +2830,10 @@ app.post(
         faqs:
           catalog
             .faqs
-            .length
+            .length,
+
+        updatedAt:
+          catalog.updatedAt
       });
 
     } catch (err) {
@@ -2638,9 +2877,10 @@ app.post(
       }
 
       const enabled =
-        Boolean(
-          req.body.enabled
-        );
+        req.body.enabled === true ||
+        req.body.enabled === "true" ||
+        req.body.enabled === 1 ||
+        req.body.enabled === "1";
 
       const result =
         await setTakeover(
@@ -2686,7 +2926,7 @@ app.post(
 );
 
 // ============================================================================
-// HUMAN TAKEOVER STATUS API
+// HUMAN TAKEOVER STATUS
 // ============================================================================
 
 app.get(
@@ -2746,7 +2986,7 @@ app.get(
 );
 
 // ============================================================================
-// CUSTOMER HISTORY API
+// CUSTOMER HISTORY
 // ============================================================================
 
 app.get(
@@ -2787,7 +3027,7 @@ app.get(
 );
 
 // ============================================================================
-// MANUAL CLEANUP API
+// MANUAL CLEANUP
 // ============================================================================
 
 app.post(
@@ -2853,6 +3093,22 @@ app.post(
         });
       }
 
+      // Never send test message while takeover is active.
+      const takeover =
+        await getTakeover(
+          recipientId
+        );
+
+      if (takeover) {
+
+        return res.status(409).json({
+          success: false,
+
+          error:
+            "Human takeover is active for this customer. AI/test sending is blocked."
+        });
+      }
+
       await sendMessengerMessage(
         recipientId,
         message
@@ -2882,6 +3138,39 @@ app.post(
 setInterval(
   cleanupOldData,
   6 * 60 * 60 * 1000
+);
+
+// ============================================================================
+// PERIODIC CATALOG REFRESH
+// ============================================================================
+//
+// Every 10 minutes GitHub catalog is checked again.
+//
+// Therefore after updating catalog.json in GitHub, the running service can
+// refresh the catalog without requiring a code change.
+//
+
+setInterval(
+  async () => {
+
+    try {
+
+      console.log(
+        "Automatic catalog refresh started..."
+      );
+
+      await loadCatalog();
+
+    } catch (err) {
+
+      console.error(
+        "Automatic catalog refresh error:",
+        err.message
+      );
+    }
+
+  },
+  10 * 60 * 1000
 );
 
 // ============================================================================
@@ -2933,6 +3222,14 @@ async function start() {
     );
 
     console.log(
+      `Human takeover commands: ., pause, .human, stop`
+    );
+
+    console.log(
+      `AI resume commands: .on, .start, .resume, .ai`
+    );
+
+    console.log(
       "=========================================="
     );
 
@@ -2946,6 +3243,10 @@ async function start() {
       PORT,
       "0.0.0.0",
       () => {
+
+        console.log(
+          "=========================================="
+        );
 
         console.log(
           `Server running on port ${PORT}`
@@ -2965,6 +3266,18 @@ async function start() {
 
         console.log(
           `Catalog: ${GITHUB_REPO}/${GITHUB_BRANCH}/${CATALOG_FILE}`
+        );
+
+        console.log(
+          "Human Takeover: ENABLED"
+        );
+
+        console.log(
+          "Human ON: . / pause / .human / stop"
+        );
+
+        console.log(
+          "AI ON: .on / .start / .resume / .ai"
         );
 
         console.log(
