@@ -1,1 +1,10 @@
-
+{
+  "products": [
+    {
+      "id": "001",
+      "name": "Test Product",
+      "price": 1000,
+      "description": "This is a test product."
+    }
+  ]
+}
