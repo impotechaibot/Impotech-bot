@@ -583,54 +583,93 @@ async function sendFacebookMessage(recipientId, text) {
 }
 
 // =============================================================================
-// 8. GITHUB CATALOG SYNC
+// 8. GITHUB CATALOG SYNC (FULL AUTO-PURGE / NO STALE DATA)
 // =============================================================================
-// ১. ডাটাবেজ থেকে পুরোনো প্রডাক্ট মুছে ফেলে নতুন ক্যাটালগ সিঙ্ক করার ফাংশন
-async function syncCatalogToDB(incomingCatalog) {
-  if (!incomingCatalog || !Array.isArray(incomingCatalog.products)) return;
+/**
+ * এই সেকশনটি অ্যাডমিন অ্যাপ থেকে পাঠানো ক্যাটালগ GitHub-এ সিঙ্ক করে এবং
+ * পুরনো প্রোডাক্ট সম্পূর্ণভাবে মুছে ফেলে যাতে Render API-তে কোনো স্টেল
+ * (পুরনো) ডেটা না থাকে।
+ *
+ * গুরুত্বপূর্ণ:
+ * - শুধুমাত্র products + faqs রিপ্লেস হয়। customers/messages/orders অক্ষত থাকে।
+ * - লোকাল catalog.json সবসময় সর্বশেষ সোর্স অফ ট্রুথ হিসেবে রিপ্লেস হয়।
+ * - GitHub-এ প্রোডাক্ট ডিলিট করলে লোকাল ক্যাটালগ থেকেও সাথে সাথে বাদ পড়ে।
+ * - পুরনো ডেটা রয়ে যাওয়ার কোনো সুযোগ নেই কারণ saveLocalCatalog() পুরো
+ *   ফাইলটি ওভাররাইট করে (temp file → rename, atomic)।
+ */
 
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const incomingIds = incomingCatalog.products.map(p => p.id);
-
-    // বর্তমান জেসন ক্যাটালগে যে প্রডাক্ট আইডিগুলো নেই, সেগুলো ডাটাবেজ থেকে মুছে ফেলা (DELETE)
-    if (incomingIds.length > 0) {
-      await client.query(
-        `DELETE FROM products WHERE NOT (id = ANY($1::text[]))`,
-        [incomingIds]
-      );
-    } else {
-      await client.query(`DELETE FROM products`);
-    }
-
-    // নতুন এবং আপডেটেড প্রডাক্ট ডাটাবেজে সেভ/আপডেট করা
-    for (const prod of incomingCatalog.products) {
-      await client.query(`
-        INSERT INTO products (id, name, price, description, stock_status)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (id) DO UPDATE SET
-          name = EXCLUDED.name,
-          price = EXCLUDED.price,
-          description = EXCLUDED.description,
-          stock_status = EXCLUDED.stock_status,
-          updated_at = NOW();
-      `, [prod.id, prod.name, prod.price, prod.description, prod.stockStatus]);
-    }
-
-    await client.query('COMMIT');
-    console.log('[DB] Old products purged and database updated successfully');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[DB] Database sync failed:', err);
-  } finally {
-    client.release();
+/**
+ * একটি ক্যাটালগ অবজেক্টকে ভ্যালিডেট করে।
+ * ভুল ডেটা দিয়ে চলমান ক্যাটালগ নষ্ট হতে দেবে না।
+ */
+function validateCatalogShape(data) {
+  if (!data || typeof data !== 'object') {
+    throw new Error('Catalog must be a JSON object');
   }
+
+  if (!Array.isArray(data.products)) {
+    throw new Error('Catalog must contain a "products" array');
+  }
+
+  const seenIds = new Set();
+
+  for (const product of data.products) {
+    if (!product || typeof product !== 'object') {
+      throw new Error('Each product must be an object');
+    }
+
+    const id = String(product.id ?? '').trim();
+
+    if (!id) {
+      throw new Error('Every product must have a non-empty "id"');
+    }
+
+    if (seenIds.has(id)) {
+      throw new Error(`Duplicate product id detected: ${id}`);
+    }
+
+    seenIds.add(id);
+  }
+
+  if (data.faqs !== undefined && !Array.isArray(data.faqs)) {
+    throw new Error('Catalog "faqs" must be an array when provided');
+  }
+
+  return true;
 }
 
-// ২. আপনার মূল Pull এবং Push ফাংশনসমূহ (কোনো কোড না কেটে পুরোনো ডেটা ডিলিট লজিক যুক্ত করা হয়েছে)
+/**
+ * পুরনো ক্যাটালগ ফাইল ও মেমোরি থেকে সম্পূর্ণভাবে মুছে নতুন ক্যাটালগ বসায়।
+ * এটিই একমাত্র পথ যার মাধ্যমে products/faqs আপডেট হয়।
+ */
+function replaceCatalogAtomically(catalogData, source = 'admin') {
+  validateCatalogShape(catalogData);
 
+  const normalized = {
+    version: catalogData.version ?? Date.now(),
+    updatedAt: catalogData.updatedAt ?? new Date().toISOString(),
+    products: catalogData.products, // ← নতুন পুরো লিস্ট (পুরনো কিছু থাকবে না)
+    faqs: Array.isArray(catalogData.faqs) ? catalogData.faqs : []
+  };
+
+  // saveLocalCatalog() আগেই validate করে, temp file লিখে atomic rename করে
+  saveLocalCatalog(normalized, source);
+
+  // মেমোরি ও লোকাল ফাইল থেকে নিশ্চিতভাবে পুরনো রেফারেন্স বাদ
+  products = normalized.products;
+  faqs = normalized.faqs;
+
+  console.log(
+    `[CATALOG] Replaced from ${source}: ${products.length} products, ${faqs.length} FAQs, version=${normalized.version}`
+  );
+
+  return normalized;
+}
+
+/**
+ * GitHub থেকে সর্বশেষ ক্যাটালগ টেনে আনে এবং লোকাল + মেমোরি সম্পূর্ণ রিপ্লেস করে।
+ * পুরনো ডেটা অটোমেটিক্যালি মুছে যায়।
+ */
 async function pullCatalogFromGitHub() {
   if (!GITHUB_TOKEN) {
     catalogMeta.lastSyncError = 'GITHUB_TOKEN is not configured';
@@ -660,18 +699,14 @@ async function pullCatalogFromGitHub() {
       Buffer.from(response.data.content, 'base64').toString('utf8')
     );
 
-    // Do not replace the working catalog with invalid data.
-    if (!Array.isArray(parsed.products)) {
-      throw new Error('GitHub catalog has no valid products array');
-    }
+    // ভুল ডেটা দিয়ে চলমান ক্যাটালগ নষ্ট করবে না
+    validateCatalogShape(parsed);
 
-    saveLocalCatalog(parsed, 'github');
-
-    // 👇 এখানে ডাটাবেজ থেকে পুরোনো তথ্য ডিলিট করার ফাংশনটি যুক্ত করা হয়েছে
-    await syncCatalogToDB(parsed);
+    // পুরনো প্রোডাক্ট মুছে নতুন ক্যাটালগ বসাও (atomic + memory replace)
+    replaceCatalogAtomically(parsed, 'github');
 
     console.log(
-      `[GITHUB] Catalog loaded: ${products.length} products, ${faqs.length} FAQs, version=${catalogMeta.version}`
+      `[GITHUB] Pulled & purged old catalog. Now: ${products.length} products, ${faqs.length} FAQs, version=${catalogMeta.version}`
     );
 
     return true;
@@ -679,11 +714,21 @@ async function pullCatalogFromGitHub() {
     catalogMeta.lastSyncError =
       err.response?.data?.message || err.message;
 
-    console.error('[GITHUB] Catalog sync failed:', catalogMeta.lastSyncError);
+    console.error(
+      '[GITHUB] Catalog sync failed:',
+      catalogMeta.lastSyncError
+    );
+
     return false;
   }
 }
 
+/**
+ * অ্যাডমিন অ্যাপ থেকে পাঠানো ক্যাটালগ GitHub-এ পুশ করে এবং লোকাল +
+ * মেমোরি সম্পূর্ণ রিপ্লেস করে। ফলে Render API-তে পুরনো ডেটা থাকবে না।
+ *
+ * রিটার্ন: { synced, commit?, error?, totalProducts, totalFaqs }
+ */
 async function pushCatalogToGitHub(
   catalogData,
   customToken,
@@ -703,11 +748,11 @@ async function pushCatalogToGitHub(
     };
   }
 
-  if (!catalogData || !Array.isArray(catalogData.products)) {
-    return {
-      synced: false,
-      message: 'Invalid catalog: products must be an array'
-    };
+  // পুশ করার আগেই ভ্যালিডেট
+  try {
+    validateCatalogShape(catalogData);
+  } catch (err) {
+    return { synced: false, error: err.message };
   }
 
   const url = `https://api.github.com/repos/${repo}/contents/${filePath}`;
@@ -718,6 +763,7 @@ async function pushCatalogToGitHub(
     'User-Agent': 'Impotech-Admin-Server'
   };
 
+  // আগের sha বের করা (থাকলে)
   let sha = null;
 
   try {
@@ -736,12 +782,13 @@ async function pushCatalogToGitHub(
     }
   }
 
+  // পুরনো ফাইল পুরোপুরি ওভাররাইট হবে (replace, merge নয়)
   const fileContentBase64 = Buffer
     .from(JSON.stringify(catalogData, null, 2), 'utf8')
     .toString('base64');
 
   const payload = {
-    message: `Update catalog from Impotech Admin v${catalogData.version || Date.now()}`,
+    message: `Replace catalog (purge old) from Impotech Admin v${catalogData.version || Date.now()}`,
     content: fileContentBase64,
     branch
   };
@@ -754,17 +801,18 @@ async function pushCatalogToGitHub(
       timeout: 20000
     });
 
-    // Keep the local catalog consistent with the catalog just uploaded.
-    saveLocalCatalog(catalogData, 'github');
+    // সফল পুশ → লোকাল + মেমোরি সম্পূর্ণ রিপ্লেস (পুরনো ডেটা বাদ)
+    replaceCatalogAtomically(catalogData, 'github');
 
-    // 👇 এখানে ডাটাবেজ থেকে পুরোনো তথ্য ডিলিট করার ফাংশনটি যুক্ত করা হয়েছে
-    await syncCatalogToDB(catalogData);
-
-    console.log(`[GITHUB] Catalog uploaded: ${repo}@${branch}`);
+    console.log(
+      `[GITHUB] Pushed & purged old catalog to ${repo}@${branch}. Now: ${products.length} products, ${faqs.length} FAQs`
+    );
 
     return {
       synced: true,
-      commit: putResponse.data?.commit?.sha || 'synced'
+      commit: putResponse.data?.commit?.sha || 'synced',
+      totalProducts: products.length,
+      totalFaqs: faqs.length
     };
   } catch (err) {
     const error = err.response?.data?.message || err.message;
