@@ -75,9 +75,9 @@ const OPENROUTER_URL =
 const TEXT_MODEL = 'google/gemini-3.1-flash-lite';
 const VOICE_MODEL = 'google/gemini-3.1-flash-lite';
 
-const MAX_PRODUCTS_TO_AI = 3;
-const MAX_FAQS_TO_AI = 4;
-const MAX_OUTPUT_TOKENS = 200;
+const MAX_PRODUCTS_TO_AI = 2;
+const MAX_FAQS_TO_AI = 2;
+const MAX_OUTPUT_TOKENS = 150;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
