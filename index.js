@@ -585,6 +585,52 @@ async function sendFacebookMessage(recipientId, text) {
 // =============================================================================
 // 8. GITHUB CATALOG SYNC
 // =============================================================================
+// ১. ডাটাবেজ থেকে পুরোনো প্রডাক্ট মুছে ফেলে নতুন ক্যাটালগ সিঙ্ক করার ফাংশন
+async function syncCatalogToDB(incomingCatalog) {
+  if (!incomingCatalog || !Array.isArray(incomingCatalog.products)) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const incomingIds = incomingCatalog.products.map(p => p.id);
+
+    // বর্তমান জেসন ক্যাটালগে যে প্রডাক্ট আইডিগুলো নেই, সেগুলো ডাটাবেজ থেকে মুছে ফেলা (DELETE)
+    if (incomingIds.length > 0) {
+      await client.query(
+        `DELETE FROM products WHERE NOT (id = ANY($1::text[]))`,
+        [incomingIds]
+      );
+    } else {
+      await client.query(`DELETE FROM products`);
+    }
+
+    // নতুন এবং আপডেটেড প্রডাক্ট ডাটাবেজে সেভ/আপডেট করা
+    for (const prod of incomingCatalog.products) {
+      await client.query(`
+        INSERT INTO products (id, name, price, description, stock_status)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          price = EXCLUDED.price,
+          description = EXCLUDED.description,
+          stock_status = EXCLUDED.stock_status,
+          updated_at = NOW();
+      `, [prod.id, prod.name, prod.price, prod.description, prod.stockStatus]);
+    }
+
+    await client.query('COMMIT');
+    console.log('[DB] Old products purged and database updated successfully');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[DB] Database sync failed:', err);
+  } finally {
+    client.release();
+  }
+}
+
+// ২. আপনার মূল Pull এবং Push ফাংশনসমূহ (কোনো কোড না কেটে পুরোনো ডেটা ডিলিট লজিক যুক্ত করা হয়েছে)
+
 async function pullCatalogFromGitHub() {
   if (!GITHUB_TOKEN) {
     catalogMeta.lastSyncError = 'GITHUB_TOKEN is not configured';
@@ -620,6 +666,9 @@ async function pullCatalogFromGitHub() {
     }
 
     saveLocalCatalog(parsed, 'github');
+
+    // 👇 এখানে ডাটাবেজ থেকে পুরোনো তথ্য ডিলিট করার ফাংশনটি যুক্ত করা হয়েছে
+    await syncCatalogToDB(parsed);
 
     console.log(
       `[GITHUB] Catalog loaded: ${products.length} products, ${faqs.length} FAQs, version=${catalogMeta.version}`
@@ -707,6 +756,9 @@ async function pushCatalogToGitHub(
 
     // Keep the local catalog consistent with the catalog just uploaded.
     saveLocalCatalog(catalogData, 'github');
+
+    // 👇 এখানে ডাটাবেজ থেকে পুরোনো তথ্য ডিলিট করার ফাংশনটি যুক্ত করা হয়েছে
+    await syncCatalogToDB(catalogData);
 
     console.log(`[GITHUB] Catalog uploaded: ${repo}@${branch}`);
 
