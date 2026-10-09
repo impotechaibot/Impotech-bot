@@ -754,7 +754,29 @@ app.post('/api/admin/cache-refresh', verifyAdminToken, async (req, res) => {
         res.status(500).json({ success: false, error: 'Failed to refresh caches from GitHub' });
     }
 });
+// ==========================================
+// AI TRAINING & RENDER SYNC ENDPOINT
+// ==========================================
 
+app.post('/api/training', async (req, res) => {
+    try {
+        // গিটহাব থেকে ক্যাটালগ ও FAQ ডেটা ইন-মেমরি ক্যাশে নতুন করে লোড করা
+        await reloadCaches();
+
+        return res.json({
+            success: true,
+            message: 'Render sync and AI training completed successfully',
+            catalogCount: catalogCache.length,
+            faqCount: faqCache.length
+        });
+    } catch (error) {
+        console.error('[Sync / Training Error]:', error.message);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to sync with Render backend'
+        });
+    }
+});
 // ==========================================
 // 11. BOOTSTRAP EXPRESS SERVER
 // ==========================================
