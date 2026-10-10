@@ -1,22 +1,22 @@
+'use strict';
+
 /**
  * =============================================================================
  * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND
  * =============================================================================
+ * AI          : OpenRouter Gemini
+ * CATALOG     : GitHub catalog.json + Local cache
+ * STORAGE     : storage_data.json
+ * MEDIA       : Product-specific Facebook URLs
+ * HUMAN       : Per-customer + Global takeover
+ * ADMIN       : Catalog, customers, messages, orders, bot status
  *
- * TEXT / VISION / VOICE : OpenRouter Gemini
- * CATALOG               : GitHub catalog.json + Local cache
- * MEDIA                 : Product-specific Facebook image/video links
- * HUMAN TAKEOVER        : Per-customer + Global bot control
- * ADMIN API             : Catalog, customers, messages, orders, bot status
- *
- * IMPROVEMENTS:
- * - Short, polite and complete AI replies
- * - Detect OpenRouter token-limit truncation
- * - Prevent silently sending messages cut off at 2000 characters
- * - Preserve existing product IDs, prices and media URLs
- * - Preserve existing API routes and services
- *
- * SECURITY:
+ * SAFETY:
+ * - Never guess a product price.
+ * - Verify exact product identity before quoting a price.
+ * - Never guess motorcycle H4 compatibility.
+ * - Reject truncated AI responses.
+ * - Never silently truncate Messenger messages.
  * - Configure secrets through Render environment variables.
  * =============================================================================
  */
@@ -25,9 +25,11 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 
+app.disable('x-powered-by');
 app.use(express.json({ limit: '50mb' }));
 
 // =============================================================================
@@ -56,7 +58,7 @@ app.use((req, res, next) => {
 // 2. CONFIGURATION
 // =============================================================================
 
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT) || 10000;
 
 const PAGE_ACCESS_TOKEN =
   process.env.PAGE_ACCESS_TOKEN ||
@@ -64,43 +66,57 @@ const PAGE_ACCESS_TOKEN =
   '';
 
 const VERIFY_TOKEN =
-  process.env.VERIFY_TOKEN ||
-  'impotech_secret_token_123';
+  process.env.VERIFY_TOKEN || '';
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const OPENROUTER_API_KEY =
+  process.env.OPENROUTER_API_KEY || '';
+
+const GITHUB_TOKEN =
+  process.env.GITHUB_TOKEN || '';
 
 const GITHUB_REPO =
   process.env.GITHUB_REPO || 'impotechaibot/Impotech-bot';
 
-const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
-const CATALOG_FILE = process.env.CATALOG_FILE || 'data/catalog.json';
+const GITHUB_BRANCH =
+  process.env.GITHUB_BRANCH || 'main';
+
+const CATALOG_FILE =
+  process.env.CATALOG_FILE || 'data/catalog.json';
 
 const ADMIN_SECRET =
-  process.env.ADMIN_SECRET ||
-  'impotech_secret_token_123';
+  process.env.ADMIN_SECRET || '';
 
 const OPENROUTER_URL =
   'https://openrouter.ai/api/v1/chat/completions';
 
-const TEXT_MODEL = 'google/gemini-3.1-flash-lite';
-const VOICE_MODEL = 'google/gemini-3.1-flash-lite';
+const TEXT_MODEL =
+  process.env.TEXT_MODEL || 'google/gemini-3.1-flash-lite';
 
-const MAX_PRODUCTS_TO_AI = 2;
-const MAX_FAQS_TO_AI = 2;
+const VOICE_MODEL =
+  process.env.VOICE_MODEL || TEXT_MODEL;
 
-// More output capacity reduces the chance of incomplete responses.
-// The system prompt still instructs the model to answer briefly.
-const MAX_OUTPUT_TOKENS = 450;
-
+const MAX_PRODUCTS_TO_AI = 5;
+const MAX_FAQS_TO_AI = 5;
+const MAX_OUTPUT_TOKENS = 700;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
 
-const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
-const DATA_FILE = path.join(__dirname, 'storage_data.json');
+const LOCAL_CATALOG_PATH =
+  path.join(__dirname, 'catalog.json');
+
+const DATA_FILE =
+  path.join(__dirname, 'storage_data.json');
+
+const GRAPH_API_VERSION =
+  process.env.GRAPH_API_VERSION || 'v18.0';
+
+const REQUIRE_ADMIN_SECRET =
+  process.env.REQUIRE_ADMIN_SECRET !== 'false';
+
+const HISTORY_LIMIT = 10;
 
 // =============================================================================
-// 3. MEMORY AND LOCAL STORAGE
+// 3. MEMORY AND STORAGE
 // =============================================================================
 
 let products = [];
@@ -123,7 +139,8 @@ let db = {
 };
 
 const customerHistory = new Map();
-const processedMessageIds = new Set();
+const processedMessageIds = new Map();
+const pendingBikeQuestions = new Map();
 
 function loadStorage() {
   try {
@@ -142,7 +159,6 @@ function loadStorage() {
       ...saved
     };
 
-    // Protect against older storage files missing these properties.
     if (!db.takeovers || typeof db.takeovers !== 'object') {
       db.takeovers = {};
     }
@@ -151,15 +167,10 @@ function loadStorage() {
       db.customers = {};
     }
 
-    if (!Array.isArray(db.messages)) {
-      db.messages = [];
-    }
-
-    if (!Array.isArray(db.orders)) {
-      db.orders = [];
-    }
+    if (!Array.isArray(db.messages)) db.messages = [];
+    if (!Array.isArray(db.orders)) db.orders = [];
   } catch (err) {
-    console.warn('[STORAGE] Load warning:', err.message);
+    console.error('[STORAGE] Load error:', err.message);
   }
 }
 
@@ -180,11 +191,7 @@ function saveStorage() {
 }
 
 function applyCatalog(data, source = 'local') {
-  if (!data || !Array.isArray(data.products)) {
-    throw new Error(
-      'Invalid catalog: products must be an array'
-    );
-  }
+  validateCatalogShape(data);
 
   products = data.products;
   faqs = Array.isArray(data.faqs) ? data.faqs : [];
@@ -214,13 +221,9 @@ function loadLocalCatalog() {
     );
 
     applyCatalog(data, 'local');
-
     return data;
   } catch (err) {
-    console.warn(
-      '[CATALOG] Local load warning:',
-      err.message
-    );
+    console.error('[CATALOG] Local load error:', err.message);
 
     return {
       products,
@@ -232,11 +235,7 @@ function loadLocalCatalog() {
 }
 
 function saveLocalCatalog(data, source = 'local') {
-  if (!data || !Array.isArray(data.products)) {
-    throw new Error(
-      'Invalid catalog: products must be an array'
-    );
-  }
+  validateCatalogShape(data);
 
   const tempPath = LOCAL_CATALOG_PATH + '.tmp';
 
@@ -247,7 +246,6 @@ function saveLocalCatalog(data, source = 'local') {
   );
 
   fs.renameSync(tempPath, LOCAL_CATALOG_PATH);
-
   applyCatalog(data, source);
 }
 
@@ -255,8 +253,93 @@ loadStorage();
 loadLocalCatalog();
 
 // =============================================================================
-// 4. TEXT NORMALIZATION AND PRODUCT SEARCH
+// 4. ADMIN AUTHENTICATION
 // =============================================================================
+
+function requireAdmin(req, res, next) {
+  if (!REQUIRE_ADMIN_SECRET) return next();
+
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({
+      success: false,
+      message: 'ADMIN_SECRET is not configured'
+    });
+  }
+
+  const supplied = String(
+    req.get('x-admin-secret') ||
+    req.get('authorization')?.replace(/^Bearer\s+/i, '') ||
+    ''
+  );
+
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(ADMIN_SECRET);
+
+  if (
+    a.length !== b.length ||
+    !crypto.timingSafeEqual(a, b)
+  ) {
+    return res.status(401).json({
+      success: false,
+      message: 'Unauthorized'
+    });
+  }
+
+  next();
+}
+
+// Protect administrative routes.
+// Public health endpoints and the Facebook webhook remain accessible.
+app.use('/api', (req, res, next) => {
+  const publicPaths = [
+    '/health',
+    '/status'
+  ];
+
+  if (publicPaths.includes(req.path)) return next();
+
+  return requireAdmin(req, res, next);
+});
+
+// =============================================================================
+// 5. CATALOG VALIDATION AND SEARCH
+// =============================================================================
+
+function validateCatalogShape(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Catalog must be a JSON object');
+  }
+
+  if (!Array.isArray(data.products)) {
+    throw new Error('Catalog must contain a products array');
+  }
+
+  const ids = new Set();
+
+  for (const product of data.products) {
+    if (!product || typeof product !== 'object') {
+      throw new Error('Every product must be an object');
+    }
+
+    const id = String(product.id ?? '').trim();
+
+    if (!id) {
+      throw new Error('Every product must have an ID');
+    }
+
+    if (ids.has(id)) {
+      throw new Error('Duplicate product ID: ' + id);
+    }
+
+    ids.add(id);
+  }
+
+  if (data.faqs !== undefined && !Array.isArray(data.faqs)) {
+    throw new Error('Catalog FAQs must be an array');
+  }
+
+  return true;
+}
 
 function normalizeText(value = '') {
   return String(value)
@@ -275,9 +358,9 @@ function tokenize(value = '') {
 
 function scoreRecord(query, record, fields) {
   const q = normalizeText(query);
-  const queryTokens = tokenize(q);
+  const tokens = tokenize(q);
 
-  if (!queryTokens.length) return 0;
+  if (!tokens.length) return 0;
 
   let score = 0;
 
@@ -285,23 +368,17 @@ function scoreRecord(query, record, fields) {
     const raw = record?.[field];
 
     const value = normalizeText(
-      Array.isArray(raw)
-        ? raw.join(' ')
-        : raw || ''
+      Array.isArray(raw) ? raw.join(' ') : raw || ''
     );
 
     if (!value) continue;
 
-    if (q.length >= 4 && value.includes(q)) {
-      score += 20;
-    }
+    if (q.length >= 4 && value === q) score += 50;
+    else if (q.length >= 4 && value.includes(q)) score += 20;
 
-    for (const token of queryTokens) {
-      if (value === token) {
-        score += 12;
-      } else if (value.includes(token)) {
-        score += 4;
-      }
+    for (const token of tokens) {
+      if (value === token) score += 12;
+      else if (value.includes(token)) score += 4;
     }
   }
 
@@ -319,7 +396,8 @@ function productScore(query, product) {
     'model',
     'sku',
     'keywords',
-    'tags'
+    'tags',
+    'aliases'
   ]);
 }
 
@@ -368,7 +446,7 @@ function appendHistory(senderId, role, text) {
     timestamp: Date.now()
   });
 
-  while (history.length > 6) {
+  while (history.length > HISTORY_LIMIT) {
     history.shift();
   }
 
@@ -376,20 +454,240 @@ function appendHistory(senderId, role, text) {
 }
 
 // =============================================================================
-// 5. MEDIA REQUEST DETECTION
+// 6. PRICE GUARD
+// =============================================================================
+
+function isPriceQuestion(text = '') {
+  const value = normalizeText(text);
+
+  return (
+    /\b(price|prices|cost|how much|rate)\b/.test(value) ||
+    /দাম|প্রাইস|মূল্য|কত টাকা|কত দাম|দাম কত|দামটা|কততে/.test(value)
+  );
+}
+
+function isGenericPriceQuestion(text = '') {
+  if (!isPriceQuestion(text)) return false;
+
+  const value = normalizeText(text);
+
+  const generic = [
+    /^দাম$/,
+    /^দাম কত$/,
+    /^দামটা কত$/,
+    /^প্রাইস$/,
+    /^প্রাইস কত$/,
+    /^মূল্য$/,
+    /^মূল্য কত$/,
+    /^কত টাকা$/,
+    /^কত দাম$/,
+    /^price$/,
+    /^price please$/,
+    /^how much$/,
+    /^how much is it$/,
+    /^what is the price$/
+  ];
+
+  return generic.some(pattern => pattern.test(value));
+}
+
+function findExactProductForPrice(query) {
+  const q = normalizeText(query);
+
+  if (!q) return null;
+
+  const matches = products.filter(product => {
+    const candidates = [
+      product.name,
+      product.id,
+      product.sku,
+      product.model,
+      product.brand,
+      ...(Array.isArray(product.aliases) ? product.aliases : [])
+    ]
+      .filter(Boolean)
+      .map(normalizeText);
+
+    return candidates.some(candidate => {
+      if (!candidate) return false;
+
+      // Require the complete product name/alias to be present.
+      return q.includes(candidate);
+    });
+  });
+
+  // Ambiguous queries must not select the first result.
+  if (matches.length !== 1) return null;
+
+  return matches[0];
+}
+
+function getPriceReply(product) {
+  if (
+    product.price === undefined ||
+    product.price === null ||
+    String(product.price).trim() === ''
+  ) {
+    return `দুঃখিত, ${product.name} পণ্যের মূল্য বর্তমানে ক্যাটালগে উল্লেখ নেই। সঠিক দাম জানতে আমাদের প্রতিনিধির সঙ্গে যোগাযোগ করুন।`;
+  }
+
+  return `${product.name}-এর দাম ${product.price} টাকা।`;
+}
+
+function getPriceClarificationReply() {
+  return 'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? পণ্যের সঠিক নাম বা মডেলটি বললে ক্যাটালগ থেকে দাম জানাতে পারব।';
+}
+
+// =============================================================================
+// 7. MOTORCYCLE H4 COMPATIBILITY
+// =============================================================================
+
+function isBikeCompatibilityQuestion(text = '') {
+  const value = normalizeText(text);
+
+  return (
+    /h4|devil eye|হেডলাইট|headlight|head lamp|plug and play|প্লাগ অ্যান্ড প্লে/.test(value) &&
+    /বাইক|মোটরসাইকেল|motorcycle|bike|হবে|ফিট|fit|সাপোর্ট|support|socket|plug|সকেট|বাল্ব|bulb/.test(value)
+  );
+}
+
+function hasBikeIdentity(text = '') {
+  const value = normalizeText(text);
+
+  return (
+    /\b(honda|yamaha|suzuki|bajaj|tvs|hero|ktm|apache|pulsar|fz|r15|gixxer|hornet|fzs|mt-15|discover|platina|gixxer|gsx)\b/i.test(value) ||
+    /হোন্ডা|ইয়ামাহা|ইয়ামাহা|সুজুকি|বাজাজ|টিভিএস|হিরো/.test(value)
+  );
+}
+
+/**
+ * Expected catalog format for a VERIFIED fitment entry:
+ *
+ * {
+ *   "brand": "Yamaha",
+ *   "model": "FZ-S V3",
+ *   "originalH4Socket": true,
+ *   "verified": true,
+ *   "source": "Official service manual URL"
+ * }
+ *
+ * Put entries in catalog.json:
+ * {
+ *   "bikeCompatibility": [ ... ]
+ * }
+ *
+ * Unknown or unverified entries are never treated as confirmation.
+ */
+
+function getBikeCompatibilityEntries() {
+  const entries = [];
+
+  for (const entry of products) {
+    if (Array.isArray(entry.bikeCompatibility)) {
+      entries.push(...entry.bikeCompatibility);
+    }
+
+    if (
+      entry.bikeCompatibility &&
+      !Array.isArray(entry.bikeCompatibility)
+    ) {
+      entries.push(entry.bikeCompatibility);
+    }
+  }
+
+  for (const faq of faqs) {
+    if (Array.isArray(faq.bikeCompatibility)) {
+      entries.push(...faq.bikeCompatibility);
+    }
+  }
+
+  return entries;
+}
+
+function identifyBikeModel(text = '') {
+  const value = normalizeText(text);
+
+  const entries = getBikeCompatibilityEntries();
+
+  const matches = entries
+    .filter(entry => entry && entry.verified === true)
+    .map(entry => {
+      const brand = normalizeText(entry.brand || '');
+      const model = normalizeText(entry.model || '');
+      const full = normalizeText(`${brand} ${model}`);
+
+      return {
+        entry,
+        full,
+        model,
+        brand
+      };
+    })
+    .filter(item => {
+      return (
+        item.full &&
+        item.model &&
+        value.includes(item.full)
+      );
+    })
+    .sort((a, b) => b.full.length - a.full.length);
+
+  if (!matches.length) return null;
+
+  // Two equally specific entries must not be guessed.
+  if (
+    matches.length > 1 &&
+    matches[0].full.length === matches[1].full.length &&
+    matches[0].entry.originalH4Socket !==
+      matches[1].entry.originalH4Socket
+  ) {
+    return null;
+  }
+
+  return matches[0];
+}
+
+function getH4CompatibilityReply(match) {
+  const model = match?.entry
+    ? `${match.entry.brand || ''} ${match.entry.model || ''}`.trim()
+    : '';
+
+  if (!match || !model) {
+    return 'আপনার বাইকের ব্র্যান্ড ও নির্দিষ্ট মডেলটি জানাবেন?';
+  }
+
+  const entry = match.entry;
+
+  // Only a verified, explicitly boolean value is accepted.
+  if (
+    entry.verified !== true ||
+    typeof entry.originalH4Socket !== 'boolean' ||
+    !entry.source
+  ) {
+    return `আপনার ${model}-এর Original Headlight-এ H4 Plug/Socket আছে কি না নিশ্চিতভাবে যাচাই করা যাচ্ছে না। বিস্তারিত জানতে আমাদের একজন এডমিন বা প্রতিনিধি খুব শীঘ্রই আপনার সাথে সরাসরি যোগাযোগ করবেন।`;
+  }
+
+  if (entry.originalH4Socket === true) {
+    return `জি, আপনার ${model}-এর Original Headlight-এ H4 Plug/Socket ব্যবহার করা হয়েছে। তাই এই H4 Plug Devil Eye Headlight আপনার বাইকে Plug and Play হিসেবে ব্যবহার করা যাবে।`;
+  }
+
+  return `আপনার ${model}-এর Original Headlight-এ H4 Plug/Socket ব্যবহার করা হয়নি। তাই এই H4 Plug Devil Eye Headlight সরাসরি Plug and Play হিসেবে ব্যবহার করা যাবে না।`;
+}
+
+// =============================================================================
+// 8. PRODUCT MEDIA
 // =============================================================================
 
 function getMediaType(text = '') {
   const value = normalizeText(text);
 
-  const asksVideo =
-    /ভিডিও|video|রিল|reel|clip/.test(value);
+  if (/ভিডিও|video|রিল|reel|clip/.test(value)) {
+    return 'videos';
+  }
 
-  const asksImage =
-    /ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture/.test(value);
-
-  if (asksVideo) return 'videos';
-  if (asksImage) return 'images';
+  if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture/.test(value)) {
+    return 'images';
+  }
 
   return null;
 }
@@ -406,7 +704,8 @@ function isFacebookLink(url) {
       parsed.protocol === 'https:' &&
       (
         parsed.hostname === 'facebook.com' ||
-        parsed.hostname.endsWith('.facebook.com')
+        parsed.hostname.endsWith('.facebook.com') ||
+        parsed.hostname === 'fb.watch'
       )
     );
   } catch (_) {
@@ -417,83 +716,60 @@ function isFacebookLink(url) {
 function getProductMediaUrls(product, mediaType) {
   const media = product?.media;
 
-  if (!media || !Array.isArray(media[mediaType])) {
-    return [];
-  }
+  if (!media || !Array.isArray(media[mediaType])) return [];
 
   return media[mediaType].filter(
-    url =>
-      typeof url === 'string' &&
-      isFacebookLink(url)
+    url => typeof url === 'string' && isFacebookLink(url)
   );
-}
-
-function getProductNameText(product) {
-  return normalizeText([
-    product?.id,
-    product?.name,
-    product?.shortDescription,
-    product?.keywords || [],
-    product?.tags || []
-  ].flat().join(' '));
 }
 
 function findProductForMedia(query, senderId) {
+  const q = normalizeText(query);
   const history = getHistory(senderId);
 
-  const previousCustomerText = history
-    .filter(item => item.role === 'user')
-    .slice(-4)
-    .map(item => item.text)
-    .join(' ');
-
-  const currentText = normalizeText(query);
-
-  const combinedQuery = normalizeText(
-    `${previousCustomerText} ${currentText}`
-  );
-
-  const ranked = products
+  const candidates = products
     .map(product => ({
       product,
-      currentScore: productScore(currentText, product),
-      combinedScore: productScore(combinedQuery, product)
+      score: productScore(q, product)
     }))
-    .sort((a, b) => {
-      if (b.currentScore !== a.currentScore) {
-        return b.currentScore - a.currentScore;
-      }
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score);
 
-      return b.combinedScore - a.combinedScore;
-    });
+  if (!candidates.length) {
+    const previousProductQuery = history
+      .filter(item => item.role === 'user')
+      .slice(-3)
+      .map(item => item.text)
+      .join(' ');
 
-  if (!ranked.length) return null;
+    if (!previousProductQuery) return null;
 
-  const first = ranked[0];
-  const second = ranked[1];
+    const previous = products
+      .map(product => ({
+        product,
+        score: productScore(previousProductQuery, product)
+      }))
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (
+      previous.length > 1 &&
+      previous[0].score === previous[1].score
+    ) {
+      return null;
+    }
+
+    return previous[0]?.product || null;
+  }
 
   if (
-    first.currentScore === 0 &&
-    first.combinedScore === 0
+    candidates.length > 1 &&
+    candidates[0].score === candidates[1].score
   ) {
     return null;
   }
 
-  if (first.currentScore > 0) {
-    return first.product;
-  }
-
-  if (
-    first.combinedScore > 0 &&
-    (
-      !second ||
-      first.combinedScore > second.combinedScore
-    )
-  ) {
-    return first.product;
-  }
-
-  return null;
+  return candidates[0].product;
 }
 
 function getProductMediaReply(query, senderId) {
@@ -504,46 +780,32 @@ function getProductMediaReply(query, senderId) {
   const product = findProductForMedia(query, senderId);
 
   if (!product) {
-    return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যটির নাম বলুন।';
+    return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যটির নাম বা মডেলটি বলুন।';
   }
 
   const urls = getProductMediaUrls(product, mediaType);
 
-  const label =
-    mediaType === 'images' ? 'ছবির' : 'ভিডিওর';
-
   if (!urls.length) {
-    console.log(
-      `[MEDIA] No ${mediaType} URL for product ${product.id}`
-    );
+    const label = mediaType === 'images' ? 'ছবির' : 'ভিডিওর';
 
-    return (
-      `দুঃখিত, ${product.name} পণ্যের ${label} লিংক ` +
-      'বর্তমানে ক্যাটালগে নেই। আমাদের প্রতিনিধি আপনাকে সাহায্য করবেন।'
-    );
+    return `দুঃখিত, ${product.name} পণ্যের ${label} লিংক বর্তমানে ক্যাটালগে নেই। বিস্তারিত জানতে আমাদের প্রতিনিধির সঙ্গে যোগাযোগ করুন।`;
   }
 
-  console.log(
-    `[MEDIA] Product=${product.id}, type=${mediaType}, count=${urls.length}`
-  );
-
-  const links = urls
-    .map((url, index) => `${index + 1}. ${url}`)
-    .join('\n');
+  const label = mediaType === 'images' ? 'ছবি' : 'ভিডিও';
 
   return (
     `অবশ্যই! ${product.name} পণ্যের ${label} লিংক:\n\n` +
-    `${links}\n\n` +
-    'লিংকে চাপ দিয়ে দেখতে পারবেন।'
+    urls.map((url, index) => `${index + 1}. ${url}`).join('\n') +
+    '\n\nলিংকে চাপ দিয়ে দেখতে পারবেন।'
   );
 }
 
 // =============================================================================
-// 6. HUMAN TAKEOVER
+// 9. HUMAN TAKEOVER
 // =============================================================================
 
 function getTakeoverState(customerId) {
-  if (!customerId) return db.isGlobalPaused;
+  if (!customerId) return !!db.isGlobalPaused;
 
   const id = String(customerId).trim();
 
@@ -566,27 +828,17 @@ function getTakeoverState(customerId) {
   return false;
 }
 
-async function setTakeoverState(
-  customerId,
-  enabled,
-  reasonStr
-) {
+async function setTakeoverState(customerId, enabled, reasonStr) {
   if (!customerId) return false;
 
   const id = String(customerId).trim();
   const isEnabled = Boolean(enabled);
 
-  const reason =
-    reasonStr ||
-    (
-      isEnabled
-        ? 'Admin takeover'
-        : 'Admin resumed AI'
-    );
-
   db.takeovers[id] = {
     isPaused: isEnabled,
-    reason,
+    reason: reasonStr || (
+      isEnabled ? 'Admin takeover' : 'Admin resumed AI'
+    ),
     timestamp: new Date().toISOString()
   };
 
@@ -606,36 +858,29 @@ async function setTakeoverState(
   saveStorage();
 
   console.log(
-    `[Takeover] ${id}: ${isEnabled ? 'PAUSED' : 'ACTIVE'} (${reason})`
+    `[Takeover] ${id}: ${isEnabled ? 'PAUSED' : 'ACTIVE'}`
   );
 
   return isEnabled;
 }
 
 // =============================================================================
-// 7. MESSENGER SEND API
+// 10. MESSENGER SEND
 // =============================================================================
 
 async function sendFacebookMessage(recipientId, text) {
   if (!PAGE_ACCESS_TOKEN) {
-    console.warn(
-      '[Messenger] PAGE_ACCESS_TOKEN is missing'
-    );
-
+    console.error('[Messenger] PAGE_ACCESS_TOKEN is missing');
     return false;
   }
 
   const finalText = String(text || '').trim();
 
-  if (!finalText) {
-    console.warn('[Messenger] Empty message blocked');
-    return false;
-  }
+  if (!finalText) return false;
 
-  // Never silently truncate a message and send an incomplete answer.
   if (finalText.length > MAX_MESSENGER_TEXT_LENGTH) {
     console.error(
-      `[Messenger] Message too long: ${finalText.length} characters`
+      `[Messenger] Message blocked: ${finalText.length} characters`
     );
 
     return false;
@@ -643,28 +888,28 @@ async function sendFacebookMessage(recipientId, text) {
 
   try {
     const url =
-      'https://graph.facebook.com/v18.0/me/messages' +
+      `https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages` +
       `?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
 
-    const payload = {
-      recipient: { id: recipientId },
-      message: { text: finalText },
-      messaging_type: 'RESPONSE'
-    };
-
-    const response = await axios.post(url, payload, {
-      timeout: 15000
-    });
+    const response = await axios.post(
+      url,
+      {
+        recipient: { id: recipientId },
+        message: { text: finalText },
+        messaging_type: 'RESPONSE'
+      },
+      { timeout: 15000 }
+    );
 
     console.log(
-      `[Messenger] Text sent to ${recipientId}; ` +
+      `[Messenger] Sent to ${recipientId}; ` +
       `message_id=${response.data?.message_id || 'accepted'}`
     );
 
     appendHistory(recipientId, 'assistant', finalText);
 
     db.messages.push({
-      id: 'msg_bot_' + Date.now(),
+      id: 'msg_bot_' + crypto.randomUUID(),
       senderId: recipientId,
       sender: 'bot',
       text: finalText,
@@ -672,7 +917,6 @@ async function sendFacebookMessage(recipientId, text) {
     });
 
     saveStorage();
-
     return true;
   } catch (err) {
     console.error(
@@ -685,84 +929,25 @@ async function sendFacebookMessage(recipientId, text) {
 }
 
 // =============================================================================
-// 8. GITHUB CATALOG SYNC
+// 11. GITHUB CATALOG SYNC
 // =============================================================================
 
-function validateCatalogShape(data) {
-  if (!data || typeof data !== 'object') {
-    throw new Error('Catalog must be a JSON object');
-  }
-
-  if (!Array.isArray(data.products)) {
-    throw new Error(
-      'Catalog must contain a "products" array'
-    );
-  }
-
-  const seenIds = new Set();
-
-  for (const product of data.products) {
-    if (!product || typeof product !== 'object') {
-      throw new Error(
-        'Each product must be an object'
-      );
-    }
-
-    const id = String(product.id ?? '').trim();
-
-    if (!id) {
-      throw new Error(
-        'Every product must have a non-empty "id"'
-      );
-    }
-
-    if (seenIds.has(id)) {
-      throw new Error(
-        `Duplicate product id detected: ${id}`
-      );
-    }
-
-    seenIds.add(id);
-  }
-
-  if (
-    data.faqs !== undefined &&
-    !Array.isArray(data.faqs)
-  ) {
-    throw new Error(
-      'Catalog "faqs" must be an array when provided'
-    );
-  }
-
-  return true;
-}
-
-function replaceCatalogAtomically(
-  catalogData,
-  source = 'admin'
-) {
+function replaceCatalogAtomically(catalogData, source = 'admin') {
   validateCatalogShape(catalogData);
 
   const normalized = {
+    ...catalogData,
     version: catalogData.version ?? Date.now(),
-    updatedAt:
-      catalogData.updatedAt ??
-      new Date().toISOString(),
+    updatedAt: catalogData.updatedAt ?? new Date().toISOString(),
     products: catalogData.products,
-    faqs: Array.isArray(catalogData.faqs)
-      ? catalogData.faqs
-      : []
+    faqs: Array.isArray(catalogData.faqs) ? catalogData.faqs : []
   };
 
   saveLocalCatalog(normalized, source);
 
-  products = normalized.products;
-  faqs = normalized.faqs;
-
   console.log(
     `[CATALOG] Replaced from ${source}: ` +
-    `${products.length} products, ${faqs.length} FAQs, ` +
-    `version=${normalized.version}`
+    `${products.length} products, ${faqs.length} FAQs`
   );
 
   return normalized;
@@ -770,20 +955,17 @@ function replaceCatalogAtomically(
 
 async function pullCatalogFromGitHub() {
   if (!GITHUB_TOKEN) {
-    catalogMeta.lastSyncError =
-      'GITHUB_TOKEN is not configured';
+    catalogMeta.lastSyncError = 'GITHUB_TOKEN is not configured';
 
-    console.warn(
-      '[GITHUB] Token missing; retaining local catalog'
-    );
-
+    console.warn('[GITHUB] Token missing; local catalog retained');
     return false;
   }
 
   try {
     const url =
       `https://api.github.com/repos/${GITHUB_REPO}` +
-      `/contents/${CATALOG_FILE}?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
+      `/contents/${CATALOG_FILE}` +
+      `?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
 
     const response = await axios.get(url, {
       headers: {
@@ -795,37 +977,22 @@ async function pullCatalogFromGitHub() {
     });
 
     if (!response.data?.content) {
-      throw new Error(
-        'GitHub response does not contain file content'
-      );
+      throw new Error('GitHub response contains no file content');
     }
 
     const parsed = JSON.parse(
-      Buffer.from(
-        response.data.content,
-        'base64'
-      ).toString('utf8')
+      Buffer.from(response.data.content, 'base64').toString('utf8')
     );
 
     validateCatalogShape(parsed);
-
     replaceCatalogAtomically(parsed, 'github');
-
-    console.log(
-      `[GITHUB] Pulled catalog: ${products.length} products, ` +
-      `${faqs.length} FAQs, version=${catalogMeta.version}`
-    );
 
     return true;
   } catch (err) {
     catalogMeta.lastSyncError =
       err.response?.data?.message || err.message;
 
-    console.error(
-      '[GITHUB] Catalog sync failed:',
-      catalogMeta.lastSyncError
-    );
-
+    console.error('[GITHUB] Pull failed:', catalogMeta.lastSyncError);
     return false;
   }
 }
@@ -843,23 +1010,16 @@ async function pushCatalogToGitHub(
   const filePath = customPath || CATALOG_FILE;
 
   if (!token) {
-    return {
-      synced: false,
-      message: 'GitHub Token is not configured'
-    };
+    return { synced: false, message: 'GitHub Token is not configured' };
   }
 
   try {
     validateCatalogShape(catalogData);
   } catch (err) {
-    return {
-      synced: false,
-      error: err.message
-    };
+    return { synced: false, error: err.message };
   }
 
-  const url =
-    `https://api.github.com/repos/${repo}/contents/${filePath}`;
+  const url = `https://api.github.com/repos/${repo}/contents/${filePath}`;
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -870,185 +1030,133 @@ async function pushCatalogToGitHub(
   let sha = null;
 
   try {
-    const getResponse = await axios.get(
+    const existing = await axios.get(
       `${url}?ref=${encodeURIComponent(branch)}`,
-      {
-        headers,
-        timeout: 10000
-      }
+      { headers, timeout: 10000 }
     );
 
-    sha = getResponse.data?.sha || null;
+    sha = existing.data?.sha || null;
   } catch (err) {
     if (err.response?.status !== 404) {
       return {
         synced: false,
-        error:
-          err.response?.data?.message || err.message
+        error: err.response?.data?.message || err.message
       };
     }
   }
 
-  const fileContentBase64 = Buffer
-    .from(
+  const payload = {
+    message: `Update Impotech catalog ${catalogData.version || Date.now()}`,
+    content: Buffer.from(
       JSON.stringify(catalogData, null, 2),
       'utf8'
-    )
-    .toString('base64');
-
-  const payload = {
-    message:
-      `Replace catalog from Impotech Admin v` +
-      `${catalogData.version || Date.now()}`,
-    content: fileContentBase64,
+    ).toString('base64'),
     branch
   };
 
   if (sha) payload.sha = sha;
 
   try {
-    const putResponse = await axios.put(
-      url,
-      payload,
-      {
-        headers,
-        timeout: 20000
-      }
-    );
+    const result = await axios.put(url, payload, {
+      headers,
+      timeout: 20000
+    });
 
-    replaceCatalogAtomically(
-      catalogData,
-      'github'
-    );
-
-    console.log(
-      `[GITHUB] Catalog uploaded to ${repo}@${branch}. ` +
-      `${products.length} products, ${faqs.length} FAQs`
-    );
+    replaceCatalogAtomically(catalogData, 'github');
 
     return {
       synced: true,
-      commit:
-        putResponse.data?.commit?.sha || 'synced',
+      commit: result.data?.commit?.sha || 'synced',
       totalProducts: products.length,
       totalFaqs: faqs.length
     };
   } catch (err) {
-    const error =
-      err.response?.data?.message || err.message;
-
-    console.error('[GITHUB] Upload failed:', error);
-
     return {
       synced: false,
-      error
+      error: err.response?.data?.message || err.message
     };
   }
 }
 
 // =============================================================================
-// 9. AI SYSTEM PROMPT
+// 12. AI SYSTEM PROMPT
 // =============================================================================
 
-function buildSystemPrompt(
-  relevantProducts,
-  relevantFaqs,
-  history
-) {
+function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
   const productContext = relevantProducts.length
-    ? relevantProducts.map((p, i) => {
-        const imageUrls =
-          getProductMediaUrls(p, 'images');
-
-        const videoUrls =
-          getProductMediaUrls(p, 'videos');
-
-        return [
-          `[পণ্য ${i + 1}]`,
-          `ID: ${p.id || 'N/A'}`,
-          `নাম: ${p.name || 'N/A'}`,
-          `মূল্য: ${p.price ?? 'N/A'} টাকা`,
-          `স্টক: ${p.stockStatus || (p.inStock ? 'IN_STOCK' : 'N/A')}`,
-          `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
-          `ছবির লিংক: ${imageUrls.join(' | ') || 'ক্যাটালগে নেই'}`,
-          `ভিডিওর লিংক: ${videoUrls.join(' | ') || 'ক্যাটালগে নেই'}`
-        ].join('\n');
-      }).join('\n\n')
-    : 'ক্যাটালগে কোনো প্রাসঙ্গিক পণ্য মেলেনি।';
+    ? relevantProducts.map((p, i) => [
+        `[পণ্য ${i + 1}]`,
+        `ID: ${p.id || 'N/A'}`,
+        `নাম: ${p.name || 'N/A'}`,
+        `ব্র্যান্ড: ${p.brand || 'N/A'}`,
+        `মডেল: ${p.model || 'N/A'}`,
+        `মূল্য: ${p.price ?? 'N/A'} টাকা`,
+        `স্টক: ${p.stockStatus || (p.inStock ? 'IN_STOCK' : 'N/A')}`,
+        `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
+        `ছবি: ${getProductMediaUrls(p, 'images').join(' | ') || 'নেই'}`,
+        `ভিডিও: ${getProductMediaUrls(p, 'videos').join(' | ') || 'নেই'}`
+      ].join('\n')).join('\n\n')
+    : 'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
 
   const faqContext = relevantFaqs.length
     ? relevantFaqs.map((f, i) =>
-        `[FAQ ${i + 1}] প্রশ্ন: ${f.question || ''}\n` +
-        `উত্তর: ${f.answer || ''}`
+        `[FAQ ${i + 1}] ${f.question || ''}\n${f.answer || ''}`
       ).join('\n\n')
-    : 'কোনো প্রাসঙ্গিক FAQ মেলেনি।';
+    : 'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
 
   const historyContext = history.length
     ? history.map(item =>
         `${item.role === 'assistant' ? 'বট' : 'গ্রাহক'}: ${item.text}`
       ).join('\n')
-    : 'পূর্বের কোনো কথোপকথন নেই।';
+    : 'পূর্ববর্তী কথোপকথন নেই।';
 
   return `
-আপনি ImpoTech BD (ইম্পোটেক বিডি) ফেসবুক পেজের অফিসিয়াল AI সাপোর্ট অ্যাসিস্ট্যান্ট।
+আপনি ImpoTech BD ফেসবুক পেজের অফিসিয়াল AI সাপোর্ট অ্যাসিস্ট্যান্ট।
 
 ব্যবসার তথ্য:
 ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
 হেল্পলাইন: 01884332067।
-ডেলিভারি চার্জ: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।
-পেমেন্ট: Cash on Delivery; ক্যাটালগ অনুযায়ী অগ্রিম প্রয়োজন নেই।
+ডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।
+পেমেন্ট: Cash on Delivery; ক্যাটালগে অগ্রিম প্রয়োজন নেই বলা থাকলে তবেই সেটি নিশ্চিত করুন।
 
-উত্তর দেওয়ার বাধ্যতামূলক নিয়ম:
-
-১. সহজ, মার্জিত ও স্বাভাবিক বাংলায় উত্তর দিন।
-২. সাধারণ প্রশ্নের উত্তর ১–৩টি ছোট বাক্যে দিন।
-৩. অপ্রয়োজনীয় ভূমিকা, পুনরাবৃত্তি ও দীর্ঘ ব্যাখ্যা এড়িয়ে চলুন।
-৪. গ্রাহকের প্রশ্নের সরাসরি উত্তর প্রথমে দিন।
-৫. একাধিক প্রশ্ন থাকলে প্রতিটি প্রশ্নের উত্তর দিন।
-৬. সংক্ষিপ্ত করতে গিয়ে প্রয়োজনীয় তথ্য বাদ দেবেন না।
-৭. গ্রাহক সম্পূর্ণ বিবরণ চাইলে ক্যাটালগে থাকা সব গুরুত্বপূর্ণ তথ্য সংক্ষেপে দিন।
-৮. দাম জানতে চাইলে ক্যাটালগের সঠিক দাম বলুন।
-৯. বৈশিষ্ট্য, স্টক, ওয়ারেন্টি বা ডেলিভারি সম্পর্কে অনুমান করবেন না।
-১০. ক্যাটালগে তথ্য না থাকলে সেটি স্পষ্টভাবে জানান।
-১১. ক্যাটালগের বাইরের কোনো পণ্যের তথ্য বা নতুন দাবি তৈরি করবেন না।
-১২. পণ্যের ID, দাম, স্টক ও মিডিয়া URL পরিবর্তন করবেন না।
-১৩. ছবি বা ভিডিও চাইলে কেবল সংশ্লিষ্ট পণ্যের ক্যাটালগের লিংক ব্যবহার করুন।
-১৪. এক পণ্যের মিডিয়া অন্য পণ্যের জন্য ব্যবহার করবেন না।
-১৫. পূর্ববর্তী কথোপকথন বিবেচনা করুন এবং একই তথ্য বারবার বলবেন না।
-১৬. গ্রাহককে অপ্রয়োজনীয় প্রশ্ন করবেন না।
-১৭. পাঠানোর আগে যাচাই করুন যে সব প্রশ্নের উত্তর আছে এবং বাক্য সম্পূর্ণ।
-১৮. তথ্য অনুপস্থিত থাকলে কল্পনা করে উত্তর পূরণ করবেন না।
-১৯. অযথা বড় তালিকা দেবেন না; প্রয়োজন হলে ছোট বুলেট ব্যবহার করুন।
-২০. উত্তর শেষ করার জন্য প্রয়োজনীয় তথ্য ও বাক্য সম্পূর্ণ রাখুন।
-২১. কোনো তথ্য নিশ্চিত না হলে সেটি নিশ্চিত বলে উপস্থাপন করবেন না।
-২২. উত্তর অসম্পূর্ণ হওয়ার আশঙ্কা থাকলে অপ্রয়োজনীয় বিবরণ বাদ দিন, কিন্তু মূল উত্তর বাদ দেবেন না।
+বাধ্যতামূলক নিয়ম:
+১. সহজ, ভদ্র ও স্বাভাবিক বাংলায় সংক্ষিপ্ত উত্তর দিন।
+২. গ্রাহকের সব প্রশ্নের উত্তর দিন, কিন্তু অনুমান করবেন না।
+৩. পণ্যের ID, দাম, স্টক ও মিডিয়া URL পরিবর্তন করবেন না।
+৪. ক্যাটালগে নেই এমন দাম, ওয়ারেন্টি বা বৈশিষ্ট্য তৈরি করবেন না।
+৫. গ্রাহক শুধু দাম জানতে চাইলে প্রথমে পণ্যের নাম জানতে চান।
+৬. পণ্য নিশ্চিত না হলে কোনো পণ্যের দাম বলবেন না।
+৭. একাধিক পণ্য মিলে গেলে পণ্যের নাম বা মডেল পরিষ্কার করুন।
+৮. নির্দিষ্ট পণ্য শনাক্ত হলে শুধু সেই পণ্যের মূল্য ব্যবহার করুন।
+৯. ক্যাটালগে দাম না থাকলে স্পষ্টভাবে জানান।
+১০. বাইকের Original Headlight-এর H4 Plug/Socket সম্পর্কে নিশ্চিত তথ্য ছাড়া Compatibility নিশ্চিত করবেন না।
+১১. বাইকের নাম দেখে অনুমান করে H4 বলবেন না।
+১২. H4 Compatibility-এর যাচাইকৃত তথ্য না থাকলে Admin/Representative-এর সহায়তা নিতে বলুন।
+১৩. শুধু H4 Plug নিশ্চিত হলেই এই FAQ অনুযায়ী Plug and Play বলা যাবে।
+১৪. অন্য Modification প্রয়োজন কি না তথ্য না থাকলে অনুমান করবেন না।
+১৫. ছবি ও ভিডিওর জন্য শুধু সংশ্লিষ্ট পণ্যের লিংক ব্যবহার করুন।
+১৬. গ্রাহক সম্পূর্ণ বিবরণ চাইলে ক্যাটালগের গুরুত্বপূর্ণ তথ্য দিন।
+১৭. অসম্পূর্ণ উত্তর, বানানো তথ্য ও অপ্রয়োজনীয় পুনরাবৃত্তি এড়িয়ে চলুন।
 
 প্রাসঙ্গিক পণ্য:
 ${productContext}
 
-FAQ:
+প্রাসঙ্গিক FAQ:
 ${faqContext}
 
 পূর্ববর্তী কথোপকথন:
 ${historyContext}
-`.trim();
+  `.trim();
 }
 
 // =============================================================================
-// 10. OPENROUTER
+// 13. OPENROUTER
 // =============================================================================
 
-async function callOpenRouter(
-  messages,
-  model = TEXT_MODEL
-) {
+async function callOpenRouter(messages, model = TEXT_MODEL) {
   if (!OPENROUTER_API_KEY) {
-    throw new Error(
-      'OPENROUTER_API_KEY is not configured'
-    );
+    throw new Error('OPENROUTER_API_KEY is not configured');
   }
-
-  console.log(`[OPENROUTER] Request -> ${model}`);
 
   const response = await axios.post(
     OPENROUTER_URL,
@@ -1062,8 +1170,7 @@ async function callOpenRouter(
       headers: {
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer':
-          'https://github.com/impotechaibot/Impotech-bot',
+        'HTTP-Referer': 'https://github.com/impotechaibot/Impotech-bot',
         'X-Title': 'ImpoTech Messenger AI Bot'
       },
       timeout: 30000,
@@ -1074,65 +1181,34 @@ async function callOpenRouter(
 
   const choice = response.data?.choices?.[0];
 
-  if (!choice) {
-    throw new Error(
-      'OpenRouter returned no response choice'
-    );
-  }
+  if (!choice) throw new Error('OpenRouter returned no response');
 
   let reply = choice.message?.content;
 
   if (Array.isArray(reply)) {
-    reply = reply
-      .map(item => item?.text || '')
-      .join('');
+    reply = reply.map(item => item?.text || '').join('');
   }
 
   reply = String(reply || '').trim();
 
-  if (!reply) {
-    throw new Error(
-      'OpenRouter returned an empty response'
-    );
-  }
+  if (!reply) throw new Error('OpenRouter returned an empty response');
 
-  // Do not treat token-truncated output as a complete answer.
   if (choice.finish_reason === 'length') {
-    console.warn(
-      '[OPENROUTER] Response truncated by token limit'
-    );
-
-    throw new Error(
-      'AI response was truncated; incomplete reply blocked'
-    );
+    throw new Error('AI response was truncated');
   }
-
-  console.log(
-    `[OPENROUTER] Response completed; ` +
-    `finish_reason=${choice.finish_reason || 'unknown'}`
-  );
 
   return reply;
 }
 
 // =============================================================================
-// 11. TEXT, VISION AND VOICE PROCESSOR
+// 14. AI TEXT, VISION AND VOICE
 // =============================================================================
 
-async function generateAIResponse(
-  customerText,
-  attachments = [],
-  senderId
-) {
-  const query =
-    customerText || 'পণ্য সম্পর্কে তথ্য দিন';
+async function generateAIResponse(customerText, attachments = [], senderId) {
+  const query = customerText || 'পণ্য সম্পর্কে তথ্য দিন';
 
-  const relevantProducts =
-    findRelevantProducts(query);
-
-  const relevantFaqs =
-    findRelevantFaqs(query);
-
+  const relevantProducts = findRelevantProducts(query);
+  const relevantFaqs = findRelevantFaqs(query);
   const history = getHistory(senderId);
 
   const systemPrompt = buildSystemPrompt(
@@ -1141,20 +1217,12 @@ async function generateAIResponse(
     history
   );
 
-  // ---------------------------------------------------------------------------
-  // Voice messages
-  // ---------------------------------------------------------------------------
-
   const audioAttachment = attachments.find(
-    item =>
-      item.type === 'audio' &&
-      item.payload?.url
+    item => item.type === 'audio' && item.payload?.url
   );
 
   if (audioAttachment) {
     try {
-      console.log('[VOICE] Downloading audio');
-
       const audioResponse = await axios.get(
         audioAttachment.payload.url,
         {
@@ -1164,32 +1232,20 @@ async function generateAIResponse(
         }
       );
 
-      const audioBase64 = Buffer
-        .from(audioResponse.data)
-        .toString('base64');
+      const audioBase64 = Buffer.from(audioResponse.data).toString('base64');
 
-      const messages = [
-        {
-          role: 'system',
-          content: systemPrompt
-        },
-
+      return await callOpenRouter([
+        { role: 'system', content: systemPrompt },
         ...history.map(item => ({
-          role:
-            item.role === 'assistant'
-              ? 'assistant'
-              : 'user',
+          role: item.role === 'assistant' ? 'assistant' : 'user',
           content: item.text
         })),
-
         {
           role: 'user',
           content: [
             {
               type: 'text',
-              text:
-                'গ্রাহকের ভয়েসের বক্তব্য বুঝে ' +
-                'বাংলায় সংক্ষিপ্ত ও সম্পূর্ণ উত্তর দিন।'
+              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় সংক্ষিপ্ত ও সম্পূর্ণ উত্তর দিন।'
             },
             {
               type: 'input_audio',
@@ -1200,34 +1256,18 @@ async function generateAIResponse(
             }
           ]
         }
-      ];
-
-      return await callOpenRouter(
-        messages,
-        VOICE_MODEL
-      );
+      ], VOICE_MODEL);
     } catch (err) {
-      console.warn(
-        '[VOICE] Processing failed:',
-        err.message
-      );
+      console.error('[VOICE] Processing failed:', err.message);
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Image messages sent by customers
-  // ---------------------------------------------------------------------------
-
   const imageAttachment = attachments.find(
-    item =>
-      item.type === 'image' &&
-      item.payload?.url
+    item => item.type === 'image' && item.payload?.url
   );
 
   if (imageAttachment) {
     try {
-      console.log('[VISION] Downloading image');
-
       const imageResponse = await axios.get(
         imageAttachment.payload.url,
         {
@@ -1237,102 +1277,49 @@ async function generateAIResponse(
         }
       );
 
-      const imageBase64 = Buffer
-        .from(imageResponse.data)
-        .toString('base64');
-
+      const imageBase64 = Buffer.from(imageResponse.data).toString('base64');
       const contentType =
-        imageResponse.headers['content-type'] ||
-        'image/jpeg';
+        imageResponse.headers['content-type'] || 'image/jpeg';
 
-      const dataUrl =
-        `data:${contentType};base64,${imageBase64}`;
-
-      const messages = [
-        {
-          role: 'system',
-          content: systemPrompt
-        },
-
+      return await callOpenRouter([
+        { role: 'system', content: systemPrompt },
         ...history.map(item => ({
-          role:
-            item.role === 'assistant'
-              ? 'assistant'
-              : 'user',
+          role: item.role === 'assistant' ? 'assistant' : 'user',
           content: item.text
         })),
-
         {
           role: 'user',
           content: [
             {
               type: 'text',
-              text: query
-                ? (
-                    `${query}\n` +
-                    'ছবিটি দেখে ক্যাটালগের সঙ্গে মিলিয়ে ' +
-                    'সংক্ষিপ্ত ও সম্পূর্ণ উত্তর দিন।'
-                  )
-                : (
-                    'ছবিটি দেখে পণ্য শনাক্ত করে ' +
-                    'ক্যাটালগ অনুযায়ী সংক্ষিপ্ত ও সম্পূর্ণ ' +
-                    'উত্তর দিন।'
-                  )
+              text: `${query}\nছবিটি দেখে ক্যাটালগের সঙ্গে মিলিয়ে উত্তর দিন।`
             },
             {
               type: 'image_url',
               image_url: {
-                url: dataUrl
+                url: `data:${contentType};base64,${imageBase64}`
               }
             }
           ]
         }
-      ];
-
-      return await callOpenRouter(
-        messages,
-        TEXT_MODEL
-      );
+      ], TEXT_MODEL);
     } catch (err) {
-      console.warn(
-        '[VISION] Processing failed:',
-        err.message
-      );
+      console.error('[VISION] Processing failed:', err.message);
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Normal text
-  // ---------------------------------------------------------------------------
-
-  const messages = [
-    {
-      role: 'system',
-      content: systemPrompt
-    },
-
+  return callOpenRouter([
+    { role: 'system', content: systemPrompt },
     ...history.map(item => ({
-      role:
-        item.role === 'assistant'
-          ? 'assistant'
-          : 'user',
+      role: item.role === 'assistant' ? 'assistant' : 'user',
       content: item.text
     })),
-
-    {
-      role: 'user',
-      content: query
-    }
-  ];
-
-  return await callOpenRouter(
-    messages,
-    TEXT_MODEL
-  );
+    { role: 'user', content: query }
+  ], TEXT_MODEL);
 }
 
 // =============================================================================
-// 12. FACEBOOK WEBHOOK
+// 15. FACEBOOK WEBHOOK
 // =============================================================================
 
 app.get('/webhook', (req, res) => {
@@ -1342,12 +1329,9 @@ app.get('/webhook', (req, res) => {
 
   if (
     mode === 'subscribe' &&
+    VERIFY_TOKEN &&
     token === VERIFY_TOKEN
   ) {
-    console.log(
-      '[Webhook] Verification successful'
-    );
-
     return res.status(200).send(challenge);
   }
 
@@ -1355,7 +1339,7 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  // Acknowledge Meta promptly.
+  // Acknowledge Meta immediately.
   res.status(200).send('EVENT_RECEIVED');
 
   try {
@@ -1369,13 +1353,7 @@ app.post('/webhook', async (req, res) => {
         const message = event.message;
         const messageId = message?.mid;
 
-        if (
-          !message ||
-          message.is_echo ||
-          !senderId
-        ) {
-          continue;
-        }
+        if (!message || message.is_echo || !senderId) continue;
 
         if (
           messageId &&
@@ -1385,18 +1363,13 @@ app.post('/webhook', async (req, res) => {
         }
 
         if (messageId) {
-          processedMessageIds.add(messageId);
-
-          setTimeout(() => {
-            processedMessageIds.delete(messageId);
-          }, 300000);
+          processedMessageIds.set(messageId, Date.now());
         }
 
-        const text = message.text || '';
+        const text = String(message.text || '').trim();
         const attachments = message.attachments || [];
 
-        const isPaused =
-          getTakeoverState(senderId);
+        const isPaused = getTakeoverState(senderId);
 
         appendHistory(
           senderId,
@@ -1405,12 +1378,10 @@ app.post('/webhook', async (req, res) => {
         );
 
         db.messages.push({
-          id: 'msg_' + Date.now(),
+          id: 'msg_' + crypto.randomUUID(),
           senderId,
           sender: 'customer',
-          text:
-            text ||
-            `[Media: ${attachments[0]?.type || 'file'}]`,
+          text: text || `[Media: ${attachments[0]?.type || 'file'}]`,
           timestamp: new Date().toISOString()
         });
 
@@ -1425,46 +1396,98 @@ app.post('/webhook', async (req, res) => {
             lastMessageText: text || '[Media]'
           };
         } else {
-          db.customers[senderId].messageCount =
-            (db.customers[senderId].messageCount || 0) + 1;
+          const customer = db.customers[senderId];
 
-          db.customers[senderId].lastActive =
-            new Date().toISOString();
-
-          db.customers[senderId].lastMessageText =
-            text || '[Media]';
+          customer.messageCount = (customer.messageCount || 0) + 1;
+          customer.lastActive = new Date().toISOString();
+          customer.lastMessageText = text || '[Media]';
         }
 
         saveStorage();
 
         if (isPaused) {
-          console.log(
-            `[Takeover] ${senderId} is paused; ` +
-            'bot will not respond'
-          );
-
+          console.log(`[Takeover] ${senderId} paused`);
           continue;
         }
 
-        console.log(
-          `[AI Response] Processing ${senderId}: "${text}"`
-        );
-
         try {
-          // Product-specific media requests are handled first.
-          if (isMediaRequest(text)) {
-            const mediaReply =
-              getProductMediaReply(text, senderId);
+          // ---------------------------------------------------------------
+          // 1. Bike compatibility guard
+          // ---------------------------------------------------------------
 
-            if (mediaReply) {
+          if (isBikeCompatibilityQuestion(text)) {
+            const match = identifyBikeModel(text);
+
+            if (!match) {
+              pendingBikeQuestions.set(senderId, {
+                timestamp: Date.now()
+              });
+
               await sendFacebookMessage(
                 senderId,
-                mediaReply
+                'আপনার বাইকের ব্র্যান্ড ও নির্দিষ্ট মডেলটি জানাবেন? Original Headlight-এ H4 Plug/Socket আছে কি না যাচাই করে জানাব।'
               );
 
               continue;
             }
+
+            await sendFacebookMessage(
+              senderId,
+              getH4CompatibilityReply(match)
+            );
+
+            continue;
           }
+
+          // ---------------------------------------------------------------
+          // 2. Price guard
+          // ---------------------------------------------------------------
+
+          if (isPriceQuestion(text)) {
+            if (isGenericPriceQuestion(text)) {
+              await sendFacebookMessage(
+                senderId,
+                getPriceClarificationReply()
+              );
+
+              continue;
+            }
+
+            const product = findExactProductForPrice(text);
+
+            if (!product) {
+              await sendFacebookMessage(
+                senderId,
+                'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? পণ্যের সঠিক নাম বা মডেলটি বললে সঠিক মূল্য জানাতে পারব।'
+              );
+
+              continue;
+            }
+
+            await sendFacebookMessage(
+              senderId,
+              getPriceReply(product)
+            );
+
+            continue;
+          }
+
+          // ---------------------------------------------------------------
+          // 3. Product-specific media
+          // ---------------------------------------------------------------
+
+          if (isMediaRequest(text)) {
+            const mediaReply = getProductMediaReply(text, senderId);
+
+            if (mediaReply) {
+              await sendFacebookMessage(senderId, mediaReply);
+              continue;
+            }
+          }
+
+          // ---------------------------------------------------------------
+          // 4. Normal AI
+          // ---------------------------------------------------------------
 
           const aiReply = await generateAIResponse(
             text,
@@ -1472,23 +1495,14 @@ app.post('/webhook', async (req, res) => {
             senderId
           );
 
-          if (aiReply) {
-            await sendFacebookMessage(
-              senderId,
-              aiReply
-            );
-          } else {
-            throw new Error(
-              'AI returned an empty response'
-            );
+          if (!aiReply) {
+            throw new Error('AI returned an empty response');
           }
-        } catch (err) {
-          console.error(
-            '[AI] Response error:',
-            err.message
-          );
 
-          // Short fallback; do not expose internal error details.
+          await sendFacebookMessage(senderId, aiReply);
+        } catch (err) {
+          console.error('[AI] Response error:', err.message);
+
           await sendFacebookMessage(
             senderId,
             'দুঃখিত, এই মুহূর্তে সম্পূর্ণ উত্তর দিতে পারছি না। বিস্তারিত জানতে আমাদের কল করুন: 01884332067'
@@ -1497,15 +1511,12 @@ app.post('/webhook', async (req, res) => {
       }
     }
   } catch (err) {
-    console.error(
-      '[Webhook] Processing error:',
-      err.message
-    );
+    console.error('[Webhook] Processing error:', err.message);
   }
 });
 
 // =============================================================================
-// 13. CATALOG API
+// 16. CATALOG ADMIN API
 // =============================================================================
 
 app.get('/api/catalog', (req, res) => {
@@ -1525,28 +1536,17 @@ app.post('/api/catalog/sync', async (req, res) => {
     const catalogData = req.body;
 
     validateCatalogShape(catalogData);
+    replaceCatalogAtomically(catalogData, 'admin');
 
-    // Replace the local catalog with the submitted full catalog.
-    replaceCatalogAtomically(
-      catalogData,
-      'admin'
-    );
-
-    let githubResult = {
-      synced: false
-    };
+    let githubResult = { synced: false };
 
     if (GITHUB_TOKEN) {
-      githubResult = await pushCatalogToGitHub(
-        catalogData
-      );
+      githubResult = await pushCatalogToGitHub(catalogData);
     }
 
     res.json({
       success: true,
-      message:
-        `Catalog sync processed: ${products.length} products, ` +
-        `${faqs.length} FAQs`,
+      message: `Catalog processed: ${products.length} products, ${faqs.length} FAQs`,
       totalProducts: products.length,
       totalFaqs: faqs.length,
       githubSynced: githubResult.synced,
@@ -1571,8 +1571,7 @@ app.post('/api/github/upload', async (req, res) => {
       githubFilePath
     } = req.body;
 
-    const targetCatalog =
-      catalogPayload || loadLocalCatalog();
+    const targetCatalog = catalogPayload || loadLocalCatalog();
 
     const result = await pushCatalogToGitHub(
       targetCatalog,
@@ -1585,20 +1584,15 @@ app.post('/api/github/upload', async (req, res) => {
     if (!result.synced) {
       return res.status(400).json({
         success: false,
-        message:
-          `GitHub upload failed: ` +
-          `${result.error || result.message}`
+        message: result.error || result.message
       });
     }
 
     res.json({
       success: true,
-      message:
-        `Catalog uploaded to ` +
-        `${githubRepo || GITHUB_REPO}@` +
-        `${githubBranch || GITHUB_BRANCH}`,
-      totalProducts: products.length,
-      totalFaqs: faqs.length,
+      message: `Catalog uploaded to ${githubRepo || GITHUB_REPO}@${githubBranch || GITHUB_BRANCH}`,
+      totalProducts: result.totalProducts,
+      totalFaqs: result.totalFaqs,
       commit: result.commit
     });
   } catch (err) {
@@ -1621,19 +1615,16 @@ app.post('/api/catalog/refresh', async (req, res) => {
 });
 
 // =============================================================================
-// 14. BOT STATUS AND ADMIN CONTROL
+// 17. BOT STATUS AND TAKEOVER API
 // =============================================================================
 
 app.get('/api/bot-status', (req, res) => {
   res.json({
     success: true,
     isGlobalPaused: !!db.isGlobalPaused,
-    reason: db.isGlobalPaused
-      ? 'Human takeover active'
-      : 'AI bot active',
-    totalPausedCustomers: Object.values(
-      db.takeovers
-    ).filter(item => item.isPaused).length
+    reason: db.isGlobalPaused ? 'Human takeover active' : 'AI bot active',
+    totalPausedCustomers: Object.values(db.takeovers)
+      .filter(item => item.isPaused).length
   });
 });
 
@@ -1642,80 +1633,59 @@ app.post('/api/toggle-bot', (req, res) => {
 
   saveStorage();
 
-  console.log(
-    `[Master Switch] ${
-      db.isGlobalPaused ? 'PAUSED' : 'ACTIVE'
-    }`
-  );
-
   res.json({
     success: true,
     isGlobalPaused: db.isGlobalPaused
   });
 });
 
-app.post(
-  '/api/customers/:senderId/takeover',
-  async (req, res) => {
-    const { senderId } = req.params;
+app.post('/api/customers/:senderId/takeover', async (req, res) => {
+  const { senderId } = req.params;
 
-    const isPaused =
-      req.body.isPaused !== undefined
-        ? !!req.body.isPaused
-        : req.body.takeover !== undefined
-          ? !!req.body.takeover
-          : true;
+  const isPaused =
+    req.body.isPaused !== undefined
+      ? !!req.body.isPaused
+      : req.body.takeover !== undefined
+        ? !!req.body.takeover
+        : true;
 
-    await setTakeoverState(
-      senderId,
-      isPaused,
-      req.body.reason
-    );
+  await setTakeoverState(senderId, isPaused, req.body.reason);
 
-    res.json({
-      success: true,
-      senderId,
-      isPaused,
-      takeover: isPaused
-    });
-  }
-);
+  res.json({
+    success: true,
+    senderId,
+    isPaused,
+    takeover: isPaused
+  });
+});
 
-app.get(
-  '/api/customers/:senderId/status',
-  (req, res) => {
-    const { senderId } = req.params;
+app.get('/api/customers/:senderId/status', (req, res) => {
+  const { senderId } = req.params;
+  const isPaused = getTakeoverState(senderId);
 
-    const isPaused =
-      getTakeoverState(senderId);
+  res.json({
+    success: true,
+    senderId,
+    isPaused,
+    takeover: isPaused
+  });
+});
 
-    res.json({
-      success: true,
-      senderId,
-      isPaused,
-      takeover: isPaused
-    });
-  }
-);
+// =============================================================================
+// 18. CUSTOMERS, MESSAGES AND ORDERS API
+// =============================================================================
 
 app.get('/api/customers', (req, res) => {
-  const list = Object.values(db.customers).map(
-    customer => ({
-      senderId: customer.id,
-      displayName:
-        customer.name ||
-        `Customer ${customer.id.slice(-4)}`,
-      phone: customer.phone || null,
-      lastMessageText:
-        customer.lastMessageText || null,
-      lastMessageAt:
-        customer.lastActive || null,
-      takeover:
-        getTakeoverState(customer.id),
-      isPaused:
-        getTakeoverState(customer.id)
-    })
-  );
+  const list = Object.values(db.customers).map(customer => ({
+    senderId: customer.id,
+    displayName: customer.name || `Customer ${String(customer.id).slice(-4)}`,
+    phone: customer.phone || null,
+    lastMessageText: customer.lastMessageText || null,
+    lastMessageAt: customer.lastActive || null,
+    messageCount: customer.messageCount || 0,
+    takeover: getTakeoverState(customer.id),
+    isPaused: getTakeoverState(customer.id)
+  }));
 
   res.json({
     success: true,
@@ -1723,39 +1693,160 @@ app.get('/api/customers', (req, res) => {
   });
 });
 
-app.post(
-  '/api/customers/:senderId/send',
-  async (req, res) => {
-    const { senderId } = req.params;
-    const { text } = req.body;
+app.get('/api/messages', (req, res) => {
+  const senderId = req.query.senderId
+    ? String(req.query.senderId)
+    : null;
 
-    if (!text) {
-      return res.status(400).json({
-        error: 'Text required'
-      });
-    }
+  const limit = Math.min(
+    Math.max(Number(req.query.limit) || 100, 1),
+    1000
+  );
 
-    const sent = await sendFacebookMessage(
-      senderId,
-      text
+  let messages = db.messages;
+
+  if (senderId) {
+    messages = messages.filter(
+      message => String(message.senderId) === senderId
     );
+  }
 
-    if (sent) {
-      return res.json({
-        success: true,
-        message: 'Message sent'
-      });
-    }
+  res.json({
+    success: true,
+    total: messages.length,
+    data: messages.slice(-limit)
+  });
+});
 
-    res.status(500).json({
+app.get('/api/orders', (req, res) => {
+  res.json({
+    success: true,
+    total: db.orders.length,
+    data: db.orders
+  });
+});
+
+app.post('/api/orders', (req, res) => {
+  const order = req.body || {};
+
+  if (!order.senderId && !order.customerId) {
+    return res.status(400).json({
+      success: false,
+      message: 'senderId or customerId is required'
+    });
+  }
+
+  const newOrder = {
+    ...order,
+    id: order.id || 'order_' + crypto.randomUUID(),
+    status: order.status || 'PENDING',
+    createdAt: order.createdAt || new Date().toISOString()
+  };
+
+  db.orders.push(newOrder);
+  saveStorage();
+
+  res.status(201).json({
+    success: true,
+    order: newOrder
+  });
+});
+
+app.get('/api/orders/:orderId', (req, res) => {
+  const order = db.orders.find(
+    item => String(item.id) === String(req.params.orderId)
+  );
+
+  if (!order) {
+    return res.status(404).json({
+      success: false,
+      message: 'Order not found'
+    });
+  }
+
+  res.json({
+    success: true,
+    order
+  });
+});
+
+app.put('/api/orders/:orderId', (req, res) => {
+  const index = db.orders.findIndex(
+    item => String(item.id) === String(req.params.orderId)
+  );
+
+  if (index === -1) {
+    return res.status(404).json({
+      success: false,
+      message: 'Order not found'
+    });
+  }
+
+  db.orders[index] = {
+    ...db.orders[index],
+    ...req.body,
+    id: db.orders[index].id,
+    updatedAt: new Date().toISOString()
+  };
+
+  saveStorage();
+
+  res.json({
+    success: true,
+    order: db.orders[index]
+  });
+});
+
+app.delete('/api/orders/:orderId', (req, res) => {
+  const index = db.orders.findIndex(
+    item => String(item.id) === String(req.params.orderId)
+  );
+
+  if (index === -1) {
+    return res.status(404).json({
+      success: false,
+      message: 'Order not found'
+    });
+  }
+
+  const removed = db.orders.splice(index, 1)[0];
+
+  saveStorage();
+
+  res.json({
+    success: true,
+    deleted: removed.id
+  });
+});
+
+app.post('/api/customers/:senderId/send', async (req, res) => {
+  const { senderId } = req.params;
+  const { text } = req.body;
+
+  if (!text) {
+    return res.status(400).json({
+      success: false,
+      message: 'Text required'
+    });
+  }
+
+  const sent = await sendFacebookMessage(senderId, text);
+
+  if (!sent) {
+    return res.status(500).json({
       success: false,
       message: 'Message sending failed'
     });
   }
-);
+
+  res.json({
+    success: true,
+    message: 'Message sent'
+  });
+});
 
 // =============================================================================
-// 15. HEALTH AND DIAGNOSTIC ENDPOINTS
+// 19. HEALTH AND DIAGNOSTICS
 // =============================================================================
 
 app.get('/health', (req, res) => {
@@ -1767,6 +1858,7 @@ app.get('/health', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.status(200).json({
+    success: true,
     status: 'LIVE_PRODUCTION',
     isGlobalPaused: !!db.isGlobalPaused
   });
@@ -1793,47 +1885,53 @@ app.get('/api/catalog/media-status', (req, res) => {
     products: products.map(product => ({
       id: product.id,
       name: product.name,
-      images:
-        getProductMediaUrls(product, 'images').length,
-      videos:
-        getProductMediaUrls(product, 'videos').length
+      images: getProductMediaUrls(product, 'images').length,
+      videos: getProductMediaUrls(product, 'videos').length
     }))
   });
 });
 
 // =============================================================================
-// 16. START SERVER AFTER INITIAL CATALOG SYNC
+// 20. START SERVER
 // =============================================================================
 
 async function startServer() {
-  // Keep the local catalog available if GitHub is unavailable.
-  // Wait for the initial sync attempt before accepting traffic.
   await pullCatalogFromGitHub();
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `[SERVER] ImpoTech Master Bot running on port ${PORT}`
-    );
+    console.log(`[SERVER] ImpoTech Master Bot running on port ${PORT}`);
 
     console.log(
-      `[CATALOG] ${products.length} products, ` +
-      `${faqs.length} FAQs; source=${catalogMeta.source}`
+      `[CATALOG] ${products.length} products, ${faqs.length} FAQs; ` +
+      `source=${catalogMeta.source}`
     );
 
     if (catalogMeta.lastSyncError) {
       console.warn(
-        '[CATALOG] Latest GitHub sync warning: ' +
-        catalogMeta.lastSyncError
+        '[CATALOG] GitHub warning: ' + catalogMeta.lastSyncError
+      );
+    }
+
+    if (!ADMIN_SECRET && REQUIRE_ADMIN_SECRET) {
+      console.error(
+        '[SECURITY] ADMIN_SECRET is missing. Admin API requests will be rejected.'
       );
     }
   });
 }
 
 startServer().catch(err => {
-  console.error(
-    '[SERVER] Startup error:',
-    err.message
-  );
-
+  console.error('[SERVER] Startup error:', err.message);
   process.exit(1);
 });
+
+// Periodically expire webhook deduplication entries.
+setInterval(() => {
+  const cutoff = Date.now() - 5 * 60 * 1000;
+
+  for (const [id, timestamp] of processedMessageIds) {
+    if (timestamp < cutoff) {
+      processedMessageIds.delete(id);
+    }
+  }
+}, 60 * 1000).unref();
