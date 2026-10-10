@@ -8,23 +8,23 @@
  * CATALOG     : GitHub catalog.json + Local cache
  * STORAGE     : storage_data.json
  * MEDIA       : Product-specific Facebook URLs
- * HUMAN       : Per-customer + Global takeover
+ * HUMAN       : Persistent per-customer + global takeover
  * ADMIN       : Catalog, customers, messages, orders, bot status
  *
- * NEW FEATURES:
- * - Automatic human handover when AI cannot answer
- * - AI automatically pauses for the specific customer after handover
- * - Persistent conversation history across server restarts
- * - Previous conversation context to avoid repetitive answers
- * - Messenger webhook duplicate protection
- * - Correct helpline and WhatsApp number
- *
- * SAFETY:
- * - Never guess product prices
- * - Never guess H4 compatibility
- * - Unknown answers trigger human handover
- * - Preserve existing admin endpoints
- * - Configure secrets through Render environment variables
+ * FEATURES:
+ * - Sales assistant and customer support
+ * - Last 20 conversation messages in AI context
+ * - Conversation history restored from storage_data.json
+ * - Motorcycle model/year/H4 compatibility assistance
+ * - Ask clarification before handover
+ * - Human takeover only for critical cases
+ * - Takeover remains enabled until admin turns it off
+ * - Messenger duplicate protection
+ * - Customer-specific message queue
+ * - Price and product media protection
+ * - Admin chat send/takeover APIs
+ * - GitHub catalog pull/push
+ * - Helpline and WhatsApp
  * =============================================================================
  */
 
@@ -47,7 +47,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader(
     'Access-Control-Allow-Methods',
-    'GET, POST, PUT, DELETE, OPTIONS'
+    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
   );
   res.setHeader(
     'Access-Control-Allow-Headers',
@@ -100,11 +100,11 @@ const WHATSAPP_NUMBER = '01884332067';
 
 const MAX_PRODUCTS_TO_AI = 5;
 const MAX_FAQS_TO_AI = 5;
-const MAX_OUTPUT_TOKENS = 700;
+const MAX_OUTPUT_TOKENS = 800;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
 
-const HISTORY_LIMIT = 30;
+const HISTORY_LIMIT = 20;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
 
@@ -120,11 +120,10 @@ const GRAPH_API_VERSION =
 const REQUIRE_ADMIN_SECRET =
   process.env.REQUIRE_ADMIN_SECRET !== 'false';
 
-// AI returns this internal marker when it cannot answer reliably.
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 
 // =============================================================================
-// 3. MEMORY AND STORAGE
+// 3. IN-MEMORY STATE AND FILE STORAGE
 // =============================================================================
 
 let products = [];
@@ -148,14 +147,14 @@ let db = {
 
 const customerHistory = new Map();
 const processedMessageIds = new Map();
-const pendingBikeQuestions = new Map();
-
-// Prevent concurrent processing of the same customer's messages.
 const customerQueues = new Map();
 
 function loadStorage() {
   try {
-    if (!fs.existsSync(DATA_FILE)) return;
+    if (!fs.existsSync(DATA_FILE)) {
+      console.log('[STORAGE] No storage file found; using empty storage');
+      return;
+    }
 
     const saved = JSON.parse(
       fs.readFileSync(DATA_FILE, 'utf8')
@@ -181,9 +180,9 @@ function loadStorage() {
     if (!Array.isArray(db.messages)) db.messages = [];
     if (!Array.isArray(db.orders)) db.orders = [];
 
-    // Restore recent conversations after restart.
     customerHistory.clear();
 
+    // Restore customer conversation history after restart.
     for (const message of db.messages) {
       const senderId = String(message.senderId || '');
 
@@ -216,15 +215,15 @@ function loadStorage() {
         ).getTime()
       });
 
-      while (history.length > HISTORY_LIMIT) {
-        history.shift();
+      if (history.length > HISTORY_LIMIT) {
+        history.splice(0, history.length - HISTORY_LIMIT);
       }
 
       customerHistory.set(senderId, history);
     }
 
     console.log(
-      `[STORAGE] Restored ${db.messages.length} messages and ` +
+      `[STORAGE] Restored ${db.messages.length} stored messages; ` +
       `${customerHistory.size} customer histories`
     );
   } catch (err) {
@@ -259,6 +258,21 @@ function addStoredMessage(message) {
       db.messages.length - MESSAGE_RETENTION_LIMIT
     );
   }
+}
+
+function normalizeText(value = '') {
+  return String(value)
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{N}\s৳$.-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenize(value = '') {
+  return normalizeText(value)
+    .split(/\s+/)
+    .filter(word => word.length >= 2);
 }
 
 function applyCatalog(data, source = 'local') {
@@ -407,21 +421,6 @@ function validateCatalogShape(data) {
   return true;
 }
 
-function normalizeText(value = '') {
-  return String(value)
-    .toLowerCase()
-    .normalize('NFKC')
-    .replace(/[^\p{L}\p{N}\s৳$.-]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function tokenize(value = '') {
-  return normalizeText(value)
-    .split(/\s+/)
-    .filter(word => word.length >= 2);
-}
-
 function scoreRecord(query, record, fields) {
   const q = normalizeText(query);
   const tokens = tokenize(q);
@@ -505,12 +504,10 @@ function getHistory(senderId) {
 
   if (!id) return [];
 
-  // Return cached history when available.
   if (customerHistory.has(id)) {
     return customerHistory.get(id);
   }
 
-  // Reconstruct history from persisted messages if necessary.
   const history = [];
 
   for (const message of db.messages) {
@@ -560,11 +557,22 @@ function appendHistory(senderId, role, text) {
     timestamp: Date.now()
   });
 
-  while (history.length > HISTORY_LIMIT) {
-    history.shift();
+  if (history.length > HISTORY_LIMIT) {
+    history.splice(0, history.length - HISTORY_LIMIT);
   }
 
   customerHistory.set(id, history);
+}
+
+function getRecentConversationText(senderId, additionalText = '') {
+  const history = getHistory(senderId);
+
+  return [
+    ...history.slice(-HISTORY_LIMIT).map(item => item.text),
+    additionalText
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function getPreviousAssistantReply(senderId, userText) {
@@ -634,20 +642,17 @@ function findExactProductForPrice(query) {
       product.id,
       product.sku,
       product.model,
-      product.brand,
       ...(Array.isArray(product.aliases) ? product.aliases : [])
     ]
       .filter(Boolean)
       .map(normalizeText);
 
-    return candidates.some(candidate => {
-      return candidate && q.includes(candidate);
-    });
+    return candidates.some(candidate =>
+      candidate && q.includes(candidate)
+    );
   });
 
-  if (matches.length !== 1) return null;
-
-  return matches[0];
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function getPriceReply(product) {
@@ -656,14 +661,14 @@ function getPriceReply(product) {
     product.price === null ||
     String(product.price).trim() === ''
   ) {
-    return `দুঃখিত, ${product.name} পণ্যের মূল্য বর্তমানে ক্যাটালগে উল্লেখ নেই।`;
+    return null;
   }
 
   return `${product.name}-এর দাম ${product.price} টাকা।`;
 }
 
 function getPriceClarificationReply() {
-  return 'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? পণ্যের সঠিক নাম বা মডেলটি বললে দাম জানাতে পারব।';
+  return 'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? পণ্যের সঠিক নাম বা মডেলটি বললে সঠিক দাম জানাতে পারব।';
 }
 
 // =============================================================================
@@ -673,10 +678,13 @@ function getPriceClarificationReply() {
 function isBikeCompatibilityQuestion(text = '') {
   const value = normalizeText(text);
 
-  return (
-    /h4|devil eye|হেডলাইট|headlight|head lamp|plug and play|প্লাগ অ্যান্ড প্লে/.test(value) &&
-    /বাইক|মোটরসাইকেল|motorcycle|bike|হবে|ফিট|fit|সাপোর্ট|support|socket|plug|সকেট|বাল্ব|bulb/.test(value)
-  );
+  const hasLightingTerm =
+    /h4|devil eye|headlight|head lamp|headlamp|হেডলাইট|হেড লাইট|plug and play|প্লাগ অ্যান্ড প্লে|socket|সকেট|বাল্ব|bulb/.test(value);
+
+  const hasBikeTerm =
+    /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট/.test(value);
+
+  return hasLightingTerm && hasBikeTerm;
 }
 
 function getBikeCompatibilityEntries() {
@@ -693,6 +701,8 @@ function getBikeCompatibilityEntries() {
   for (const faq of faqs) {
     if (Array.isArray(faq.bikeCompatibility)) {
       entries.push(...faq.bikeCompatibility);
+    } else if (faq.bikeCompatibility) {
+      entries.push(faq.bikeCompatibility);
     }
   }
 
@@ -703,41 +713,60 @@ function identifyBikeModel(text = '') {
   const value = normalizeText(text);
 
   const matches = getBikeCompatibilityEntries()
-    .filter(entry => entry && entry.verified === true)
-    .map(entry => ({
-      entry,
-      full: normalizeText(
-        `${entry.brand || ''} ${entry.model || ''}`
-      )
-    }))
-    .filter(item => item.full && value.includes(item.full))
-    .sort((a, b) => b.full.length - a.full.length);
+    .filter(entry =>
+      entry &&
+      entry.verified === true &&
+      typeof entry.originalH4Socket === 'boolean' &&
+      entry.brand &&
+      entry.model &&
+      entry.source
+    )
+    .map(entry => {
+      const aliases = Array.isArray(entry.aliases)
+        ? entry.aliases
+        : [];
+
+      const names = [
+        `${entry.brand} ${entry.model}`,
+        ...aliases
+      ]
+        .map(normalizeText)
+        .filter(Boolean);
+
+      const matchedName = names
+        .filter(name => value.includes(name))
+        .sort((a, b) => b.length - a.length)[0];
+
+      return {
+        entry,
+        matchedName,
+        score: matchedName ? matchedName.length : 0
+      };
+    })
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score);
 
   if (!matches.length) return null;
 
-  if (
-    matches.length > 1 &&
-    matches[0].full.length === matches[1].full.length &&
-    matches[0].entry.originalH4Socket !==
-      matches[1].entry.originalH4Socket
-  ) {
-    return null;
-  }
+  const best = matches[0];
 
-  return matches[0];
+  const conflicting = matches.some(item =>
+    item.score === best.score &&
+    item.entry.originalH4Socket !==
+      best.entry.originalH4Socket
+  );
+
+  if (conflicting) return null;
+
+  return best;
 }
 
 function getH4CompatibilityReply(match) {
-  if (!match?.entry) {
-    return null;
-  }
+  if (!match?.entry) return null;
 
   const entry = match.entry;
-  const model =
-    `${entry.brand || ''} ${entry.model || ''}`.trim();
 
   if (
-    !model ||
     entry.verified !== true ||
     typeof entry.originalH4Socket !== 'boolean' ||
     !entry.source
@@ -745,11 +774,61 @@ function getH4CompatibilityReply(match) {
     return null;
   }
 
+  const model =
+    `${entry.brand} ${entry.model}`.trim();
+
   if (entry.originalH4Socket) {
-    return `যাচাইকৃত তথ্য অনুযায়ী ${model}-এর Original Headlight-এ H4 Plug/Socket আছে। তবে অন্য কোনো Modification প্রয়োজন কি না তা আলাদাভাবে নিশ্চিত করতে হবে।`;
+    return (
+      `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
+      `Original Headlight-এ H4 Socket আছে। ` +
+      `তবে বাইকের উৎপাদন সাল বা Variant আলাদা হলে ` +
+      `সেটি মিলিয়ে নেওয়া প্রয়োজন হতে পারে।`
+    );
   }
 
-  return `যাচাইকৃত তথ্য অনুযায়ী ${model}-এর Original Headlight-এ H4 Plug/Socket নেই। তাই সরাসরি Plug and Play হবে বলে নিশ্চিত করা যাচ্ছে না।`;
+  return (
+    `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
+    `Original Headlight-এ H4 Socket নেই। ` +
+    `আপনার বাইকের Variant বা Headlight পরিবর্তন করা থাকলে ` +
+    `সেটি জানালে আরও নির্দিষ্টভাবে যাচাই করতে পারব।`
+  );
+}
+
+function extractBikeYear(text = '') {
+  const matches = String(text).match(
+    /\b(?:19[89]\d|20[0-3]\d)\b/g
+  );
+
+  return matches ? matches[matches.length - 1] : null;
+}
+
+function customerConfirmedH4(senderId, currentText = '') {
+  const context = getRecentConversationText(
+    senderId,
+    currentText
+  );
+
+  const hasH4 = /\bh.?4\b/i.test(context);
+
+  const confirmation =
+    /আমার বাইকে h.?4 আছে|আমার বাইকে h.?4 সকেট আছে|বাইকে h.?4 socket আছে|h.?4 সকেট আছে|h.?4 socket আছে|already h.?4|it has h.?4|my bike has h.?4/i;
+
+  return hasH4 && confirmation.test(context);
+}
+
+function getBikeClarificationReply(senderId, text = '') {
+  const context = getRecentConversationText(senderId, text);
+  const year = extractBikeYear(context);
+
+  if (!year) {
+    return (
+      'আপনার বাইকের সঠিক ব্র্যান্ড, মডেল এবং কত সালের মডেল ' +
+      'তা জানাবেন? যেমন: Yamaha FZ, 2022। ' +
+      'এগুলো মিলিয়ে H4 Socket ও সরাসরি ফিট হওয়ার বিষয়টি যাচাই করে জানাব।'
+    );
+  }
+
+  return null;
 }
 
 // =============================================================================
@@ -827,7 +906,7 @@ function findProductForMedia(query, senderId) {
 
   const previousProductQuery = history
     .filter(item => item.role === 'user')
-    .slice(-3)
+    .slice(-5)
     .map(item => item.text)
     .join(' ');
 
@@ -859,13 +938,17 @@ function getProductMediaReply(query, senderId) {
   const product = findProductForMedia(query, senderId);
 
   if (!product) {
-    return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যটির নাম বা মডেলটি বলুন।';
+    return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যের নাম বা মডেলটি বলুন।';
   }
 
   const urls = getProductMediaUrls(product, mediaType);
 
   if (!urls.length) {
-    return null;
+    return (
+      `দুঃখিত, ${product.name}-এর ` +
+      `${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক ` +
+      'বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না। অন্য কোনো পণ্যের তথ্য চাইলে বলুন।'
+    );
   }
 
   const label = mediaType === 'images' ? 'ছবি' : 'ভিডিও';
@@ -910,13 +993,14 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
 
   const id = String(customerId).trim();
   const isEnabled = Boolean(enabled);
+  const timestamp = new Date().toISOString();
 
   db.takeovers[id] = {
     isPaused: isEnabled,
     reason: reasonStr || (
       isEnabled ? 'Human takeover' : 'Admin resumed AI'
     ),
-    timestamp: new Date().toISOString()
+    timestamp
   };
 
   if (!db.customers[id]) {
@@ -925,11 +1009,13 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
       name: 'Customer ' + id.slice(-4),
       messageCount: 0,
       isPaused: isEnabled,
-      takeover: isEnabled
+      takeover: isEnabled,
+      takeoverUpdatedAt: timestamp
     };
   } else {
     db.customers[id].isPaused = isEnabled;
     db.customers[id].takeover = isEnabled;
+    db.customers[id].takeoverUpdatedAt = timestamp;
   }
 
   saveStorage();
@@ -941,27 +1027,22 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   return isEnabled;
 }
 
-/**
- * Transfer a conversation to a human representative.
- *
- * Enable takeover BEFORE sending the transfer message so subsequent
- * customer messages do not trigger another AI response.
- */
 async function transferToHuman(senderId, reason, customMessage) {
+  // Persist takeover before sending the notification.
   await setTakeoverState(
     senderId,
     true,
-    reason || 'AI unable to answer'
+    reason || 'Critical issue requiring human support'
   );
 
   const message = customMessage ||
-    `দুঃখিত, এই বিষয়টির সঠিক উত্তর নিশ্চিত করার জন্য আমি আপনার কথাটি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। এখন থেকে আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করবেন। জরুরি প্রয়োজনে হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`;
+    `আপনার বিষয়টি আমাদের প্রতিনিধির সহায়তা প্রয়োজন। আমি কথোপকথনটি প্রতিনিধির কাছে হস্তান্তর করছি। এখন থেকে প্রতিনিধি উত্তর দেবেন। জরুরি প্রয়োজনে হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`;
 
   const sent = await sendFacebookMessage(senderId, message);
 
   if (!sent) {
     console.error(
-      `[Takeover] Transfer enabled, but notification failed for ${senderId}`
+      `[Takeover] Enabled, but transfer notification failed for ${senderId}`
     );
   }
 
@@ -1125,7 +1206,8 @@ async function pushCatalogToGitHub(
     return { synced: false, error: err.message };
   }
 
-  const url = `https://api.github.com/repos/${repo}/contents/${filePath}`;
+  const url =
+    `https://api.github.com/repos/${repo}/contents/${filePath}`;
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -1185,7 +1267,7 @@ async function pushCatalogToGitHub(
 }
 
 // =============================================================================
-// 13. AI SYSTEM PROMPT
+// 13. SALES ASSISTANT SYSTEM PROMPT
 // =============================================================================
 
 function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
@@ -1196,9 +1278,10 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
         `নাম: ${p.name || 'N/A'}`,
         `ব্র্যান্ড: ${p.brand || 'N/A'}`,
         `মডেল: ${p.model || 'N/A'}`,
-        `মূল্য: ${p.price ?? 'N/A'} টাকা`,
-        `স্টক: ${p.stockStatus || (p.inStock ? 'IN_STOCK' : 'N/A')}`,
+        `মূল্য: ${p.price ?? 'ক্যাটালগে নেই'} টাকা`,
+        `স্টক: ${p.stockStatus || (p.inStock === true ? 'IN_STOCK' : 'তথ্য নেই')}`,
         `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
+        `বৈশিষ্ট্য: ${Array.isArray(p.features) ? p.features.join(', ') : 'N/A'}`,
         `ছবি: ${getProductMediaUrls(p, 'images').join(' | ') || 'নেই'}`,
         `ভিডিও: ${getProductMediaUrls(p, 'videos').join(' | ') || 'নেই'}`
       ].join('\n')).join('\n\n')
@@ -1212,12 +1295,12 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
 
   const historyContext = history.length
     ? history.map(item =>
-        `${item.role === 'assistant' ? 'বট' : 'গ্রাহক'}: ${item.text}`
+        `${item.role === 'assistant' ? 'বট/প্রতিনিধি' : 'গ্রাহক'}: ${item.text}`
       ).join('\n')
     : 'পূর্ববর্তী কথোপকথন নেই।';
 
   return `
-আপনি ImpoTech BD ফেসবুক পেজের অফিসিয়াল AI সাপোর্ট অ্যাসিস্ট্যান্ট।
+আপনি ImpoTech BD ফেসবুক পেজের বিক্রয় সহকারী এবং কাস্টমার সাপোর্ট অ্যাসিস্ট্যান্ট।
 
 যোগাযোগ:
 হেল্পলাইন: ${HELPLINE}
@@ -1230,33 +1313,68 @@ WhatsApp: ${WHATSAPP_NUMBER}
 গাজীপুরের ভেতরে ৫০ টাকা।
 গাজীপুরের বাইরে ১০০ টাকা।
 
-পেমেন্ট:
-ক্যাটালগের তথ্য অনুযায়ী Cash on Delivery সম্পর্কে উত্তর দিন।
+আপনার কাজ:
+- কাস্টমারকে সাহায্য করা এবং বিক্রয় বাড়াতে সহায়তা করা।
+- পণ্যের বৈশিষ্ট্য সহজ ভাষায় বোঝানো।
+- কাস্টমারের প্রয়োজন বুঝে উপযুক্ত পণ্য বেছে নিতে সাহায্য করা।
+- উপযুক্ত হলে কাস্টমার অর্ডার করতে চান কি না জিজ্ঞেস করা।
+- বন্ধুত্বপূর্ণ, ভদ্র, স্বাভাবিক ও বিশ্বাসযোগ্যভাবে কথা বলা।
+- কথোপকথন সংক্ষিপ্ত রাখা; অপ্রয়োজনীয় দীর্ঘ উত্তর না দেওয়া।
 
-অত্যন্ত গুরুত্বপূর্ণ নিয়ম:
+বিক্রয় সংক্রান্ত নিয়ম:
+১. কাস্টমার কী খুঁজছেন তা আগে বুঝুন।
+২. প্রাসঙ্গিক পণ্যের সুবিধা বলুন, তবে কেবল উপলভ্য তথ্যের ভিত্তিতে।
+৩. কাস্টমার কিনতে আগ্রহী হলে অর্ডার করার পরবর্তী ধাপ বুঝিয়ে দিন।
+৪. কাস্টমারকে চাপ দেবেন না এবং মিথ্যা জরুরি অবস্থা তৈরি করবেন না।
+৫. দাম ক্যাটালগে থাকলে সেই দাম বলুন। দাম না থাকলে অনুমান করবেন না।
+৬. স্টক, ওয়ারেন্টি, ডেলিভারি সময়, গ্যারান্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
+৭. পণ্যের ID, দাম বা মিডিয়া URL পরিবর্তন করবেন না।
+৮. কাস্টমার কোন পণ্য বোঝাচ্ছেন তা পরিষ্কার না হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
+৯. ক্যাটালগে কোনো তথ্য না থাকলেই Human Takeover চাইবেন না।
+১০. একই প্রশ্ন বারবার করে কাস্টমারকে বিরক্ত করবেন না।
 
-১. সহজ, ভদ্র ও স্বাভাবিক বাংলায় উত্তর দিন।
-২. কাস্টমারের আগের কথোপকথন ভালোভাবে বিবেচনা করুন।
-৩. আগে কাস্টমার কী বলেছেন এবং আপনি কী উত্তর দিয়েছেন তা মনে রাখুন।
-৪. একই প্রশ্নের আগের উত্তর থাকলে সেটি বিবেচনা করুন।
-৫. আগের উত্তর ইতিমধ্যে দেওয়া থাকলে অপ্রয়োজনীয়ভাবে হুবহু পুনরাবৃত্তি করবেন না।
-৬. কাস্টমার নতুন তথ্য দিলে সেই অনুযায়ী উত্তর আপডেট করুন।
-৭. ক্যাটালগে নেই এমন দাম, ওয়ারেন্টি, স্টক বা বৈশিষ্ট্য বানাবেন না।
-৮. পণ্যের ID, দাম এবং মিডিয়া URL পরিবর্তন করবেন না।
-৯. সঠিক পণ্য শনাক্ত না হলে দাম অনুমান করবেন না।
-১০. বাইকের H4 Compatibility নিশ্চিত করার মতো যাচাইকৃত তথ্য না থাকলে নিশ্চিত উত্তর দেবেন না।
-১১. অপ্রাসঙ্গিক প্রশ্নে কোম্পানির বিষয়ে বানানো তথ্য দেবেন না।
-১২. কাস্টমারের প্রশ্ন বুঝতে না পারলে এবং স্বাভাবিকভাবে পরিষ্কার করা সম্ভব হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
-১৩. কাস্টমারের প্রশ্নটি পরিষ্কার হলেও প্রয়োজনীয় তথ্য না থাকলে, অথবা নির্ভরযোগ্য উত্তর দেওয়ার মতো তথ্য না থাকলে, Human Takeover প্রয়োজন।
-১৪. কাস্টমারের প্রশ্নের উত্তর দিতে না পারলে অনুমান করে উত্তর দেবেন না।
-১৫. এমন ক্ষেত্রে উত্তরের একেবারে শুরুতে ঠিক এই মার্কার দিন:
+কথোপকথনের স্মৃতি:
+১. নিচে দেওয়া আগের কথোপকথনের সর্বশেষ ২০টি বার্তা বিবেচনা করুন।
+২. কাস্টমার আগে কোন মডেল, সাল, পণ্য বা বাজেট বলেছেন তা মনে রাখুন।
+৩. কাস্টমার ইতিমধ্যে তথ্য দিয়ে থাকলে আবার সেই তথ্য জিজ্ঞেস করবেন না।
+৪. আগের উত্তর ভুল বা অসম্পূর্ণ হলে নতুন তথ্যের ভিত্তিতে সংশোধন করুন।
+৫. একই প্রশ্নের উত্তর হুবহু পুনরাবৃত্তি না করে প্রয়োজন অনুযায়ী পরের ধাপে এগিয়ে যান।
+৬. অ্যাডমিন বা মানব প্রতিনিধি ইতিমধ্যে উত্তর দিয়ে থাকলে সেটিও কথোপকথনের অংশ হিসেবে বিবেচনা করুন।
+
+বাইক, গাড়ি, মডেল ও H4 Socket:
+১. বাইকের ব্র্যান্ড, মডেল, উৎপাদন সাল ও Variant গুরুত্বপূর্ণ হতে পারে।
+২. প্রয়োজনীয় তথ্য না থাকলে প্রথমে মডেল এবং উৎপাদন সাল জানতে চান।
+৩. কাস্টমার যদি ইতিমধ্যে মডেল ও সাল বলে থাকেন, সেগুলো আবার জিজ্ঞেস করবেন না।
+৪. কাস্টমার নিজে বলেন যে তাঁর বাইকে H4 Socket আছে, তাহলে সেই কথাকে বর্তমান কথোপকথনের নিশ্চিত করা তথ্য হিসেবে নিন।
+৫. কাস্টমার নিজে H4 Socket নিশ্চিত করলে অযথা আবার H4 আছে কি না জিজ্ঞেস করবেন না।
+৬. কাস্টমার নিজে Socket নিশ্চিত করলেও পণ্যের Connector, Voltage, Wattage বা অন্য কোনো অপরিহার্য বিষয় নিয়ে তথ্য না থাকলে কেবল সেই নির্দিষ্ট বিষয়টি জিজ্ঞেস করুন।
+৭. সাধারণ জ্ঞান দিয়ে সম্ভাব্য তথ্য ব্যাখ্যা করতে পারেন, কিন্তু অনুমানকে শতভাগ নিশ্চিত তথ্য হিসেবে বলবেন না।
+৮. একই মডেলের বিভিন্ন সাল বা Variant-এ পার্থক্য হতে পারে। তথ্য অস্পষ্ট হলে তা ব্যাখ্যা করে একটি প্রয়োজনীয় প্রশ্ন করুন।
+৯. কাস্টমারের মডেল ও সাল জানা থাকলে সেগুলো ক্যাটালগের যাচাইকৃত তথ্যের সঙ্গে মিলিয়ে দেখুন।
+১০. ক্যাটালগে রেকর্ড না থাকলেই সরাসরি Human Takeover করবেন না।
+১১. নিশ্চিত না হলে কোন তথ্যটি অনিশ্চিত তা পরিষ্কারভাবে বলুন এবং কাস্টমারের কাছে প্রয়োজনীয় তথ্য চান।
+১২. বাইক বা গাড়ির Compatibility নিয়ে উত্তর দিতে গিয়ে অপ্রাসঙ্গিকভাবে প্রতিনিধির কাছে পাঠাবেন না।
+
+Human Takeover:
+১. সাধারণ প্রশ্ন, শুভেচ্ছা, পণ্যের তথ্য, মডেল যাচাই বা সাধারণ অনিশ্চয়তায় Human Takeover করবেন না।
+২. প্রথমে একটি পরিষ্কার প্রশ্ন করে প্রয়োজনীয় তথ্য সংগ্রহের চেষ্টা করুন।
+৩. শুধু দাম, মডেল বা ক্যাটালগের তথ্য না থাকার কারণে Human Takeover করবেন না।
+৪. গুরুতর অভিযোগ, প্রতারণা/নিরাপত্তা-সংক্রান্ত অভিযোগ, সংবেদনশীল অর্ডার বা পেমেন্ট সমস্যা, অথবা মানব প্রতিনিধির সিদ্ধান্ত সত্যিই প্রয়োজন হলে তবেই নিচের মার্কার ব্যবহার করুন।
+৫. প্রযুক্তিগতভাবে উত্তর তৈরি করতে ব্যর্থ হলে আগে একবার পুনরায় চেষ্টা করুন; তবুও সম্ভব না হলে কাস্টমারকে প্রয়োজনীয় তথ্য জিজ্ঞেস করুন।
+৬. সত্যিই মানব সহায়তা প্রয়োজন হলে উত্তরের একেবারে শুরুতে ঠিক এই মার্কার লিখুন:
 ${HANDOVER_MARKER}
-এর পরে একটি সংক্ষিপ্ত ব্যাখ্যা লিখুন।
-১৬. মার্কারটি শুধু উত্তর জানা না থাকলে বা মানব প্রতিনিধির সাহায্য প্রয়োজন হলেই ব্যবহার করুন।
-১৭. সাধারণ অভিবাদন, ধন্যবাদ বা উত্তরযোগ্য প্রশ্নে মার্কার ব্যবহার করবেন না।
-১৮. এই মার্কার কাস্টমারের কাছে পাঠানোর জন্য নয়; ব্যাকএন্ড এটি শনাক্ত করে Human Takeover চালু করবে।
-১৯. কোনো তথ্য না থাকলে প্রতিনিধির সহায়তা ছাড়া নিশ্চিত দাবি করবেন না।
-২০. উত্তর সংক্ষিপ্ত, প্রাসঙ্গিক এবং গ্রাহকবান্ধব রাখুন।
+৭. মার্কারের পরে এক বাক্যে কারণ লিখুন।
+৮. এই মার্কার কাস্টমারের কাছে পাঠানোর জন্য নয়; ব্যাকএন্ড মার্কার শনাক্ত করে Takeover চালু করবে।
+৯. সাধারণ অনিশ্চয়তার অজুহাতে মার্কার ব্যবহার করবেন না।
+১০. Takeover চালু থাকলে AI উত্তর পাঠাবে না; অ্যাডমিন নিজে চালু না করা পর্যন্ত এই অবস্থা থাকবে।
+
+অন্যান্য নিয়ম:
+- সহজ ও স্বাভাবিক বাংলায় উত্তর দিন।
+- কাস্টমার ইংরেজিতে লিখলে প্রয়োজনমতো ইংরেজিতে উত্তর দিতে পারেন।
+- কোম্পানি সম্পর্কে বানানো তথ্য দেবেন না।
+- কাস্টমারের ব্যক্তিগত তথ্য প্রকাশ করবেন না।
+- পণ্য কেনার সিদ্ধান্ত নিতে সহায়ক বাস্তব তথ্য দিন।
+- ক্যাটালগের তথ্যকে অগ্রাধিকার দিন।
 
 প্রাসঙ্গিক পণ্য:
 ${productContext}
@@ -1284,7 +1402,7 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
       model,
       messages,
       max_tokens: MAX_OUTPUT_TOKENS,
-      temperature: 0.2
+      temperature: 0.25
     },
     {
       headers: {
@@ -1333,14 +1451,13 @@ async function generateAIResponse(
   attachments = [],
   senderId
 ) {
-  const query = customerText || 'পণ্য সম্পর্কে তথ্য দিন';
+  const query = customerText || 'ছবিটি বা পাঠানো ফাইলটি দেখে সাহায্য করুন';
 
   const allHistory = getHistory(senderId);
-
-  // The latest incoming user message has already been recorded.
-  // Do not send it twice to the AI model.
   const history = allHistory.slice();
 
+  // Incoming customer message has already been stored.
+  // Avoid sending it twice to the AI.
   if (
     history.length &&
     history[history.length - 1].role === 'user' &&
@@ -1349,8 +1466,13 @@ async function generateAIResponse(
     history.pop();
   }
 
-  const relevantProducts = findRelevantProducts(query);
-  const relevantFaqs = findRelevantFaqs(query);
+  const relevantProducts = findRelevantProducts(
+    getRecentConversationText(senderId, query)
+  );
+
+  const relevantFaqs = findRelevantFaqs(
+    getRecentConversationText(senderId, query)
+  );
 
   const systemPrompt = buildSystemPrompt(
     relevantProducts,
@@ -1390,8 +1512,8 @@ async function generateAIResponse(
             {
               type: 'text',
               text:
-                'গ্রাহকের ভয়েস বুঝে বাংলায় উত্তর দিন। ' +
-                'নিশ্চিত উত্তর জানা না থাকলে handover marker ব্যবহার করুন।'
+                'গ্রাহকের ভয়েস বুঝে উত্তর দিন। ' +
+                'প্রয়োজন হলে তাঁর প্রশ্নটি সংক্ষেপে পরিষ্কার করুন।'
             },
             {
               type: 'input_audio',
@@ -1438,8 +1560,8 @@ async function generateAIResponse(
             {
               type: 'text',
               text:
-                `${query}\nছবিটি দেখে ক্যাটালগের সঙ্গে মিলিয়ে উত্তর দিন। ` +
-                'নিশ্চিত না হলে handover marker ব্যবহার করুন।'
+                `${query}\nছবিটি দেখে প্রাসঙ্গিক পণ্য বা তথ্য শনাক্ত করুন। ` +
+                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করে বলবেন না।'
             },
             {
               type: 'image_url',
@@ -1463,7 +1585,19 @@ async function generateAIResponse(
 }
 
 // =============================================================================
-// 16. MESSAGE PROCESSING
+// 16. CRITICAL HANDOVER CLASSIFICATION
+// =============================================================================
+
+function isCriticalHandoverQuestion(text = '') {
+  const value = normalizeText(text);
+
+  return (
+    /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/.test(value)
+  );
+}
+
+// =============================================================================
+// 17. MESSAGE PROCESSING
 // =============================================================================
 
 async function processCustomerMessage(
@@ -1471,9 +1605,8 @@ async function processCustomerMessage(
   text,
   attachments = []
 ) {
-  // Re-check immediately before processing.
   if (getTakeoverState(senderId)) {
-    console.log(`[Takeover] ${senderId} is already paused`);
+    console.log(`[Takeover] ${senderId} is paused; skipping AI`);
     return;
   }
 
@@ -1481,27 +1614,94 @@ async function processCustomerMessage(
 
   try {
     // -----------------------------------------------------------------------
-    // 1. H4 compatibility
+    // 1. Critical issue: transfer directly to a representative.
     // -----------------------------------------------------------------------
 
-    if (isBikeCompatibilityQuestion(customerText)) {
-      const match = identifyBikeModel(customerText);
-      const reply = getH4CompatibilityReply(match);
+    if (isCriticalHandoverQuestion(customerText)) {
+      await transferToHuman(
+        senderId,
+        'Critical customer issue',
+        `আপনার বিষয়টি গুরুত্ব দিয়ে দেখা প্রয়োজন। আমি কথোপকথনটি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
+      );
 
-      if (!reply) {
-        await transferToHuman(
-          senderId,
-          'Unverified motorcycle H4 compatibility'
-        );
-        return;
-      }
-
-      await sendFacebookMessage(senderId, reply);
       return;
     }
 
     // -----------------------------------------------------------------------
-    // 2. Product price
+    // 2. H4 compatibility: use verified catalog information first.
+    // -----------------------------------------------------------------------
+
+    if (isBikeCompatibilityQuestion(customerText)) {
+      const context = getRecentConversationText(
+        senderId,
+        customerText
+      );
+
+      const match = identifyBikeModel(context);
+      const verifiedReply = getH4CompatibilityReply(match);
+
+      if (verifiedReply) {
+        await sendFacebookMessage(senderId, verifiedReply);
+        return;
+      }
+
+      // If the customer personally confirms H4, do not ask the same
+      // question again. Let AI explain next compatibility requirements.
+      if (customerConfirmedH4(senderId, customerText)) {
+        const reply = await generateAIResponse(
+          customerText,
+          attachments,
+          senderId
+        );
+
+        if (reply.includes(HANDOVER_MARKER)) {
+          // Do not transfer for an ordinary fitment uncertainty.
+          await sendFacebookMessage(
+            senderId,
+            'আপনি জানিয়েছেন যে আপনার বাইকে H4 Socket আছে। এখন পণ্যের মডেল বা Connector-এর তথ্যটি জানালে বাকি Compatibility মিলিয়ে বলতে পারব।'
+          );
+          return;
+        }
+
+        await sendFacebookMessage(senderId, reply);
+        return;
+      }
+
+      // Ask for model/year first instead of sending every question
+      // to the human representative.
+      const clarification = getBikeClarificationReply(
+        senderId,
+        customerText
+      );
+
+      if (clarification) {
+        await sendFacebookMessage(senderId, clarification);
+        return;
+      }
+
+      // Model/year may already be in the conversation.
+      // Let the AI use its general knowledge and available catalog context.
+      // Uncertainty alone must not trigger human takeover.
+      const bikeReply = await generateAIResponse(
+        customerText,
+        attachments,
+        senderId
+      );
+
+      if (bikeReply.includes(HANDOVER_MARKER)) {
+        await sendFacebookMessage(
+          senderId,
+          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে আপনার Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন? তাহলে আরও নির্ভুলভাবে সাহায্য করতে পারব।'
+        );
+        return;
+      }
+
+      await sendFacebookMessage(senderId, bikeReply);
+      return;
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Product price.
     // -----------------------------------------------------------------------
 
     if (isPriceQuestion(customerText)) {
@@ -1516,36 +1716,30 @@ async function processCustomerMessage(
       const product = findExactProductForPrice(customerText);
 
       if (!product) {
-        // Ask for clarification first instead of guessing the product.
         await sendFacebookMessage(
           senderId,
-          'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? পণ্যের সঠিক নাম বা মডেলটি বললে সঠিক মূল্য জানাতে পারব।'
+          'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? সঠিক নাম বা মডেলটি বললে ক্যাটালগ থেকে দাম মিলিয়ে জানাতে পারব।'
         );
         return;
       }
 
-      if (
-        product.price === undefined ||
-        product.price === null ||
-        String(product.price).trim() === ''
-      ) {
-        await transferToHuman(
+      const priceReply = getPriceReply(product);
+
+      if (!priceReply) {
+        // Missing price is not, by itself, a critical issue.
+        await sendFacebookMessage(
           senderId,
-          'Product price missing from catalog',
-          `দুঃখিত, ${product.name} পণ্যের সঠিক দাম বর্তমানে ক্যাটালগে নেই। আমি বিষয়টি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি।`
+          `দুঃখিত, ${product.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই। আপনি চাইলে পণ্যটির অন্য তথ্য জানাতে পারি।`
         );
         return;
       }
 
-      await sendFacebookMessage(
-        senderId,
-        getPriceReply(product)
-      );
+      await sendFacebookMessage(senderId, priceReply);
       return;
     }
 
     // -----------------------------------------------------------------------
-    // 3. Product media
+    // 4. Product media.
     // -----------------------------------------------------------------------
 
     if (isMediaRequest(customerText)) {
@@ -1558,16 +1752,10 @@ async function processCustomerMessage(
         await sendFacebookMessage(senderId, mediaReply);
         return;
       }
-
-      await transferToHuman(
-        senderId,
-        'Requested product media unavailable'
-      );
-      return;
     }
 
     // -----------------------------------------------------------------------
-    // 4. Normal AI
+    // 5. Normal AI sales/support response.
     // -----------------------------------------------------------------------
 
     let aiReply = await generateAIResponse(
@@ -1580,24 +1768,34 @@ async function processCustomerMessage(
       throw new Error('AI returned an empty response');
     }
 
-    // AI explicitly indicated it cannot answer.
+    // AI marker is reserved for genuinely critical human support.
     if (aiReply.includes(HANDOVER_MARKER)) {
       const explanation = aiReply
         .replaceAll(HANDOVER_MARKER, '')
         .trim();
 
-      await transferToHuman(
+      if (isCriticalHandoverQuestion(customerText)) {
+        await transferToHuman(
+          senderId,
+          'AI identified a critical support issue',
+          explanation
+            ? `${explanation}\n\nআমি বিষয়টি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
+            : undefined
+        );
+
+        return;
+      }
+
+      // If it is not a critical issue, keep helping instead of pausing AI.
+      await sendFacebookMessage(
         senderId,
-        'AI unable to answer customer question',
-        explanation
-          ? `${explanation}\n\nআমি বিষয়টি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
-          : undefined
+        explanation ||
+        'আপনার প্রশ্নটি আরও ভালোভাবে বুঝতে একটি তথ্য জানতে চাই। আপনি কোন পণ্য বা মডেলটির কথা বলছেন?'
       );
 
       return;
     }
 
-    // Do not repeat an identical previous reply unnecessarily.
     const previousReply = getPreviousAssistantReply(
       senderId,
       customerText
@@ -1607,33 +1805,34 @@ async function processCustomerMessage(
       previousReply &&
       normalizeText(previousReply) === normalizeText(aiReply)
     ) {
-      // Acknowledge the previous answer without sending it all over again.
       aiReply =
         'আগের উত্তরে বিষয়টি জানিয়েছি। আপনি চাইলে কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
     }
 
-    // Re-check before sending to avoid responding after a manual takeover.
-    if (getTakeoverState(senderId)) {
-      return;
-    }
+    // Check takeover immediately before sending.
+    if (getTakeoverState(senderId)) return;
 
     await sendFacebookMessage(senderId, aiReply);
   } catch (err) {
     console.error('[AI] Response error:', err.message);
 
-    // AI/API failure also hands over instead of repeatedly apologizing.
-    if (!getTakeoverState(senderId)) {
-      await transferToHuman(
-        senderId,
-        'AI processing error',
-        `দুঃখিত, এই মুহূর্তে আপনার প্রশ্নের সঠিক উত্তর দিতে পারছি না। আমি বিষয়টি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
-      );
-    }
+    if (getTakeoverState(senderId)) return;
+
+    // A transient API error should not automatically disable the bot.
+    // Tell the customer briefly and allow later messages to work.
+    await sendFacebookMessage(
+      senderId,
+      'দুঃখিত, এই মুহূর্তে উত্তর তৈরি করতে সমস্যা হচ্ছে। আপনি একটু পরে আবার লিখবেন? জরুরি প্রয়োজনে হেল্পলাইন: ' +
+      HELPLINE +
+      '। WhatsApp: ' +
+      WHATSAPP_NUMBER +
+      '।'
+    );
   }
 }
 
 // =============================================================================
-// 17. FACEBOOK WEBHOOK
+// 18. FACEBOOK WEBHOOK
 // =============================================================================
 
 app.get('/webhook', (req, res) => {
@@ -1669,7 +1868,6 @@ app.post('/webhook', async (req, res) => {
 
         if (!message || message.is_echo || !senderId) continue;
 
-        // Ignore duplicate Messenger webhook deliveries.
         if (
           messageId &&
           processedMessageIds.has(messageId)
@@ -1684,7 +1882,6 @@ app.post('/webhook', async (req, res) => {
         const text = String(message.text || '').trim();
         const attachments = message.attachments || [];
 
-        // Serialize incoming messages for each customer.
         const previousTask =
           customerQueues.get(senderId) || Promise.resolve();
 
@@ -1764,7 +1961,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // =============================================================================
-// 18. CATALOG ADMIN API
+// 19. CATALOG ADMIN API
 // =============================================================================
 
 app.get('/api/catalog', (req, res) => {
@@ -1868,7 +2065,7 @@ app.post('/api/catalog/refresh', async (req, res) => {
 });
 
 // =============================================================================
-// 19. BOT STATUS AND TAKEOVER API
+// 20. BOT STATUS AND TAKEOVER API
 // =============================================================================
 
 app.get('/api/bot-status', (req, res) => {
@@ -1876,10 +2073,10 @@ app.get('/api/bot-status', (req, res) => {
     success: true,
     isGlobalPaused: !!db.isGlobalPaused,
     reason: db.isGlobalPaused
-      ? 'Human takeover active'
+      ? 'Global human takeover active'
       : 'AI bot active',
     totalPausedCustomers: Object.values(db.takeovers)
-      .filter(item => item.isPaused).length
+      .filter(item => item && item.isPaused).length
   });
 });
 
@@ -1914,7 +2111,10 @@ app.post('/api/customers/:senderId/takeover', async (req, res) => {
     success: true,
     senderId,
     isPaused,
-    takeover: isPaused
+    takeover: isPaused,
+    message: isPaused
+      ? 'Human takeover enabled. AI remains paused until an admin resumes it.'
+      : 'AI resumed for this customer.'
   });
 });
 
@@ -1926,12 +2126,49 @@ app.get('/api/customers/:senderId/status', (req, res) => {
     success: true,
     senderId,
     isPaused,
-    takeover: isPaused
+    takeover: isPaused,
+    reason: db.takeovers[senderId]?.reason || null,
+    updatedAt: db.takeovers[senderId]?.timestamp || null
+  });
+});
+
+// Convenience endpoints for admin chat UI.
+app.post('/api/customers/:senderId/takeover/enable', async (req, res) => {
+  const { senderId } = req.params;
+
+  await setTakeoverState(
+    senderId,
+    true,
+    req.body?.reason || 'Enabled from admin chat'
+  );
+
+  res.json({
+    success: true,
+    senderId,
+    takeover: true,
+    isPaused: true
+  });
+});
+
+app.post('/api/customers/:senderId/takeover/disable', async (req, res) => {
+  const { senderId } = req.params;
+
+  await setTakeoverState(
+    senderId,
+    false,
+    req.body?.reason || 'Disabled from admin chat'
+  );
+
+  res.json({
+    success: true,
+    senderId,
+    takeover: false,
+    isPaused: false
   });
 });
 
 // =============================================================================
-// 20. CUSTOMERS, MESSAGES AND ORDERS API
+// 21. CUSTOMERS, MESSAGES AND ORDERS API
 // =============================================================================
 
 app.get('/api/customers', (req, res) => {
@@ -1945,7 +2182,9 @@ app.get('/api/customers', (req, res) => {
     lastMessageAt: customer.lastActive || null,
     messageCount: customer.messageCount || 0,
     takeover: getTakeoverState(customer.id),
-    isPaused: getTakeoverState(customer.id)
+    isPaused: getTakeoverState(customer.id),
+    takeoverReason: db.takeovers[customer.id]?.reason || null,
+    takeoverUpdatedAt: db.takeovers[customer.id]?.timestamp || null
   }));
 
   res.json({
@@ -2080,11 +2319,12 @@ app.delete('/api/orders/:orderId', (req, res) => {
   });
 });
 
+// Admin sends a message from the chat UI.
 app.post('/api/customers/:senderId/send', async (req, res) => {
   const { senderId } = req.params;
-  const { text } = req.body;
+  const { text } = req.body || {};
 
-  if (!text) {
+  if (!text || !String(text).trim()) {
     return res.status(400).json({
       success: false,
       message: 'Text required'
@@ -2107,7 +2347,7 @@ app.post('/api/customers/:senderId/send', async (req, res) => {
 });
 
 // =============================================================================
-// 21. HEALTH AND DIAGNOSTICS
+// 22. HEALTH AND DIAGNOSTICS
 // =============================================================================
 
 app.get('/health', (req, res) => {
@@ -2138,6 +2378,7 @@ app.get('/api/status', (req, res) => {
     globalBotPaused: !!db.isGlobalPaused,
     helpline: HELPLINE,
     whatsapp: WHATSAPP_NUMBER,
+    historyLimit: HISTORY_LIMIT,
     timestamp: new Date().toISOString()
   });
 });
@@ -2155,7 +2396,7 @@ app.get('/api/catalog/media-status', (req, res) => {
 });
 
 // =============================================================================
-// 22. START SERVER
+// 23. START SERVER
 // =============================================================================
 
 async function startServer() {
@@ -2173,6 +2414,7 @@ async function startServer() {
 
     console.log(`[CONTACT] Helpline: ${HELPLINE}`);
     console.log(`[CONTACT] WhatsApp: ${WHATSAPP_NUMBER}`);
+    console.log(`[MEMORY] Last ${HISTORY_LIMIT} conversation messages`);
 
     if (catalogMeta.lastSyncError) {
       console.warn(
@@ -2196,7 +2438,7 @@ startServer().catch(err => {
 });
 
 // =============================================================================
-// 23. CLEANUP
+// 24. CLEANUP
 // =============================================================================
 
 setInterval(() => {
