@@ -86,8 +86,8 @@ const OPENROUTER_URL =
 const TEXT_MODEL = 'google/gemini-3.1-flash-lite';
 const VOICE_MODEL = 'google/gemini-3.1-flash-lite';
 
-const MAX_PRODUCTS_TO_AI = 2;
-const MAX_FAQS_TO_AI = 2;
+const MAX_PRODUCTS_TO_AI = 7;
+const MAX_FAQS_TO_AI = 4;
 
 // More output capacity reduces the chance of incomplete responses.
 // The system prompt still instructs the model to answer briefly.
