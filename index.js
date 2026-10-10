@@ -1,4 +1,3 @@
-
 /**
  * =============================================================================
  * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND
@@ -7,13 +6,18 @@
  * TEXT / VISION / VOICE : OpenRouter Gemini
  * CATALOG               : GitHub catalog.json + Local cache
  * MEDIA                 : Product-specific Facebook image/video links
- * HUMAN TAKEOVER         : Per-customer + Global bot control
- * ADMIN API              : Catalog, customers, messages, orders, bot status
+ * HUMAN TAKEOVER        : Per-customer + Global bot control
+ * ADMIN API             : Catalog, customers, messages, orders, bot status
  *
- * IMPORTANT:
- * - Existing product IDs, prices and media URLs are not changed.
- * - Existing API routes are retained.
- * - Do not commit API tokens or passwords to GitHub.
+ * IMPROVEMENTS:
+ * - Short, polite and complete AI replies
+ * - Detect OpenRouter token-limit truncation
+ * - Prevent silently sending messages cut off at 2000 characters
+ * - Preserve existing product IDs, prices and media URLs
+ * - Preserve existing API routes and services
+ *
+ * SECURITY:
+ * - Configure secrets through Render environment variables.
  * =============================================================================
  */
 
@@ -23,11 +27,13 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+
 app.use(express.json({ limit: '50mb' }));
 
 // =============================================================================
 // 1. CORS
 // =============================================================================
+
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader(
@@ -39,13 +45,17 @@ app.use((req, res, next) => {
     'Content-Type, Authorization, x-admin-secret'
   );
 
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
   next();
 });
 
 // =============================================================================
 // 2. CONFIGURATION
 // =============================================================================
+
 const PORT = process.env.PORT || 10000;
 
 const PAGE_ACCESS_TOKEN =
@@ -67,7 +77,8 @@ const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 const CATALOG_FILE = process.env.CATALOG_FILE || 'data/catalog.json';
 
 const ADMIN_SECRET =
-  process.env.ADMIN_SECRET || 'impotech_secret_token_123';
+  process.env.ADMIN_SECRET ||
+  'impotech_secret_token_123';
 
 const OPENROUTER_URL =
   'https://openrouter.ai/api/v1/chat/completions';
@@ -77,8 +88,13 @@ const VOICE_MODEL = 'google/gemini-3.1-flash-lite';
 
 const MAX_PRODUCTS_TO_AI = 2;
 const MAX_FAQS_TO_AI = 2;
-const MAX_OUTPUT_TOKENS = 150;
+
+// More output capacity reduces the chance of incomplete responses.
+// The system prompt still instructs the model to answer briefly.
+const MAX_OUTPUT_TOKENS = 450;
+
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_MESSENGER_TEXT_LENGTH = 2000;
 
 const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
 const DATA_FILE = path.join(__dirname, 'storage_data.json');
@@ -86,6 +102,7 @@ const DATA_FILE = path.join(__dirname, 'storage_data.json');
 // =============================================================================
 // 3. MEMORY AND LOCAL STORAGE
 // =============================================================================
+
 let products = [];
 let faqs = [];
 
@@ -112,9 +129,10 @@ function loadStorage() {
   try {
     if (!fs.existsSync(DATA_FILE)) return;
 
-    const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const saved = JSON.parse(
+      fs.readFileSync(DATA_FILE, 'utf8')
+    );
 
-    // Preserve compatibility with existing storage_data.json.
     db = {
       isGlobalPaused: false,
       takeovers: {},
@@ -123,6 +141,23 @@ function loadStorage() {
       orders: [],
       ...saved
     };
+
+    // Protect against older storage files missing these properties.
+    if (!db.takeovers || typeof db.takeovers !== 'object') {
+      db.takeovers = {};
+    }
+
+    if (!db.customers || typeof db.customers !== 'object') {
+      db.customers = {};
+    }
+
+    if (!Array.isArray(db.messages)) {
+      db.messages = [];
+    }
+
+    if (!Array.isArray(db.orders)) {
+      db.orders = [];
+    }
   } catch (err) {
     console.warn('[STORAGE] Load warning:', err.message);
   }
@@ -130,7 +165,15 @@ function loadStorage() {
 
 function saveStorage() {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf8');
+    const tempPath = DATA_FILE + '.tmp';
+
+    fs.writeFileSync(
+      tempPath,
+      JSON.stringify(db, null, 2),
+      'utf8'
+    );
+
+    fs.renameSync(tempPath, DATA_FILE);
   } catch (err) {
     console.error('[STORAGE] Save error:', err.message);
   }
@@ -138,7 +181,9 @@ function saveStorage() {
 
 function applyCatalog(data, source = 'local') {
   if (!data || !Array.isArray(data.products)) {
-    throw new Error('Invalid catalog: products must be an array');
+    throw new Error(
+      'Invalid catalog: products must be an array'
+    );
   }
 
   products = data.products;
@@ -169,22 +214,38 @@ function loadLocalCatalog() {
     );
 
     applyCatalog(data, 'local');
+
     return data;
   } catch (err) {
-    console.warn('[CATALOG] Local load warning:', err.message);
-    return { products, faqs };
+    console.warn(
+      '[CATALOG] Local load warning:',
+      err.message
+    );
+
+    return {
+      products,
+      faqs,
+      version: catalogMeta.version,
+      updatedAt: catalogMeta.updatedAt
+    };
   }
 }
 
 function saveLocalCatalog(data, source = 'local') {
-  // Validate before replacing the current in-memory catalog.
   if (!data || !Array.isArray(data.products)) {
-    throw new Error('Invalid catalog: products must be an array');
+    throw new Error(
+      'Invalid catalog: products must be an array'
+    );
   }
 
   const tempPath = LOCAL_CATALOG_PATH + '.tmp';
 
-  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf8');
+  fs.writeFileSync(
+    tempPath,
+    JSON.stringify(data, null, 2),
+    'utf8'
+  );
+
   fs.renameSync(tempPath, LOCAL_CATALOG_PATH);
 
   applyCatalog(data, source);
@@ -196,6 +257,7 @@ loadLocalCatalog();
 // =============================================================================
 // 4. TEXT NORMALIZATION AND PRODUCT SEARCH
 // =============================================================================
+
 function normalizeText(value = '') {
   return String(value)
     .toLowerCase()
@@ -221,17 +283,25 @@ function scoreRecord(query, record, fields) {
 
   for (const field of fields) {
     const raw = record?.[field];
+
     const value = normalizeText(
-      Array.isArray(raw) ? raw.join(' ') : raw || ''
+      Array.isArray(raw)
+        ? raw.join(' ')
+        : raw || ''
     );
 
     if (!value) continue;
 
-    if (q.length >= 4 && value.includes(q)) score += 20;
+    if (q.length >= 4 && value.includes(q)) {
+      score += 20;
+    }
 
     for (const token of queryTokens) {
-      if (value === token) score += 12;
-      else if (value.includes(token)) score += 4;
+      if (value === token) {
+        score += 12;
+      } else if (value.includes(token)) {
+        score += 4;
+      }
     }
   }
 
@@ -298,13 +368,17 @@ function appendHistory(senderId, role, text) {
     timestamp: Date.now()
   });
 
-  while (history.length > 6) history.shift();
+  while (history.length > 6) {
+    history.shift();
+  }
+
   customerHistory.set(id, history);
 }
 
 // =============================================================================
 // 5. MEDIA REQUEST DETECTION
 // =============================================================================
+
 function getMediaType(text = '') {
   const value = normalizeText(text);
 
@@ -343,10 +417,15 @@ function isFacebookLink(url) {
 function getProductMediaUrls(product, mediaType) {
   const media = product?.media;
 
-  if (!media || !Array.isArray(media[mediaType])) return [];
+  if (!media || !Array.isArray(media[mediaType])) {
+    return [];
+  }
 
-  return media[mediaType]
-    .filter(url => typeof url === 'string' && isFacebookLink(url));
+  return media[mediaType].filter(
+    url =>
+      typeof url === 'string' &&
+      isFacebookLink(url)
+  );
 }
 
 function getProductNameText(product) {
@@ -359,18 +438,9 @@ function getProductNameText(product) {
   ].flat().join(' '));
 }
 
-/**
- * Select a product for a media request.
- *
- * Use the current message plus recent customer messages so that:
- * "হেডলাইট দেখাও" followed by "ছবি দাও"
- * can refer to the same product.
- *
- * If there is no confident match, ask the customer to clarify instead of
- * sending media belonging to an unrelated product.
- */
 function findProductForMedia(query, senderId) {
   const history = getHistory(senderId);
+
   const previousCustomerText = history
     .filter(item => item.role === 'user')
     .slice(-4)
@@ -378,22 +448,17 @@ function findProductForMedia(query, senderId) {
     .join(' ');
 
   const currentText = normalizeText(query);
+
   const combinedQuery = normalizeText(
     `${previousCustomerText} ${currentText}`
   );
 
-  // Prefer products matched by the current request itself.
   const ranked = products
-    .map(product => {
-      const currentScore = productScore(currentText, product);
-      const combinedScore = productScore(combinedQuery, product);
-
-      return {
-        product,
-        currentScore,
-        combinedScore
-      };
-    })
+    .map(product => ({
+      product,
+      currentScore: productScore(currentText, product),
+      combinedScore: productScore(combinedQuery, product)
+    }))
     .sort((a, b) => {
       if (b.currentScore !== a.currentScore) {
         return b.currentScore - a.currentScore;
@@ -407,17 +472,17 @@ function findProductForMedia(query, senderId) {
   const first = ranked[0];
   const second = ranked[1];
 
-  // A generic "ছবি দাও" request should not select an arbitrary product.
-  if (first.currentScore === 0 && first.combinedScore === 0) {
+  if (
+    first.currentScore === 0 &&
+    first.combinedScore === 0
+  ) {
     return null;
   }
 
-  // If the current query has a direct product match, use it.
   if (first.currentScore > 0) {
     return first.product;
   }
 
-  // Otherwise only use conversation history when there is a clear winner.
   if (
     first.combinedScore > 0 &&
     (
@@ -433,23 +498,29 @@ function findProductForMedia(query, senderId) {
 
 function getProductMediaReply(query, senderId) {
   const mediaType = getMediaType(query);
+
   if (!mediaType) return null;
 
   const product = findProductForMedia(query, senderId);
 
   if (!product) {
-    return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান, দয়া করে পণ্যটির নামটি বলবেন?';
+    return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যটির নাম বলুন।';
   }
 
   const urls = getProductMediaUrls(product, mediaType);
-  const label = mediaType === 'images' ? 'ছবির' : 'ভিডিওর';
+
+  const label =
+    mediaType === 'images' ? 'ছবির' : 'ভিডিওর';
 
   if (!urls.length) {
     console.log(
       `[MEDIA] No ${mediaType} URL for product ${product.id}`
     );
 
-    return `দুঃখিত, ${product.name} পণ্যের ${label} লিংক বর্তমানে ক্যাটালগে নেই। আমাদের প্রতিনিধি আপনাকে সাহায্য করবেন।`;
+    return (
+      `দুঃখিত, ${product.name} পণ্যের ${label} লিংক ` +
+      'বর্তমানে ক্যাটালগে নেই। আমাদের প্রতিনিধি আপনাকে সাহায্য করবেন।'
+    );
   }
 
   console.log(
@@ -461,15 +532,16 @@ function getProductMediaReply(query, senderId) {
     .join('\n');
 
   return (
-    `অবশ্যই! ${product.name} পণ্যের ${label} লিংক নিচে দেওয়া হলো:\n\n` +
+    `অবশ্যই! ${product.name} পণ্যের ${label} লিংক:\n\n` +
     `${links}\n\n` +
-    'এগুলো আমাদের ক্যাটালগে সংরক্ষিত Facebook লিংক। লিংকে চাপ দিয়ে মূল পোস্ট বা ভিডিও দেখতে পারবেন।'
+    'লিংকে চাপ দিয়ে দেখতে পারবেন।'
   );
 }
 
 // =============================================================================
 // 6. HUMAN TAKEOVER
 // =============================================================================
+
 function getTakeoverState(customerId) {
   if (!customerId) return db.isGlobalPaused;
 
@@ -494,7 +566,11 @@ function getTakeoverState(customerId) {
   return false;
 }
 
-async function setTakeoverState(customerId, enabled, reasonStr) {
+async function setTakeoverState(
+  customerId,
+  enabled,
+  reasonStr
+) {
   if (!customerId) return false;
 
   const id = String(customerId).trim();
@@ -502,7 +578,11 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
 
   const reason =
     reasonStr ||
-    (isEnabled ? 'Admin takeover' : 'Admin resumed AI');
+    (
+      isEnabled
+        ? 'Admin takeover'
+        : 'Admin resumed AI'
+    );
 
   db.takeovers[id] = {
     isPaused: isEnabled,
@@ -535,20 +615,40 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
 // =============================================================================
 // 7. MESSENGER SEND API
 // =============================================================================
+
 async function sendFacebookMessage(recipientId, text) {
   if (!PAGE_ACCESS_TOKEN) {
-    console.warn('[Messenger] PAGE_ACCESS_TOKEN is missing');
+    console.warn(
+      '[Messenger] PAGE_ACCESS_TOKEN is missing'
+    );
+
+    return false;
+  }
+
+  const finalText = String(text || '').trim();
+
+  if (!finalText) {
+    console.warn('[Messenger] Empty message blocked');
+    return false;
+  }
+
+  // Never silently truncate a message and send an incomplete answer.
+  if (finalText.length > MAX_MESSENGER_TEXT_LENGTH) {
+    console.error(
+      `[Messenger] Message too long: ${finalText.length} characters`
+    );
+
     return false;
   }
 
   try {
     const url =
-      `https://graph.facebook.com/v18.0/me/messages` +
+      'https://graph.facebook.com/v18.0/me/messages' +
       `?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
 
     const payload = {
       recipient: { id: recipientId },
-      message: { text: String(text).slice(0, 2000) },
+      message: { text: finalText },
       messaging_type: 'RESPONSE'
     };
 
@@ -557,20 +657,22 @@ async function sendFacebookMessage(recipientId, text) {
     });
 
     console.log(
-      `[Messenger] Text sent to ${recipientId}; message_id=${response.data?.message_id || 'accepted'}`
+      `[Messenger] Text sent to ${recipientId}; ` +
+      `message_id=${response.data?.message_id || 'accepted'}`
     );
 
-    appendHistory(recipientId, 'assistant', text);
+    appendHistory(recipientId, 'assistant', finalText);
 
     db.messages.push({
       id: 'msg_bot_' + Date.now(),
       senderId: recipientId,
       sender: 'bot',
-      text,
+      text: finalText,
       timestamp: new Date().toISOString()
     });
 
     saveStorage();
+
     return true;
   } catch (err) {
     console.error(
@@ -583,97 +685,98 @@ async function sendFacebookMessage(recipientId, text) {
 }
 
 // =============================================================================
-// 8. GITHUB CATALOG SYNC (FULL AUTO-PURGE / NO STALE DATA)
+// 8. GITHUB CATALOG SYNC
 // =============================================================================
-/**
- * এই সেকশনটি অ্যাডমিন অ্যাপ থেকে পাঠানো ক্যাটালগ GitHub-এ সিঙ্ক করে এবং
- * পুরনো প্রোডাক্ট সম্পূর্ণভাবে মুছে ফেলে যাতে Render API-তে কোনো স্টেল
- * (পুরনো) ডেটা না থাকে।
- *
- * গুরুত্বপূর্ণ:
- * - শুধুমাত্র products + faqs রিপ্লেস হয়। customers/messages/orders অক্ষত থাকে।
- * - লোকাল catalog.json সবসময় সর্বশেষ সোর্স অফ ট্রুথ হিসেবে রিপ্লেস হয়।
- * - GitHub-এ প্রোডাক্ট ডিলিট করলে লোকাল ক্যাটালগ থেকেও সাথে সাথে বাদ পড়ে।
- * - পুরনো ডেটা রয়ে যাওয়ার কোনো সুযোগ নেই কারণ saveLocalCatalog() পুরো
- *   ফাইলটি ওভাররাইট করে (temp file → rename, atomic)।
- */
 
-/**
- * একটি ক্যাটালগ অবজেক্টকে ভ্যালিডেট করে।
- * ভুল ডেটা দিয়ে চলমান ক্যাটালগ নষ্ট হতে দেবে না।
- */
 function validateCatalogShape(data) {
   if (!data || typeof data !== 'object') {
     throw new Error('Catalog must be a JSON object');
   }
 
   if (!Array.isArray(data.products)) {
-    throw new Error('Catalog must contain a "products" array');
+    throw new Error(
+      'Catalog must contain a "products" array'
+    );
   }
 
   const seenIds = new Set();
 
   for (const product of data.products) {
     if (!product || typeof product !== 'object') {
-      throw new Error('Each product must be an object');
+      throw new Error(
+        'Each product must be an object'
+      );
     }
 
     const id = String(product.id ?? '').trim();
 
     if (!id) {
-      throw new Error('Every product must have a non-empty "id"');
+      throw new Error(
+        'Every product must have a non-empty "id"'
+      );
     }
 
     if (seenIds.has(id)) {
-      throw new Error(`Duplicate product id detected: ${id}`);
+      throw new Error(
+        `Duplicate product id detected: ${id}`
+      );
     }
 
     seenIds.add(id);
   }
 
-  if (data.faqs !== undefined && !Array.isArray(data.faqs)) {
-    throw new Error('Catalog "faqs" must be an array when provided');
+  if (
+    data.faqs !== undefined &&
+    !Array.isArray(data.faqs)
+  ) {
+    throw new Error(
+      'Catalog "faqs" must be an array when provided'
+    );
   }
 
   return true;
 }
 
-/**
- * পুরনো ক্যাটালগ ফাইল ও মেমোরি থেকে সম্পূর্ণভাবে মুছে নতুন ক্যাটালগ বসায়।
- * এটিই একমাত্র পথ যার মাধ্যমে products/faqs আপডেট হয়।
- */
-function replaceCatalogAtomically(catalogData, source = 'admin') {
+function replaceCatalogAtomically(
+  catalogData,
+  source = 'admin'
+) {
   validateCatalogShape(catalogData);
 
   const normalized = {
     version: catalogData.version ?? Date.now(),
-    updatedAt: catalogData.updatedAt ?? new Date().toISOString(),
-    products: catalogData.products, // ← নতুন পুরো লিস্ট (পুরনো কিছু থাকবে না)
-    faqs: Array.isArray(catalogData.faqs) ? catalogData.faqs : []
+    updatedAt:
+      catalogData.updatedAt ??
+      new Date().toISOString(),
+    products: catalogData.products,
+    faqs: Array.isArray(catalogData.faqs)
+      ? catalogData.faqs
+      : []
   };
 
-  // saveLocalCatalog() আগেই validate করে, temp file লিখে atomic rename করে
   saveLocalCatalog(normalized, source);
 
-  // মেমোরি ও লোকাল ফাইল থেকে নিশ্চিতভাবে পুরনো রেফারেন্স বাদ
   products = normalized.products;
   faqs = normalized.faqs;
 
   console.log(
-    `[CATALOG] Replaced from ${source}: ${products.length} products, ${faqs.length} FAQs, version=${normalized.version}`
+    `[CATALOG] Replaced from ${source}: ` +
+    `${products.length} products, ${faqs.length} FAQs, ` +
+    `version=${normalized.version}`
   );
 
   return normalized;
 }
 
-/**
- * GitHub থেকে সর্বশেষ ক্যাটালগ টেনে আনে এবং লোকাল + মেমোরি সম্পূর্ণ রিপ্লেস করে।
- * পুরনো ডেটা অটোমেটিক্যালি মুছে যায়।
- */
 async function pullCatalogFromGitHub() {
   if (!GITHUB_TOKEN) {
-    catalogMeta.lastSyncError = 'GITHUB_TOKEN is not configured';
-    console.warn('[GITHUB] Token missing; retaining local catalog');
+    catalogMeta.lastSyncError =
+      'GITHUB_TOKEN is not configured';
+
+    console.warn(
+      '[GITHUB] Token missing; retaining local catalog'
+    );
+
     return false;
   }
 
@@ -692,21 +795,25 @@ async function pullCatalogFromGitHub() {
     });
 
     if (!response.data?.content) {
-      throw new Error('GitHub response does not contain file content');
+      throw new Error(
+        'GitHub response does not contain file content'
+      );
     }
 
     const parsed = JSON.parse(
-      Buffer.from(response.data.content, 'base64').toString('utf8')
+      Buffer.from(
+        response.data.content,
+        'base64'
+      ).toString('utf8')
     );
 
-    // ভুল ডেটা দিয়ে চলমান ক্যাটালগ নষ্ট করবে না
     validateCatalogShape(parsed);
 
-    // পুরনো প্রোডাক্ট মুছে নতুন ক্যাটালগ বসাও (atomic + memory replace)
     replaceCatalogAtomically(parsed, 'github');
 
     console.log(
-      `[GITHUB] Pulled & purged old catalog. Now: ${products.length} products, ${faqs.length} FAQs, version=${catalogMeta.version}`
+      `[GITHUB] Pulled catalog: ${products.length} products, ` +
+      `${faqs.length} FAQs, version=${catalogMeta.version}`
     );
 
     return true;
@@ -723,12 +830,6 @@ async function pullCatalogFromGitHub() {
   }
 }
 
-/**
- * অ্যাডমিন অ্যাপ থেকে পাঠানো ক্যাটালগ GitHub-এ পুশ করে এবং লোকাল +
- * মেমোরি সম্পূর্ণ রিপ্লেস করে। ফলে Render API-তে পুরনো ডেটা থাকবে না।
- *
- * রিটার্ন: { synced, commit?, error?, totalProducts, totalFaqs }
- */
 async function pushCatalogToGitHub(
   catalogData,
   customToken,
@@ -748,14 +849,17 @@ async function pushCatalogToGitHub(
     };
   }
 
-  // পুশ করার আগেই ভ্যালিডেট
   try {
     validateCatalogShape(catalogData);
   } catch (err) {
-    return { synced: false, error: err.message };
+    return {
+      synced: false,
+      error: err.message
+    };
   }
 
-  const url = `https://api.github.com/repos/${repo}/contents/${filePath}`;
+  const url =
+    `https://api.github.com/repos/${repo}/contents/${filePath}`;
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -763,13 +867,15 @@ async function pushCatalogToGitHub(
     'User-Agent': 'Impotech-Admin-Server'
   };
 
-  // আগের sha বের করা (থাকলে)
   let sha = null;
 
   try {
     const getResponse = await axios.get(
       `${url}?ref=${encodeURIComponent(branch)}`,
-      { headers, timeout: 10000 }
+      {
+        headers,
+        timeout: 10000
+      }
     );
 
     sha = getResponse.data?.sha || null;
@@ -777,18 +883,23 @@ async function pushCatalogToGitHub(
     if (err.response?.status !== 404) {
       return {
         synced: false,
-        error: err.response?.data?.message || err.message
+        error:
+          err.response?.data?.message || err.message
       };
     }
   }
 
-  // পুরনো ফাইল পুরোপুরি ওভাররাইট হবে (replace, merge নয়)
   const fileContentBase64 = Buffer
-    .from(JSON.stringify(catalogData, null, 2), 'utf8')
+    .from(
+      JSON.stringify(catalogData, null, 2),
+      'utf8'
+    )
     .toString('base64');
 
   const payload = {
-    message: `Replace catalog (purge old) from Impotech Admin v${catalogData.version || Date.now()}`,
+    message:
+      `Replace catalog from Impotech Admin v` +
+      `${catalogData.version || Date.now()}`,
     content: fileContentBase64,
     branch
   };
@@ -796,60 +907,81 @@ async function pushCatalogToGitHub(
   if (sha) payload.sha = sha;
 
   try {
-    const putResponse = await axios.put(url, payload, {
-      headers,
-      timeout: 20000
-    });
+    const putResponse = await axios.put(
+      url,
+      payload,
+      {
+        headers,
+        timeout: 20000
+      }
+    );
 
-    // সফল পুশ → লোকাল + মেমোরি সম্পূর্ণ রিপ্লেস (পুরনো ডেটা বাদ)
-    replaceCatalogAtomically(catalogData, 'github');
+    replaceCatalogAtomically(
+      catalogData,
+      'github'
+    );
 
     console.log(
-      `[GITHUB] Pushed & purged old catalog to ${repo}@${branch}. Now: ${products.length} products, ${faqs.length} FAQs`
+      `[GITHUB] Catalog uploaded to ${repo}@${branch}. ` +
+      `${products.length} products, ${faqs.length} FAQs`
     );
 
     return {
       synced: true,
-      commit: putResponse.data?.commit?.sha || 'synced',
+      commit:
+        putResponse.data?.commit?.sha || 'synced',
       totalProducts: products.length,
       totalFaqs: faqs.length
     };
   } catch (err) {
-    const error = err.response?.data?.message || err.message;
+    const error =
+      err.response?.data?.message || err.message;
 
     console.error('[GITHUB] Upload failed:', error);
 
-    return { synced: false, error };
+    return {
+      synced: false,
+      error
+    };
   }
 }
 
 // =============================================================================
 // 9. AI SYSTEM PROMPT
 // =============================================================================
-function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
+
+function buildSystemPrompt(
+  relevantProducts,
+  relevantFaqs,
+  history
+) {
   const productContext = relevantProducts.length
     ? relevantProducts.map((p, i) => {
-        const imageUrls = getProductMediaUrls(p, 'images');
-        const videoUrls = getProductMediaUrls(p, 'videos');
+        const imageUrls =
+          getProductMediaUrls(p, 'images');
+
+        const videoUrls =
+          getProductMediaUrls(p, 'videos');
 
         return [
           `[পণ্য ${i + 1}]`,
           `ID: ${p.id || 'N/A'}`,
           `নাম: ${p.name || 'N/A'}`,
-          `মূল্য: ৳${p.price ?? 'N/A'}`,
+          `মূল্য: ${p.price ?? 'N/A'} টাকা`,
           `স্টক: ${p.stockStatus || (p.inStock ? 'IN_STOCK' : 'N/A')}`,
           `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
           `ছবির লিংক: ${imageUrls.join(' | ') || 'ক্যাটালগে নেই'}`,
           `ভিডিওর লিংক: ${videoUrls.join(' | ') || 'ক্যাটালগে নেই'}`
         ].join('\n');
       }).join('\n\n')
-    : 'ক্যাটালগে কোনো পণ্য মেলেনি।';
+    : 'ক্যাটালগে কোনো প্রাসঙ্গিক পণ্য মেলেনি।';
 
   const faqContext = relevantFaqs.length
     ? relevantFaqs.map((f, i) =>
-        `[FAQ ${i + 1}] প্রশ্ন: ${f.question || ''}\nউত্তর: ${f.answer || ''}`
+        `[FAQ ${i + 1}] প্রশ্ন: ${f.question || ''}\n` +
+        `উত্তর: ${f.answer || ''}`
       ).join('\n\n')
-    : 'কোনো নির্দিষ্ট FAQ মেলেনি।';
+    : 'কোনো প্রাসঙ্গিক FAQ মেলেনি।';
 
   const historyContext = history.length
     ? history.map(item =>
@@ -859,20 +991,37 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
 
   return `
 আপনি ImpoTech BD (ইম্পোটেক বিডি) ফেসবুক পেজের অফিসিয়াল AI সাপোর্ট অ্যাসিস্ট্যান্ট।
+
+ব্যবসার তথ্য:
 ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
 হেল্পলাইন: 01884332067।
 ডেলিভারি চার্জ: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।
 পেমেন্ট: Cash on Delivery; ক্যাটালগ অনুযায়ী অগ্রিম প্রয়োজন নেই।
 
-কঠোর নিয়ম:
-১. ক্যাটালগ ও FAQ-এর তথ্যের ওপর ভিত্তি করে সংক্ষিপ্ত ও বিনম্র বাংলায় উত্তর দিন।
-২. দাম, স্টক, ওয়ারেন্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
-৩. গ্রাহক ছবি বা ভিডিও চাইলে শুধু অনুমান করে URL তৈরি করবেন না।
-৪. ক্যাটালগে থাকা মিডিয়া লিংকই ব্যবহার করতে হবে।
-৫. মিডিয়া লিংক না থাকলে তা স্পষ্ট করে বলুন।
-৬. এক পণ্যের ছবি বা ভিডিও অন্য পণ্যের জন্য দেবেন না।
-৭. গ্রাহকের ছবি বা ভয়েস মেসেজ এলে সেটি বুঝে উত্তর দিন।
-৮. তথ্য না থাকলে প্রতিনিধির সাহায্য নিতে বলুন।
+উত্তর দেওয়ার বাধ্যতামূলক নিয়ম:
+
+১. সহজ, মার্জিত ও স্বাভাবিক বাংলায় উত্তর দিন।
+২. সাধারণ প্রশ্নের উত্তর ১–৩টি ছোট বাক্যে দিন।
+৩. অপ্রয়োজনীয় ভূমিকা, পুনরাবৃত্তি ও দীর্ঘ ব্যাখ্যা এড়িয়ে চলুন।
+৪. গ্রাহকের প্রশ্নের সরাসরি উত্তর প্রথমে দিন।
+৫. একাধিক প্রশ্ন থাকলে প্রতিটি প্রশ্নের উত্তর দিন।
+৬. সংক্ষিপ্ত করতে গিয়ে প্রয়োজনীয় তথ্য বাদ দেবেন না।
+৭. গ্রাহক সম্পূর্ণ বিবরণ চাইলে ক্যাটালগে থাকা সব গুরুত্বপূর্ণ তথ্য সংক্ষেপে দিন।
+৮. দাম জানতে চাইলে ক্যাটালগের সঠিক দাম বলুন।
+৯. বৈশিষ্ট্য, স্টক, ওয়ারেন্টি বা ডেলিভারি সম্পর্কে অনুমান করবেন না।
+১০. ক্যাটালগে তথ্য না থাকলে সেটি স্পষ্টভাবে জানান।
+১১. ক্যাটালগের বাইরের কোনো পণ্যের তথ্য বা নতুন দাবি তৈরি করবেন না।
+১২. পণ্যের ID, দাম, স্টক ও মিডিয়া URL পরিবর্তন করবেন না।
+১৩. ছবি বা ভিডিও চাইলে কেবল সংশ্লিষ্ট পণ্যের ক্যাটালগের লিংক ব্যবহার করুন।
+১৪. এক পণ্যের মিডিয়া অন্য পণ্যের জন্য ব্যবহার করবেন না।
+১৫. পূর্ববর্তী কথোপকথন বিবেচনা করুন এবং একই তথ্য বারবার বলবেন না।
+১৬. গ্রাহককে অপ্রয়োজনীয় প্রশ্ন করবেন না।
+১৭. পাঠানোর আগে যাচাই করুন যে সব প্রশ্নের উত্তর আছে এবং বাক্য সম্পূর্ণ।
+১৮. তথ্য অনুপস্থিত থাকলে কল্পনা করে উত্তর পূরণ করবেন না।
+১৯. অযথা বড় তালিকা দেবেন না; প্রয়োজন হলে ছোট বুলেট ব্যবহার করুন।
+২০. উত্তর শেষ করার জন্য প্রয়োজনীয় তথ্য ও বাক্য সম্পূর্ণ রাখুন।
+২১. কোনো তথ্য নিশ্চিত না হলে সেটি নিশ্চিত বলে উপস্থাপন করবেন না।
+২২. উত্তর অসম্পূর্ণ হওয়ার আশঙ্কা থাকলে অপ্রয়োজনীয় বিবরণ বাদ দিন, কিন্তু মূল উত্তর বাদ দেবেন না।
 
 প্রাসঙ্গিক পণ্য:
 ${productContext}
@@ -888,9 +1037,15 @@ ${historyContext}
 // =============================================================================
 // 10. OPENROUTER
 // =============================================================================
-async function callOpenRouter(messages, model = TEXT_MODEL) {
+
+async function callOpenRouter(
+  messages,
+  model = TEXT_MODEL
+) {
   if (!OPENROUTER_API_KEY) {
-    throw new Error('OPENROUTER_API_KEY is not configured');
+    throw new Error(
+      'OPENROUTER_API_KEY is not configured'
+    );
   }
 
   console.log(`[OPENROUTER] Request -> ${model}`);
@@ -901,13 +1056,14 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
       model,
       messages,
       max_tokens: MAX_OUTPUT_TOKENS,
-      temperature: 0.3
+      temperature: 0.2
     },
     {
       headers: {
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://github.com/impotechaibot/Impotech-bot',
+        'HTTP-Referer':
+          'https://github.com/impotechaibot/Impotech-bot',
         'X-Title': 'ImpoTech Messenger AI Bot'
       },
       timeout: 30000,
@@ -916,23 +1072,67 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
     }
   );
 
-  let reply = response.data?.choices?.[0]?.message?.content;
+  const choice = response.data?.choices?.[0];
 
-  if (Array.isArray(reply)) {
-    reply = reply.map(item => item?.text || '').join('');
+  if (!choice) {
+    throw new Error(
+      'OpenRouter returned no response choice'
+    );
   }
 
-  return String(reply || '').trim();
+  let reply = choice.message?.content;
+
+  if (Array.isArray(reply)) {
+    reply = reply
+      .map(item => item?.text || '')
+      .join('');
+  }
+
+  reply = String(reply || '').trim();
+
+  if (!reply) {
+    throw new Error(
+      'OpenRouter returned an empty response'
+    );
+  }
+
+  // Do not treat token-truncated output as a complete answer.
+  if (choice.finish_reason === 'length') {
+    console.warn(
+      '[OPENROUTER] Response truncated by token limit'
+    );
+
+    throw new Error(
+      'AI response was truncated; incomplete reply blocked'
+    );
+  }
+
+  console.log(
+    `[OPENROUTER] Response completed; ` +
+    `finish_reason=${choice.finish_reason || 'unknown'}`
+  );
+
+  return reply;
 }
 
 // =============================================================================
 // 11. TEXT, VISION AND VOICE PROCESSOR
 // =============================================================================
-async function generateAIResponse(customerText, attachments = [], senderId) {
-  const query = customerText || 'পণ্য সম্পর্কে তথ্য দিন';
 
-  const relevantProducts = findRelevantProducts(query);
-  const relevantFaqs = findRelevantFaqs(query);
+async function generateAIResponse(
+  customerText,
+  attachments = [],
+  senderId
+) {
+  const query =
+    customerText || 'পণ্য সম্পর্কে তথ্য দিন';
+
+  const relevantProducts =
+    findRelevantProducts(query);
+
+  const relevantFaqs =
+    findRelevantFaqs(query);
+
   const history = getHistory(senderId);
 
   const systemPrompt = buildSystemPrompt(
@@ -941,9 +1141,14 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
     history
   );
 
+  // ---------------------------------------------------------------------------
   // Voice messages
+  // ---------------------------------------------------------------------------
+
   const audioAttachment = attachments.find(
-    item => item.type === 'audio' && item.payload?.url
+    item =>
+      item.type === 'audio' &&
+      item.payload?.url
   );
 
   if (audioAttachment) {
@@ -964,17 +1169,27 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
         .toString('base64');
 
       const messages = [
-        { role: 'system', content: systemPrompt },
+        {
+          role: 'system',
+          content: systemPrompt
+        },
+
         ...history.map(item => ({
-          role: item.role === 'assistant' ? 'assistant' : 'user',
+          role:
+            item.role === 'assistant'
+              ? 'assistant'
+              : 'user',
           content: item.text
         })),
+
         {
           role: 'user',
           content: [
             {
               type: 'text',
-              text: 'গ্রাহকের ভয়েস শুনে বাংলায় উত্তর দিন।'
+              text:
+                'গ্রাহকের ভয়েসের বক্তব্য বুঝে ' +
+                'বাংলায় সংক্ষিপ্ত ও সম্পূর্ণ উত্তর দিন।'
             },
             {
               type: 'input_audio',
@@ -987,15 +1202,26 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
         }
       ];
 
-      return await callOpenRouter(messages, VOICE_MODEL);
+      return await callOpenRouter(
+        messages,
+        VOICE_MODEL
+      );
     } catch (err) {
-      console.warn('[VOICE] Processing failed:', err.message);
+      console.warn(
+        '[VOICE] Processing failed:',
+        err.message
+      );
     }
   }
 
+  // ---------------------------------------------------------------------------
   // Image messages sent by customers
+  // ---------------------------------------------------------------------------
+
   const imageAttachment = attachments.find(
-    item => item.type === 'image' && item.payload?.url
+    item =>
+      item.type === 'image' &&
+      item.payload?.url
   );
 
   if (imageAttachment) {
@@ -1016,62 +1242,112 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
         .toString('base64');
 
       const contentType =
-        imageResponse.headers['content-type'] || 'image/jpeg';
+        imageResponse.headers['content-type'] ||
+        'image/jpeg';
 
       const dataUrl =
         `data:${contentType};base64,${imageBase64}`;
 
       const messages = [
-        { role: 'system', content: systemPrompt },
+        {
+          role: 'system',
+          content: systemPrompt
+        },
+
         ...history.map(item => ({
-          role: item.role === 'assistant' ? 'assistant' : 'user',
+          role:
+            item.role === 'assistant'
+              ? 'assistant'
+              : 'user',
           content: item.text
         })),
+
         {
           role: 'user',
           content: [
             {
               type: 'text',
               text: query
-                ? `${query}\nএই ছবিটি দেখে ক্যাটালগের সঙ্গে মিলিয়ে উত্তর দিন।`
-                : 'ছবিটি দেখে পণ্য শনাক্ত করে ক্যাটালগ অনুযায়ী উত্তর দিন।'
+                ? (
+                    `${query}\n` +
+                    'ছবিটি দেখে ক্যাটালগের সঙ্গে মিলিয়ে ' +
+                    'সংক্ষিপ্ত ও সম্পূর্ণ উত্তর দিন।'
+                  )
+                : (
+                    'ছবিটি দেখে পণ্য শনাক্ত করে ' +
+                    'ক্যাটালগ অনুযায়ী সংক্ষিপ্ত ও সম্পূর্ণ ' +
+                    'উত্তর দিন।'
+                  )
             },
             {
               type: 'image_url',
-              image_url: { url: dataUrl }
+              image_url: {
+                url: dataUrl
+              }
             }
           ]
         }
       ];
 
-      return await callOpenRouter(messages, TEXT_MODEL);
+      return await callOpenRouter(
+        messages,
+        TEXT_MODEL
+      );
     } catch (err) {
-      console.warn('[VISION] Processing failed:', err.message);
+      console.warn(
+        '[VISION] Processing failed:',
+        err.message
+      );
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Normal text
+  // ---------------------------------------------------------------------------
+
   const messages = [
-    { role: 'system', content: systemPrompt },
+    {
+      role: 'system',
+      content: systemPrompt
+    },
+
     ...history.map(item => ({
-      role: item.role === 'assistant' ? 'assistant' : 'user',
+      role:
+        item.role === 'assistant'
+          ? 'assistant'
+          : 'user',
       content: item.text
     })),
-    { role: 'user', content: query }
+
+    {
+      role: 'user',
+      content: query
+    }
   ];
 
-  return await callOpenRouter(messages, TEXT_MODEL);
+  return await callOpenRouter(
+    messages,
+    TEXT_MODEL
+  );
 }
 
 // =============================================================================
 // 12. FACEBOOK WEBHOOK
 // =============================================================================
+
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('[Webhook] Verification successful');
+  if (
+    mode === 'subscribe' &&
+    token === VERIFY_TOKEN
+  ) {
+    console.log(
+      '[Webhook] Verification successful'
+    );
+
     return res.status(200).send(challenge);
   }
 
@@ -1079,7 +1355,7 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  // Acknowledge Meta promptly; process the event afterward.
+  // Acknowledge Meta promptly.
   res.status(200).send('EVENT_RECEIVED');
 
   try {
@@ -1093,9 +1369,20 @@ app.post('/webhook', async (req, res) => {
         const message = event.message;
         const messageId = message?.mid;
 
-        if (!message || message.is_echo || !senderId) continue;
+        if (
+          !message ||
+          message.is_echo ||
+          !senderId
+        ) {
+          continue;
+        }
 
-        if (messageId && processedMessageIds.has(messageId)) continue;
+        if (
+          messageId &&
+          processedMessageIds.has(messageId)
+        ) {
+          continue;
+        }
 
         if (messageId) {
           processedMessageIds.add(messageId);
@@ -1107,15 +1394,23 @@ app.post('/webhook', async (req, res) => {
 
         const text = message.text || '';
         const attachments = message.attachments || [];
-        const isPaused = getTakeoverState(senderId);
 
-        appendHistory(senderId, 'user', text || '[Media File]');
+        const isPaused =
+          getTakeoverState(senderId);
+
+        appendHistory(
+          senderId,
+          'user',
+          text || '[Media File]'
+        );
 
         db.messages.push({
           id: 'msg_' + Date.now(),
           senderId,
           sender: 'customer',
-          text: text || `[Media: ${attachments[0]?.type || 'file'}]`,
+          text:
+            text ||
+            `[Media: ${attachments[0]?.type || 'file'}]`,
           timestamp: new Date().toISOString()
         });
 
@@ -1144,8 +1439,10 @@ app.post('/webhook', async (req, res) => {
 
         if (isPaused) {
           console.log(
-            `[Takeover] ${senderId} is paused; bot will not respond`
+            `[Takeover] ${senderId} is paused; ` +
+            'bot will not respond'
           );
+
           continue;
         }
 
@@ -1154,12 +1451,17 @@ app.post('/webhook', async (req, res) => {
         );
 
         try {
-          // MEDIA REQUESTS ARE HANDLED BEFORE AI TEXT GENERATION.
+          // Product-specific media requests are handled first.
           if (isMediaRequest(text)) {
-            const mediaReply = getProductMediaReply(text, senderId);
+            const mediaReply =
+              getProductMediaReply(text, senderId);
 
             if (mediaReply) {
-              await sendFacebookMessage(senderId, mediaReply);
+              await sendFacebookMessage(
+                senderId,
+                mediaReply
+              );
+
               continue;
             }
           }
@@ -1171,26 +1473,41 @@ app.post('/webhook', async (req, res) => {
           );
 
           if (aiReply) {
-            await sendFacebookMessage(senderId, aiReply);
+            await sendFacebookMessage(
+              senderId,
+              aiReply
+            );
+          } else {
+            throw new Error(
+              'AI returned an empty response'
+            );
           }
         } catch (err) {
-          console.error('[AI] Response error:', err.message);
+          console.error(
+            '[AI] Response error:',
+            err.message
+          );
 
+          // Short fallback; do not expose internal error details.
           await sendFacebookMessage(
             senderId,
-            'ধন্যবাদ আপনার মেসেজের জন্য! বিস্তারিত জানতে আমাদের কল করুন: 01884332067'
+            'দুঃখিত, এই মুহূর্তে সম্পূর্ণ উত্তর দিতে পারছি না। বিস্তারিত জানতে আমাদের কল করুন: 01884332067'
           );
         }
       }
     }
   } catch (err) {
-    console.error('[Webhook] Processing error:', err.message);
+    console.error(
+      '[Webhook] Processing error:',
+      err.message
+    );
   }
 });
 
 // =============================================================================
 // 13. CATALOG API
 // =============================================================================
+
 app.get('/api/catalog', (req, res) => {
   const catalog = loadLocalCatalog();
 
@@ -1207,17 +1524,29 @@ app.post('/api/catalog/sync', async (req, res) => {
   try {
     const catalogData = req.body;
 
-    saveLocalCatalog(catalogData, 'admin');
+    validateCatalogShape(catalogData);
 
-    let githubResult = { synced: false };
+    // Replace the local catalog with the submitted full catalog.
+    replaceCatalogAtomically(
+      catalogData,
+      'admin'
+    );
+
+    let githubResult = {
+      synced: false
+    };
 
     if (GITHUB_TOKEN) {
-      githubResult = await pushCatalogToGitHub(catalogData);
+      githubResult = await pushCatalogToGitHub(
+        catalogData
+      );
     }
 
     res.json({
       success: true,
-      message: `Catalog sync processed: ${products.length} products, ${faqs.length} FAQs`,
+      message:
+        `Catalog sync processed: ${products.length} products, ` +
+        `${faqs.length} FAQs`,
       totalProducts: products.length,
       totalFaqs: faqs.length,
       githubSynced: githubResult.synced,
@@ -1242,7 +1571,8 @@ app.post('/api/github/upload', async (req, res) => {
       githubFilePath
     } = req.body;
 
-    const targetCatalog = catalogPayload || loadLocalCatalog();
+    const targetCatalog =
+      catalogPayload || loadLocalCatalog();
 
     const result = await pushCatalogToGitHub(
       targetCatalog,
@@ -1255,13 +1585,18 @@ app.post('/api/github/upload', async (req, res) => {
     if (!result.synced) {
       return res.status(400).json({
         success: false,
-        message: `GitHub upload failed: ${result.error || result.message}`
+        message:
+          `GitHub upload failed: ` +
+          `${result.error || result.message}`
       });
     }
 
     res.json({
       success: true,
-      message: `Catalog uploaded to ${githubRepo || GITHUB_REPO}@${githubBranch || GITHUB_BRANCH}`,
+      message:
+        `Catalog uploaded to ` +
+        `${githubRepo || GITHUB_REPO}@` +
+        `${githubBranch || GITHUB_BRANCH}`,
       totalProducts: products.length,
       totalFaqs: faqs.length,
       commit: result.commit
@@ -1274,7 +1609,6 @@ app.post('/api/github/upload', async (req, res) => {
   }
 });
 
-// Pull the latest catalog on demand.
 app.post('/api/catalog/refresh', async (req, res) => {
   const synced = await pullCatalogFromGitHub();
 
@@ -1289,6 +1623,7 @@ app.post('/api/catalog/refresh', async (req, res) => {
 // =============================================================================
 // 14. BOT STATUS AND ADMIN CONTROL
 // =============================================================================
+
 app.get('/api/bot-status', (req, res) => {
   res.json({
     success: true,
@@ -1296,8 +1631,9 @@ app.get('/api/bot-status', (req, res) => {
     reason: db.isGlobalPaused
       ? 'Human takeover active'
       : 'AI bot active',
-    totalPausedCustomers: Object.values(db.takeovers)
-      .filter(item => item.isPaused).length
+    totalPausedCustomers: Object.values(
+      db.takeovers
+    ).filter(item => item.isPaused).length
   });
 });
 
@@ -1307,7 +1643,9 @@ app.post('/api/toggle-bot', (req, res) => {
   saveStorage();
 
   console.log(
-    `[Master Switch] ${db.isGlobalPaused ? 'PAUSED' : 'ACTIVE'}`
+    `[Master Switch] ${
+      db.isGlobalPaused ? 'PAUSED' : 'ACTIVE'
+    }`
   );
 
   res.json({
@@ -1316,79 +1654,110 @@ app.post('/api/toggle-bot', (req, res) => {
   });
 });
 
-app.post('/api/customers/:senderId/takeover', async (req, res) => {
-  const { senderId } = req.params;
+app.post(
+  '/api/customers/:senderId/takeover',
+  async (req, res) => {
+    const { senderId } = req.params;
 
-  const isPaused =
-    req.body.isPaused !== undefined
-      ? !!req.body.isPaused
-      : req.body.takeover !== undefined
-        ? !!req.body.takeover
-        : true;
+    const isPaused =
+      req.body.isPaused !== undefined
+        ? !!req.body.isPaused
+        : req.body.takeover !== undefined
+          ? !!req.body.takeover
+          : true;
 
-  await setTakeoverState(senderId, isPaused, req.body.reason);
+    await setTakeoverState(
+      senderId,
+      isPaused,
+      req.body.reason
+    );
 
-  res.json({
-    success: true,
-    senderId,
-    isPaused,
-    takeover: isPaused
-  });
-});
-
-app.get('/api/customers/:senderId/status', (req, res) => {
-  const { senderId } = req.params;
-  const isPaused = getTakeoverState(senderId);
-
-  res.json({
-    success: true,
-    senderId,
-    isPaused,
-    takeover: isPaused
-  });
-});
-
-app.get('/api/customers', (req, res) => {
-  const list = Object.values(db.customers).map(customer => ({
-    senderId: customer.id,
-    displayName:
-      customer.name || `Customer ${customer.id.slice(-4)}`,
-    phone: customer.phone || null,
-    lastMessageText: customer.lastMessageText || null,
-    lastMessageAt: customer.lastActive || null,
-    takeover: getTakeoverState(customer.id),
-    isPaused: getTakeoverState(customer.id)
-  }));
-
-  res.json({ success: true, data: list });
-});
-
-app.post('/api/customers/:senderId/send', async (req, res) => {
-  const { senderId } = req.params;
-  const { text } = req.body;
-
-  if (!text) {
-    return res.status(400).json({ error: 'Text required' });
-  }
-
-  const sent = await sendFacebookMessage(senderId, text);
-
-  if (sent) {
-    return res.json({
+    res.json({
       success: true,
-      message: 'Message sent'
+      senderId,
+      isPaused,
+      takeover: isPaused
     });
   }
+);
 
-  res.status(500).json({
-    success: false,
-    message: 'Message sending failed'
+app.get(
+  '/api/customers/:senderId/status',
+  (req, res) => {
+    const { senderId } = req.params;
+
+    const isPaused =
+      getTakeoverState(senderId);
+
+    res.json({
+      success: true,
+      senderId,
+      isPaused,
+      takeover: isPaused
+    });
+  }
+);
+
+app.get('/api/customers', (req, res) => {
+  const list = Object.values(db.customers).map(
+    customer => ({
+      senderId: customer.id,
+      displayName:
+        customer.name ||
+        `Customer ${customer.id.slice(-4)}`,
+      phone: customer.phone || null,
+      lastMessageText:
+        customer.lastMessageText || null,
+      lastMessageAt:
+        customer.lastActive || null,
+      takeover:
+        getTakeoverState(customer.id),
+      isPaused:
+        getTakeoverState(customer.id)
+    })
+  );
+
+  res.json({
+    success: true,
+    data: list
   });
 });
+
+app.post(
+  '/api/customers/:senderId/send',
+  async (req, res) => {
+    const { senderId } = req.params;
+    const { text } = req.body;
+
+    if (!text) {
+      return res.status(400).json({
+        error: 'Text required'
+      });
+    }
+
+    const sent = await sendFacebookMessage(
+      senderId,
+      text
+    );
+
+    if (sent) {
+      return res.json({
+        success: true,
+        message: 'Message sent'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Message sending failed'
+    });
+  }
+);
 
 // =============================================================================
 // 15. HEALTH AND DIAGNOSTIC ENDPOINTS
 // =============================================================================
+
 app.get('/health', (req, res) => {
   res.status(200).json({
     success: true,
@@ -1403,7 +1772,6 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Newly added /api/status endpoint.
 app.get('/api/status', (req, res) => {
   res.json({
     success: true,
@@ -1419,15 +1787,16 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// Diagnostic view of media availability, without exposing access tokens.
 app.get('/api/catalog/media-status', (req, res) => {
   res.json({
     success: true,
     products: products.map(product => ({
       id: product.id,
       name: product.name,
-      images: getProductMediaUrls(product, 'images').length,
-      videos: getProductMediaUrls(product, 'videos').length
+      images:
+        getProductMediaUrls(product, 'images').length,
+      videos:
+        getProductMediaUrls(product, 'videos').length
     }))
   });
 });
@@ -1435,9 +1804,10 @@ app.get('/api/catalog/media-status', (req, res) => {
 // =============================================================================
 // 16. START SERVER AFTER INITIAL CATALOG SYNC
 // =============================================================================
+
 async function startServer() {
   // Keep the local catalog available if GitHub is unavailable.
-  // But wait for the initial attempt before accepting traffic.
+  // Wait for the initial sync attempt before accepting traffic.
   await pullCatalogFromGitHub();
 
   app.listen(PORT, '0.0.0.0', () => {
@@ -1446,18 +1816,24 @@ async function startServer() {
     );
 
     console.log(
-      `[CATALOG] ${products.length} products, ${faqs.length} FAQs; source=${catalogMeta.source}`
+      `[CATALOG] ${products.length} products, ` +
+      `${faqs.length} FAQs; source=${catalogMeta.source}`
     );
 
     if (catalogMeta.lastSyncError) {
       console.warn(
-        `[CATALOG] Latest GitHub sync warning: ${catalogMeta.lastSyncError}`
+        '[CATALOG] Latest GitHub sync warning: ' +
+        catalogMeta.lastSyncError
       );
     }
   });
 }
 
 startServer().catch(err => {
-  console.error('[SERVER] Startup error:', err.message);
+  console.error(
+    '[SERVER] Startup error:',
+    err.message
+  );
+
   process.exit(1);
 });
