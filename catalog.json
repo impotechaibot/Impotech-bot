@@ -313,6 +313,27 @@
         "original"
       ],
       "question": "প্রোডাক্টে কোনো লোগো বা ব্র্যান্ডের নাম লেখা আছে?"
+    },
+    {
+      "answer": "কাস্টমার নির্দিষ্ট বাইকের ব্র্যান্ড ও মডেল দিলে প্রথমে যাচাই করতে হবে ওই বাইকের Original/Factory Headlight Bulb বা Headlight Socket H4 কি না।\n\n- যদি নির্ভরযোগ্য তথ্য থেকে নিশ্চিত হওয়া যায় যে ওই বাইকের Original Headlight-এ H4 Plug/Socket আছে, তাহলে বলবে:\n  “জি, আপনার [বাইকের মডেল]-এর Original Headlight,হেডলাইট -এ H4 Plug/Socket ব্যবহার করা হয়েছে। তাই এই H4 Plug Devil Eye Headlight আপনার বাইকে Plug and Play হিসেবে ব্যবহার করা যাবে।”\n\n- যদি নিশ্চিত হওয়া যায় যে বাইকটিতে H4 Plug/Socket নেই, তাহলে বলবে:\n  “আপনার [বাইকের মডেল]-এর Original Headlight-এ H4 Plug/Socket ব্যবহার করা হয়নি। তাই এই H4 Plug Devil Eye Headlight সরাসরি Plug and Play হিসেবে ব্যবহার করা যাবে না।”\n\n- যদি নির্ভরযোগ্য তথ্য পাওয়া না যায়, তাহলে কোনো অনুমান করা যাবে না। বলবে:\n  “আপনার [বাইকের মডেল]-এর Original Headlight-এ H4 Plug/Socket আছে কি না নিশ্চিতভাবে যাচাই করা যাচ্ছে না। বিস্তারিত জানতে আমাদের একজন এডমিন বা প্রতিনিধি খুব শীঘ্রই আপনার সাথে সরাসরি যোগাযোগ করবেন।”\n\nগুরুত্বপূর্ণ নিয়ম:\n\n1. কাস্টমার শুধু “আমার বাইকে হবে?” বললে প্রথমে বাইকের ব্র্যান্ড + নির্দিষ্ট মডেল জানতে হবে।\n2. মডেল পাওয়ার পর যাচাই করতে হবে ওই মডেলের Factory/Original Headlight-এ H4 Plug/Socket আছে কি না।\n3. শুধু বাইকের মডেল দেখে অনুমান করে H4 বলা যাবে না।\n4. H4 Plug নিশ্চিত হলেই Plug and Play compatibility সম্পর্কে উত্তর দেওয়া যাবে।\n5. H4 Plug না থাকলে সরাসরি Plug and Play হবে বলা যাবে না।\n6. তথ্য নিশ্চিতভাবে যাচাই করা না গেলে কোনো অনুমান করা যাবে না এবং Admin/Representative-এর কাছে পাঠাতে হবে।\n7. H4 Plug/Socket থাকলেই শুধু এই FAQ অনুযায়ী Fitment নিশ্চিত করা যাবে; অন্য কোনো অতিরিক্ত modification-এর প্রয়োজন আছে কি না সে বিষয়ে তথ্য না থাকলে অনুমান করা যাবে না।",
+      "category": "GENERAL",
+      "id": "faq_184125",
+      "keywords": [
+        "Headlight",
+        "ডেভিল আই",
+        "devil eye",
+        "হেডলাইট",
+        "headlight",
+        "দাম",
+        "price",
+        "60W",
+        "1099 taka",
+        "warranty",
+        "ওয়ারেন্টি",
+        "200 days",
+        "projector"
+      ],
+      "question": "আমার বাইকের মডেল [নির্দিষ্ট মডেল]। এতে কি H4 Plug Devil Eye Headlight, 60W Red/Blue Devil Eye Headlight,৬০ ওয়াট লাল/নীল ডেভিল আই হেডলাইট লাগবে?"
     }
   ],
   "payment": {
@@ -481,6 +502,6 @@
       ]
     }
   ],
-  "updatedAt": "2026-10-10T01:09:40Z",
-  "version": 12
+  "updatedAt": "2026-10-10T01:36:47Z",
+  "version": 13
 }
