@@ -1,4 +1,3 @@
-
 'use strict';
 
 /**
@@ -8,23 +7,10 @@
  * AI          : OpenRouter Gemini
  * CATALOG     : GitHub catalog.json + Local cache
  * STORAGE     : storage_data.json
- * MEDIA       : Product-specific Facebook URLs
+ * MEMORY      : Persistent customer memory + last 20 messages
+ * FOLLOW-UP   : Scheduled around 23 hours after customer interaction
  * HUMAN       : Persistent per-customer + global takeover
  * ADMIN       : Catalog, customers, messages, orders, bot status
- *
- * FEATURES:
- * - Sales assistant, text, vision and voice support
- * - Last 20 conversation messages in AI context
- * - Persistent conversation history
- * - Motorcycle model/year/H4 compatibility
- * - Product price and media protection
- * - Automatic order creation from Messenger
- * - Automatic per-customer human takeover after order
- * - Fixed order acknowledgement
- * - Messenger message deduplication
- * - Per-customer message queue
- * - GitHub catalog pull/push
- * - Admin customer/message/order APIs
  * =============================================================================
  */
 
@@ -55,7 +41,6 @@ app.use((req, res, next) => {
   );
 
   if (req.method === 'OPTIONS') return res.sendStatus(200);
-
   next();
 });
 
@@ -78,10 +63,7 @@ const GITHUB_REPO =
   process.env.GITHUB_REPO || 'impotechaibot/Impotech-bot';
 
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
-
-const CATALOG_FILE =
-  process.env.CATALOG_FILE || 'data/catalog.json';
-
+const CATALOG_FILE = process.env.CATALOG_FILE || 'data/catalog.json';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 
 const OPENROUTER_URL =
@@ -97,23 +79,24 @@ const WHATSAPP_NUMBER = '01884332067';
 
 const MAX_PRODUCTS_TO_AI = 5;
 const MAX_FAQS_TO_AI = 5;
-const MAX_OUTPUT_TOKENS = 800;
+const MAX_OUTPUT_TOKENS = 500;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
+const MAX_AI_LINES = 5;
 
 const HISTORY_LIMIT = 20;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
 
-const LOCAL_CATALOG_PATH =
-  path.join(__dirname, 'catalog.json');
+// Follow-up is scheduled at 23 hours, leaving a safety margin
+// before the standard 24-hour Messenger messaging window closes.
+const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
+const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
 
-const DATA_FILE =
-  path.join(__dirname, 'storage_data.json');
+const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
+const DATA_FILE = path.join(__dirname, 'storage_data.json');
 
-const GRAPH_API_VERSION =
-  process.env.GRAPH_API_VERSION || 'v18.0';
-
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
 const REQUIRE_ADMIN_SECRET =
   process.env.REQUIRE_ADMIN_SECRET !== 'false';
 
@@ -121,6 +104,9 @@ const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 
 const ORDER_CONFIRMATION =
   'আপনার অর্ডারটি গ্রহণ করা হয়েছে। আমাদের প্রতিনিধি শীঘ্রই আপনার অর্ডারটি কনফার্ম করবেন।';
+
+const FOLLOWUP_MESSAGE =
+  'আপনি কি পণ্যটি সম্পর্কে আরও কিছু জানতে চান? কোনো প্রশ্ন থাকলে জানাবেন, আমরা সাহায্য করতে প্রস্তুত।';
 
 // =============================================================================
 // 3. STATE AND STORAGE
@@ -142,17 +128,51 @@ let db = {
   takeovers: {},
   customers: {},
   messages: [],
-  orders: []
+  orders: [],
+  customerMemory: {},
+  scheduledFollowups: {}
 };
 
 const customerHistory = new Map();
 const processedMessageIds = new Map();
 const customerQueues = new Map();
+const followupTimers = new Map();
+
+function ensureStorageShape() {
+  if (!db || typeof db !== 'object') db = {};
+
+  if (typeof db.isGlobalPaused !== 'boolean') {
+    db.isGlobalPaused = false;
+  }
+
+  if (!db.takeovers || typeof db.takeovers !== 'object') {
+    db.takeovers = {};
+  }
+
+  if (!db.customers || typeof db.customers !== 'object') {
+    db.customers = {};
+  }
+
+  if (!Array.isArray(db.messages)) db.messages = [];
+  if (!Array.isArray(db.orders)) db.orders = [];
+
+  if (!db.customerMemory || typeof db.customerMemory !== 'object') {
+    db.customerMemory = {};
+  }
+
+  if (
+    !db.scheduledFollowups ||
+    typeof db.scheduledFollowups !== 'object'
+  ) {
+    db.scheduledFollowups = {};
+  }
+}
 
 function loadStorage() {
   try {
     if (!fs.existsSync(DATA_FILE)) {
-      console.log('[STORAGE] No storage file found');
+      console.log('[STORAGE] No storage file found; using empty storage');
+      ensureStorageShape();
       return;
     }
 
@@ -164,20 +184,12 @@ function loadStorage() {
       customers: {},
       messages: [],
       orders: [],
+      customerMemory: {},
+      scheduledFollowups: {},
       ...saved
     };
 
-    if (!db.takeovers || typeof db.takeovers !== 'object') {
-      db.takeovers = {};
-    }
-
-    if (!db.customers || typeof db.customers !== 'object') {
-      db.customers = {};
-    }
-
-    if (!Array.isArray(db.messages)) db.messages = [];
-    if (!Array.isArray(db.orders)) db.orders = [];
-
+    ensureStorageShape();
     customerHistory.clear();
 
     for (const message of db.messages) {
@@ -186,9 +198,7 @@ function loadStorage() {
 
       let role;
 
-      if (
-        ['customer', 'user'].includes(message.sender)
-      ) {
+      if (['customer', 'user'].includes(message.sender)) {
         role = 'user';
       } else if (
         ['bot', 'assistant', 'admin'].includes(message.sender)
@@ -217,15 +227,19 @@ function loadStorage() {
 
     console.log(
       `[STORAGE] Restored ${db.messages.length} messages, ` +
-      `${db.orders.length} orders`
+      `${db.orders.length} orders and ` +
+      `${Object.keys(db.customerMemory).length} customer memories`
     );
   } catch (err) {
     console.error('[STORAGE] Load error:', err.message);
+    ensureStorageShape();
   }
 }
 
 function saveStorage() {
   try {
+    ensureStorageShape();
+
     const tempPath = DATA_FILE + '.tmp';
 
     fs.writeFileSync(
@@ -269,7 +283,139 @@ function tokenize(value = '') {
 }
 
 // =============================================================================
-// 4. CATALOG VALIDATION AND LOADING
+// 4. PERSISTENT CUSTOMER MEMORY
+// =============================================================================
+
+// Memory is intentionally conservative: store customer-provided facts and
+// preferences, not guesses. Full message history remains available separately.
+function getCustomerMemory(senderId) {
+  const id = String(senderId || '');
+  if (!id) return null;
+
+  if (!db.customerMemory[id]) {
+    db.customerMemory[id] = {
+      senderId: id,
+      facts: [],
+      preferences: [],
+      summary: '',
+      updatedAt: null
+    };
+  }
+
+  const memory = db.customerMemory[id];
+
+  if (!Array.isArray(memory.facts)) memory.facts = [];
+  if (!Array.isArray(memory.preferences)) memory.preferences = [];
+  if (typeof memory.summary !== 'string') memory.summary = '';
+
+  return memory;
+}
+
+function addUniqueMemoryItem(list, value, maxItems = 30) {
+  const text = String(value || '').trim();
+  if (!text || text.length > 220) return list;
+
+  const key = normalizeText(text);
+  if (!key) return list;
+
+  if (!list.some(item => normalizeText(item) === key)) {
+    list.push(text);
+  }
+
+  if (list.length > maxItems) {
+    list.splice(0, list.length - maxItems);
+  }
+
+  return list;
+}
+
+function updateCustomerMemory(senderId, customerText) {
+  const text = String(customerText || '').trim();
+  if (!senderId || !text || text.length > 1000) return;
+
+  const memory = getCustomerMemory(senderId);
+  const customer = db.customers[String(senderId)] || {};
+
+  // Save explicit product/model context, without inventing a match.
+  const matchedProducts = products
+    .map(product => ({
+      product,
+      score: productScore(text, product)
+    }))
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (
+    matchedProducts.length &&
+    (
+      matchedProducts.length === 1 ||
+      matchedProducts[0].score > matchedProducts[1].score
+    )
+  ) {
+    addUniqueMemoryItem(
+      memory.facts,
+      `আলোচিত পণ্য: ${matchedProducts[0].product.name} (ID: ${matchedProducts[0].product.id})`
+    );
+  }
+
+  // Only retain phone numbers when the customer explicitly provides one.
+  const phoneMatch = text.match(
+    /(?:\+?8801|01)[0-9\s-]{8,14}/
+  );
+
+  if (phoneMatch) {
+    customer.phone = phoneMatch[0].replace(/[\s-]/g, '');
+  }
+
+  const preferencePatterns = [
+    /আমি (?:সাধারণত )?(?:কালো|সাদা|লাল|নীল|কালার|রঙের)[^।.!?]{0,100}/i,
+    /আমার (?:বাইক|মোটরসাইকেল|গাড়ি)[^।.!?]{0,120}/i,
+    /আমার (?:পছন্দ|বাজেট)[^।.!?]{0,120}/i,
+    /বাজেট [^।.!?]{0,80}/i,
+    /ডেলিভারি (?:গাজীপুর|ঢাকা|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা)[^।.!?]{0,80}/i
+  ];
+
+  for (const pattern of preferencePatterns) {
+    const match = text.match(pattern);
+    if (match) addUniqueMemoryItem(memory.preferences, match[0], 20);
+  }
+
+  // Keep a bounded, durable summary of recent customer-provided information.
+  if (text.length >= 8 && !/^(হ্যাঁ|না|ok|okay|ধন্যবাদ|thanks)$/i.test(text)) {
+    memory.summary = [
+      memory.summary,
+      `গ্রাহক বলেছেন: ${text.slice(0, 240)}`
+    ].filter(Boolean).slice(-8).join('\n');
+  }
+
+  memory.updatedAt = new Date().toISOString();
+  customer.lastMemoryUpdatedAt = memory.updatedAt;
+
+  saveStorage();
+}
+
+function buildCustomerMemoryContext(senderId) {
+  const memory = getCustomerMemory(senderId);
+  if (!memory) return 'কোনো সংরক্ষিত গ্রাহক মেমোরি নেই।';
+
+  const facts = memory.facts.slice(-15);
+  const preferences = memory.preferences.slice(-10);
+
+  return [
+    facts.length
+      ? `গুরুত্বপূর্ণ তথ্য:\n- ${facts.join('\n- ')}`
+      : '',
+    preferences.length
+      ? `গ্রাহকের পছন্দ/প্রসঙ্গ:\n- ${preferences.join('\n- ')}`
+      : '',
+    memory.summary
+      ? `সংরক্ষিত কথোপকথনের সারাংশ:\n${memory.summary}`
+      : ''
+  ].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত গ্রাহক মেমোরি নেই।';
+}
+
+// =============================================================================
+// 5. CATALOG VALIDATION AND LOADING
 // =============================================================================
 
 function validateCatalogShape(data) {
@@ -291,10 +437,7 @@ function validateCatalogShape(data) {
     const id = String(product.id ?? '').trim();
 
     if (!id) throw new Error('Every product must have an ID');
-
-    if (ids.has(id)) {
-      throw new Error('Duplicate product ID: ' + id);
-    }
+    if (ids.has(id)) throw new Error('Duplicate product ID: ' + id);
 
     ids.add(id);
   }
@@ -369,7 +512,7 @@ loadStorage();
 loadLocalCatalog();
 
 // =============================================================================
-// 5. ADMIN AUTHENTICATION
+// 6. ADMIN AUTHENTICATION
 // =============================================================================
 
 function requireAdmin(req, res, next) {
@@ -405,15 +548,12 @@ function requireAdmin(req, res, next) {
 }
 
 app.use('/api', (req, res, next) => {
-  if (['/health', '/status'].includes(req.path)) {
-    return next();
-  }
-
+  if (['/health', '/status'].includes(req.path)) return next();
   return requireAdmin(req, res, next);
 });
 
 // =============================================================================
-// 6. PRODUCT AND FAQ SEARCH
+// 7. PRODUCT AND FAQ SEARCH
 // =============================================================================
 
 function scoreRecord(query, record, fields) {
@@ -447,26 +587,14 @@ function scoreRecord(query, record, fields) {
 
 function productScore(query, product) {
   return scoreRecord(query, product, [
-    'id',
-    'name',
-    'description',
-    'shortDescription',
-    'category',
-    'brand',
-    'model',
-    'sku',
-    'keywords',
-    'tags',
-    'aliases'
+    'id', 'name', 'description', 'shortDescription', 'category',
+    'brand', 'model', 'sku', 'keywords', 'tags', 'aliases'
   ]);
 }
 
 function findRelevantProducts(query) {
   return products
-    .map(product => ({
-      product,
-      score: productScore(query, product)
-    }))
+    .map(product => ({ product, score: productScore(query, product) }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, MAX_PRODUCTS_TO_AI)
@@ -478,10 +606,7 @@ function findRelevantFaqs(query) {
     .map(faq => ({
       faq,
       score: scoreRecord(query, faq, [
-        'question',
-        'answer',
-        'category',
-        'keywords'
+        'question', 'answer', 'category', 'keywords'
       ])
     }))
     .filter(item => item.score > 0)
@@ -491,16 +616,14 @@ function findRelevantFaqs(query) {
 }
 
 // =============================================================================
-// 7. CONVERSATION HISTORY
+// 8. CONVERSATION HISTORY
 // =============================================================================
 
 function getHistory(senderId) {
   const id = String(senderId || '');
   if (!id) return [];
 
-  if (customerHistory.has(id)) {
-    return customerHistory.get(id);
-  }
+  if (customerHistory.has(id)) return customerHistory.get(id);
 
   const history = [];
 
@@ -511,9 +634,7 @@ function getHistory(senderId) {
 
     if (['customer', 'user'].includes(message.sender)) {
       role = 'user';
-    } else if (
-      ['bot', 'assistant', 'admin'].includes(message.sender)
-    ) {
+    } else if (['bot', 'assistant', 'admin'].includes(message.sender)) {
       role = 'assistant';
     } else {
       continue;
@@ -522,15 +643,12 @@ function getHistory(senderId) {
     history.push({
       role,
       text: String(message.text || ''),
-      timestamp: new Date(
-        message.timestamp || Date.now()
-      ).getTime()
+      timestamp: new Date(message.timestamp || Date.now()).getTime()
     });
   }
 
   const limited = history.slice(-HISTORY_LIMIT);
   customerHistory.set(id, limited);
-
   return limited;
 }
 
@@ -570,9 +688,7 @@ function getPreviousAssistantReply(senderId, userText) {
       normalizeText(history[i].text) === normalized
     ) {
       for (let j = i + 1; j < history.length; j++) {
-        if (history[j].role === 'assistant') {
-          return history[j].text;
-        }
+        if (history[j].role === 'assistant') return history[j].text;
       }
     }
   }
@@ -581,7 +697,7 @@ function getPreviousAssistantReply(senderId, userText) {
 }
 
 // =============================================================================
-// 8. PRICE PROTECTION
+// 9. EXACT PRODUCT MATCHING AND PRICE PROTECTION
 // =============================================================================
 
 function isPriceQuestion(text = '') {
@@ -599,44 +715,81 @@ function isGenericPriceQuestion(text = '') {
   const value = normalizeText(text);
 
   return [
-    /^দাম$/,
-    /^দাম কত$/,
-    /^দামটা কত$/,
-    /^প্রাইস$/,
-    /^প্রাইস কত$/,
-    /^মূল্য$/,
-    /^মূল্য কত$/,
-    /^কত টাকা$/,
-    /^কত দাম$/,
-    /^price$/,
-    /^price please$/,
-    /^how much$/,
-    /^how much is it$/,
-    /^what is the price$/
+    /^দাম$/, /^দাম কত$/, /^দামটা কত$/, /^প্রাইস$/,
+    /^প্রাইস কত$/, /^মূল্য$/, /^মূল্য কত$/, /^কত টাকা$/,
+    /^কত দাম$/, /^price$/, /^price please$/, /^how much$/,
+    /^how much is it$/, /^what is the price$/
   ].some(pattern => pattern.test(value));
 }
 
+function getProductIdentifiers(product) {
+  return [
+    product.name,
+    product.id,
+    product.sku,
+    product.model,
+    ...(Array.isArray(product.aliases) ? product.aliases : [])
+  ]
+    .filter(Boolean)
+    .map(normalizeText)
+    .filter(Boolean);
+}
+
+// Match a product only when a full identifier is present. A partial name
+// or one common token must not be enough to disclose the wrong price.
 function findExactProductForPrice(query) {
   const q = normalizeText(query);
   if (!q) return null;
 
-  const matches = products.filter(product => {
-    const candidates = [
-      product.name,
-      product.id,
-      product.sku,
-      product.model,
-      ...(Array.isArray(product.aliases) ? product.aliases : [])
-    ]
-      .filter(Boolean)
-      .map(normalizeText);
+  const matches = [];
 
-    return candidates.some(candidate =>
-      candidate && q.includes(candidate)
-    );
-  });
+  for (const product of products) {
+    const identifiers = getProductIdentifiers(product);
 
+    const matched = identifiers.some(identifier => {
+      if (identifier.length < 3) return false;
+
+      const escaped = identifier.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        '\\$&'
+      );
+
+      const pattern = new RegExp(
+        `(^|\\s)${escaped.replace(/\s+/g, '\\s+')}(?=\\s|$)`,
+        'i'
+      );
+
+      return pattern.test(q);
+    });
+
+    if (matched) matches.push(product);
+  }
+
+  // If identifiers collide across products, do not guess.
   return matches.length === 1 ? matches[0] : null;
+}
+
+function findProductFromRecentContext(senderId) {
+  const history = getHistory(senderId);
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role !== 'user') continue;
+
+    const previousText = history[i].text || '';
+    const match = findExactProductForPrice(previousText);
+
+    if (match) return match;
+  }
+
+  const memory = getCustomerMemory(senderId);
+  const recentFacts = (memory?.facts || []).slice().reverse();
+
+  for (const fact of recentFacts) {
+    const match = findExactProductForPrice(fact);
+    if (match) return match;
+  }
+
+  return null;
 }
 
 function getPriceReply(product) {
@@ -656,7 +809,7 @@ function getPriceClarificationReply() {
 }
 
 // =============================================================================
-// 9. MOTORCYCLE H4 COMPATIBILITY
+// 10. MOTORCYCLE H4 COMPATIBILITY
 // =============================================================================
 
 function isBikeCompatibilityQuestion(text = '') {
@@ -707,11 +860,9 @@ function identifyBikeModel(text = '') {
     )
     .map(entry => {
       const aliases = Array.isArray(entry.aliases) ? entry.aliases : [];
-
-      const names = [
-        `${entry.brand} ${entry.model}`,
-        ...aliases
-      ].map(normalizeText).filter(Boolean);
+      const names = [`${entry.brand} ${entry.model}`, ...aliases]
+        .map(normalizeText)
+        .filter(Boolean);
 
       const matchedName = names
         .filter(name => value.includes(name))
@@ -756,15 +907,13 @@ function getH4CompatibilityReply(match) {
   if (entry.originalH4Socket) {
     return (
       `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
-      'Original Headlight-এ H4 Socket আছে। তবে বাইকের উৎপাদন সাল ' +
-      'বা Variant আলাদা হলে সেটি মিলিয়ে নেওয়া প্রয়োজন হতে পারে।'
+      'Original Headlight-এ H4 Socket আছে। Variant বা উৎপাদন সাল আলাদা হলে সেটিও মিলিয়ে নেওয়া প্রয়োজন।'
     );
   }
 
   return (
     `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
-    'Original Headlight-এ H4 Socket নেই। আপনার বাইকের Variant বা ' +
-    'Headlight পরিবর্তন করা থাকলে সেটি জানালে যাচাই করতে পারব।'
+    'Original Headlight-এ H4 Socket নেই। Variant বা Headlight পরিবর্তন করা থাকলে সেটি জানালে যাচাই করতে পারব।'
   );
 }
 
@@ -775,7 +924,6 @@ function extractBikeYear(text = '') {
 
 function customerConfirmedH4(senderId, currentText = '') {
   const context = getRecentConversationText(senderId, currentText);
-
   const hasH4 = /\bh.?4\b/i.test(context);
 
   const confirmation =
@@ -799,7 +947,7 @@ function getBikeClarificationReply(senderId, text = '') {
 }
 
 // =============================================================================
-// 10. PRODUCT MEDIA
+// 11. PRODUCT MEDIA
 // =============================================================================
 
 function getMediaType(text = '') {
@@ -846,51 +994,27 @@ function getProductMediaUrls(product, mediaType) {
 }
 
 function findProductForMedia(query, senderId) {
+  const exact = findExactProductForPrice(query);
+  if (exact) return exact;
+
   const q = normalizeText(query);
 
   const candidates = products
-    .map(product => ({
-      product,
-      score: productScore(q, product)
-    }))
-    .filter(item => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-
-  if (candidates.length) {
-    if (
-      candidates.length > 1 &&
-      candidates[0].score === candidates[1].score
-    ) {
-      return null;
-    }
-
-    return candidates[0].product;
-  }
-
-  const previousProductQuery = getHistory(senderId)
-    .filter(item => item.role === 'user')
-    .slice(-5)
-    .map(item => item.text)
-    .join(' ');
-
-  if (!previousProductQuery) return null;
-
-  const previous = products
-    .map(product => ({
-      product,
-      score: productScore(previousProductQuery, product)
-    }))
+    .map(product => ({ product, score: productScore(q, product) }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score);
 
   if (
-    previous.length > 1 &&
-    previous[0].score === previous[1].score
+    candidates.length &&
+    (
+      candidates.length === 1 ||
+      candidates[0].score > candidates[1].score
+    )
   ) {
-    return null;
+    return candidates[0].product;
   }
 
-  return previous[0]?.product || null;
+  return findProductFromRecentContext(senderId);
 }
 
 function getProductMediaReply(query, senderId) {
@@ -908,27 +1032,24 @@ function getProductMediaReply(query, senderId) {
   if (!urls.length) {
     return (
       `দুঃখিত, ${product.name}-এর ` +
-      `${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক ` +
-      'বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।'
+      `${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`
     );
   }
 
   const label = mediaType === 'images' ? 'ছবি' : 'ভিডিও';
 
   return (
-    `অবশ্যই! ${product.name} পণ্যের ${label} লিংক:\n\n` +
-    urls.map((url, index) => `${index + 1}. ${url}`).join('\n') +
-    '\n\nলিংকে চাপ দিয়ে দেখতে পারবেন।'
+    `অবশ্যই! ${product.name} পণ্যের ${label} লিংক:\n` +
+    urls.map((url, index) => `${index + 1}. ${url}`).join('\n')
   );
 }
 
 // =============================================================================
-// 11. ORDER INTENT DETECTION AND ORDER STORAGE
+// 12. ORDER INTENT AND ORDER STORAGE
 // =============================================================================
 
 function isExplicitOrderIntent(text = '') {
   const value = normalizeText(text);
-
   if (!value) return false;
 
   const patterns = [
@@ -942,7 +1063,6 @@ function isExplicitOrderIntent(text = '') {
 
 function identifyOrderedProduct(senderId, customerText) {
   const exact = findExactProductForPrice(customerText);
-
   if (exact) return exact;
 
   const currentMatches = products
@@ -954,7 +1074,7 @@ function identifyOrderedProduct(senderId, customerText) {
     .sort((a, b) => b.score - a.score);
 
   if (
-    currentMatches.length > 0 &&
+    currentMatches.length &&
     (
       currentMatches.length === 1 ||
       currentMatches[0].score > currentMatches[1].score
@@ -963,53 +1083,19 @@ function identifyOrderedProduct(senderId, customerText) {
     return currentMatches[0].product;
   }
 
-  // Check recent customer messages for a product reference.
-  const history = getHistory(senderId);
-
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].role !== 'user') continue;
-
-    const previousText = history[i].text || '';
-
-    const matches = products
-      .map(product => ({
-        product,
-        score: productScore(previousText, product)
-      }))
-      .filter(item => item.score > 0)
-      .sort((a, b) => b.score - a.score);
-
-    if (
-      matches.length > 0 &&
-      (
-        matches.length === 1 ||
-        matches[0].score > matches[1].score
-      )
-    ) {
-      return matches[0].product;
-    }
-  }
-
-  return null;
+  return findProductFromRecentContext(senderId);
 }
 
 function createMessengerOrder(senderId, customerText, messageId) {
   const id = String(senderId || '').trim();
-
   if (!id) throw new Error('Customer sender ID is required');
 
-  // Prevent duplicate orders after Messenger retries or server restarts.
   if (messageId) {
     const existing = db.orders.find(
       order => order.sourceMessageId === messageId
     );
 
-    if (existing) {
-      return {
-        order: existing,
-        created: false
-      };
-    }
+    if (existing) return { order: existing, created: false };
   }
 
   const customer = db.customers[id] || {};
@@ -1019,8 +1105,7 @@ function createMessengerOrder(senderId, customerText, messageId) {
     id: 'order_' + crypto.randomUUID(),
     senderId: id,
     customerId: id,
-    customerName:
-      customer.name || `Customer ${id.slice(-4)}`,
+    customerName: customer.name || `Customer ${id.slice(-4)}`,
     customerPhone: customer.phone || null,
     productId: product?.id || null,
     productName: product?.name || null,
@@ -1048,26 +1133,24 @@ function createMessengerOrder(senderId, customerText, messageId) {
   db.customers[id].lastOrderId = order.id;
   db.customers[id].lastOrderAt = order.createdAt;
 
+  cancelFollowup(id);
+
   if (!saveStorage()) {
     db.orders = db.orders.filter(item => item.id !== order.id);
     throw new Error('Could not persist the customer order');
   }
 
-  return {
-    order,
-    created: true
-  };
+  return { order, created: true };
 }
 
 // =============================================================================
-// 12. HUMAN TAKEOVER
+// 13. HUMAN TAKEOVER
 // =============================================================================
 
 function getTakeoverState(customerId) {
   if (!customerId) return !!db.isGlobalPaused;
 
   const id = String(customerId).trim();
-
   if (db.isGlobalPaused) return true;
 
   if (
@@ -1114,6 +1197,8 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   db.customers[id].takeover = isEnabled;
   db.customers[id].takeoverUpdatedAt = timestamp;
 
+  if (isEnabled) cancelFollowup(id);
+
   if (!saveStorage()) {
     console.error('[Takeover] Failed to persist state');
   }
@@ -1139,8 +1224,20 @@ async function transferToHuman(senderId, reason, customMessage) {
 }
 
 // =============================================================================
-// 13. MESSENGER SEND
+// 14. MESSENGER SEND AND RESPONSE LENGTH
 // =============================================================================
+
+function limitToFiveLines(text) {
+  const lines = String(text || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (lines.length <= MAX_AI_LINES) return lines.join('\n');
+
+  return lines.slice(0, MAX_AI_LINES).join('\n');
+}
 
 async function sendFacebookMessage(recipientId, text) {
   if (!PAGE_ACCESS_TOKEN) {
@@ -1149,7 +1246,6 @@ async function sendFacebookMessage(recipientId, text) {
   }
 
   const finalText = String(text || '').trim();
-
   if (!finalText) return false;
 
   if (finalText.length > MAX_MESSENGER_TEXT_LENGTH) {
@@ -1197,10 +1293,160 @@ async function sendFacebookMessage(recipientId, text) {
 
     return false;
   }
+  }
+// =============================================================================
+// 15. AUTOMATIC FOLLOW-UP SCHEDULER
+// =============================================================================
+
+// Follow-ups are persisted so pending tasks can be restored after a restart.
+// A follow-up is sent only if the customer has not messaged again, no order
+// exists, takeover is inactive, and the standard messaging window is valid.
+
+function cancelFollowup(senderId) {
+  const id = String(senderId || '');
+  if (!id) return;
+
+  const timer = followupTimers.get(id);
+  if (timer) clearTimeout(timer);
+
+  followupTimers.delete(id);
+
+  if (db.scheduledFollowups[id]) {
+    delete db.scheduledFollowups[id];
+    saveStorage();
+  }
+}
+
+function customerHasOrder(senderId) {
+  const id = String(senderId || '');
+
+  return db.orders.some(order =>
+    String(order.senderId || order.customerId || '') === id &&
+    !['CANCELLED', 'CANCELED', 'REJECTED'].includes(
+      String(order.status || '').toUpperCase()
+    )
+  );
+}
+
+function scheduleFollowup(senderId, lastCustomerMessageAt = Date.now()) {
+  const id = String(senderId || '');
+  if (!id) return;
+
+  cancelFollowup(id);
+
+  if (getTakeoverState(id) || customerHasOrder(id)) return;
+
+  const customer = db.customers[id] || {};
+  const lastAt = new Date(lastCustomerMessageAt).getTime();
+
+  if (!Number.isFinite(lastAt)) return;
+
+  db.scheduledFollowups[id] = {
+    senderId: id,
+    dueAt: lastAt + FOLLOWUP_DELAY_MS,
+    lastCustomerMessageAt: lastAt,
+    lastMessageId: customer.lastMessageId || null,
+    status: 'PENDING'
+  };
+
+  saveStorage();
+  armFollowupTimer(id);
+}
+
+function armFollowupTimer(senderId) {
+  const id = String(senderId || '');
+  const task = db.scheduledFollowups[id];
+
+  if (!task || task.status !== 'PENDING') return;
+
+  const existing = followupTimers.get(id);
+  if (existing) clearTimeout(existing);
+
+  const delay = Math.max(0, Number(task.dueAt) - Date.now());
+
+  const timer = setTimeout(async () => {
+    followupTimers.delete(id);
+    await executeFollowup(id);
+  }, Math.min(delay, 2147483647));
+
+  if (typeof timer.unref === 'function') timer.unref();
+
+  followupTimers.set(id, timer);
+}
+
+async function executeFollowup(senderId) {
+  const id = String(senderId || '');
+  const task = db.scheduledFollowups[id];
+
+  if (!task || task.status !== 'PENDING') return;
+
+  const customer = db.customers[id];
+
+  if (!customer || getTakeoverState(id) || customerHasOrder(id)) {
+    delete db.scheduledFollowups[id];
+    saveStorage();
+    return;
+  }
+
+  const dueAt = Number(task.dueAt);
+  if (Date.now() < dueAt) {
+    armFollowupTimer(id);
+    return;
+  }
+
+  const lastCustomerAt = new Date(
+    customer.lastCustomerMessageAt || customer.lastActive || 0
+  ).getTime();
+
+  // Do not send outside the standard 24-hour customer-service window.
+  // If the saved timestamp is missing or invalid, fail closed.
+  if (
+    !Number.isFinite(lastCustomerAt) ||
+    lastCustomerAt <= 0 ||
+    Date.now() - lastCustomerAt >= 24 * 60 * 60 * 1000
+  ) {
+    delete db.scheduledFollowups[id];
+    saveStorage();
+    console.log(`[FOLLOWUP] Skipped ${id}: messaging window expired`);
+    return;
+  }
+
+  // If a newer message was received, the older follow-up is stale.
+  if (lastCustomerAt > Number(task.lastCustomerMessageAt || 0)) {
+    scheduleFollowup(id, lastCustomerAt);
+    return;
+  }
+
+  const sent = await sendFacebookMessage(id, FOLLOWUP_MESSAGE);
+
+  task.status = sent ? 'SENT' : 'FAILED';
+  task.sentAt = new Date().toISOString();
+  task.result = sent ? 'sent' : 'send_failed';
+
+  saveStorage();
+
+  console.log(
+    `[FOLLOWUP] ${id}: ${sent ? 'sent' : 'failed'}`
+  );
+}
+
+function restoreFollowupTasks() {
+  for (const [senderId, task] of Object.entries(db.scheduledFollowups)) {
+    if (!task || task.status !== 'PENDING') continue;
+
+    if (getTakeoverState(senderId) || customerHasOrder(senderId)) {
+      delete db.scheduledFollowups[senderId];
+      continue;
+    }
+
+    armFollowupTimer(senderId);
+  }
+
+  saveStorage();
 }
 
 // =============================================================================
-// 14. GITHUB CATALOG SYNC
+// 16. GITHUB CATALOG SYNC
 // =============================================================================
 
 function replaceCatalogAtomically(catalogData, source = 'admin') {
@@ -1256,7 +1502,6 @@ async function pullCatalogFromGitHub() {
 
     validateCatalogShape(parsed);
     replaceCatalogAtomically(parsed, 'github');
-
     return true;
   } catch (err) {
     catalogMeta.lastSyncError =
@@ -1353,10 +1598,15 @@ async function pushCatalogToGitHub(
 }
 
 // =============================================================================
-// 15. AI SYSTEM PROMPT
+// 17. AI SYSTEM PROMPT
 // =============================================================================
 
-function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
+function buildSystemPrompt(
+  relevantProducts,
+  relevantFaqs,
+  history,
+  memoryContext
+) {
   const productContext = relevantProducts.length
     ? relevantProducts.map((p, i) => [
         `[পণ্য ${i + 1}]`,
@@ -1396,24 +1646,28 @@ WhatsApp: ${WHATSAPP_NUMBER}
 - গাজীপুরের ভেতরে ৫০ টাকা।
 - গাজীপুরের বাইরে ১০০ টাকা।
 
-নিয়ম:
-১. সহজ, স্বাভাবিক ও ভদ্র বাংলায় উত্তর দিন।
-২. কাস্টমার ইংরেজিতে লিখলে ইংরেজিতে উত্তর দিতে পারেন।
+কঠোর নিয়ম:
+১. সহজ, স্বাভাবিক ও ভদ্র বাংলায় উত্তর দিন। গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে উত্তর দিতে পারেন।
+২. প্রতিটি উত্তর সর্বোচ্চ ৫টি লাইনে রাখুন। অপ্রয়োজনীয় ব্যাখ্যা দেবেন না।
 ৩. ক্যাটালগের বাইরে দাম, স্টক, ওয়ারেন্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
-৪. পণ্যের দাম কেবল ক্যাটালগ থেকে বলবেন।
-৫. কাস্টমারের প্রশ্ন অস্পষ্ট হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
-৬. শেষ ২০টি বার্তার প্রসঙ্গ মনে রাখুন; একই প্রশ্ন অযথা পুনরায় করবেন না।
+৪. পণ্যের দাম কেবল ক্যাটালগ থেকে বলবেন। সঠিক পণ্য শনাক্ত না হলে অনুমান করবেন না।
+৫. প্রশ্ন অস্পষ্ট হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
+৬. শেষ ২০টি বার্তার পাশাপাশি নিচের সংরক্ষিত গ্রাহক মেমোরিও ব্যবহার করুন।
 ৭. পণ্যের নাম, ID, দাম বা মিডিয়া URL পরিবর্তন করবেন না।
 ৮. বিক্রয়ের ক্ষেত্রে কাস্টমারকে চাপ দেবেন না।
-৯. অর্ডারের অনুরোধ শনাক্ত হলে ব্যাকএন্ড সেটি সংরক্ষণ করে Human Takeover চালু করবে। AI নিজে অর্ডার গ্রহণ হয়েছে বলে দাবি করবে না।
-১০. সাধারণ প্রশ্ন বা ক্যাটালগে তথ্য না থাকার কারণে Human Takeover চাইবেন না।
+৯. অর্ডারের অনুরোধ শনাক্ত হলে ব্যাকএন্ড অর্ডার সংরক্ষণ করে Human Takeover চালু করবে।
+১০. সাধারণ প্রশ্নের জন্য Human Takeover চাইবেন না।
 ১১. H4 Compatibility নিশ্চিত না হলে অনুমানকে নিশ্চিত তথ্য হিসেবে বলবেন না।
 ১২. বাইকের মডেল, উৎপাদন সাল বা Variant প্রয়োজন হলে জিজ্ঞেস করুন।
 ১৩. কাস্টমার নিজে H4 Socket নিশ্চিত করলে একই প্রশ্ন আবার করবেন না।
 ১৪. গুরুতর অভিযোগ, নিরাপত্তা বা পেমেন্ট সমস্যা সত্যিই মানব সহায়তা চাইলে উত্তরের শুরুতে ${HANDOVER_MARKER} লিখুন।
 ১৫. মার্কারটি কাস্টমারের কাছে পাঠানো হবে না; ব্যাকএন্ড এটি শনাক্ত করবে।
 ১৬. Takeover চালু থাকলে AI-এর উত্তর পাঠানো হবে না।
-১৭. কাস্টমারের ব্যক্তিগত তথ্য প্রকাশ করবেন না।
+১৭. গ্রাহকের ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।
+১৮. সংরক্ষিত মেমোরিতে তথ্য না থাকলে সেটি আছে বলে দাবি করবেন না।
+
+সংরক্ষিত গ্রাহক মেমোরি:
+${memoryContext || 'কোনো মেমোরি নেই।'}
 
 প্রাসঙ্গিক পণ্য:
 ${productContext}
@@ -1427,7 +1681,7 @@ ${historyContext}
 }
 
 // =============================================================================
-// 16. OPENROUTER AI
+// 18. OPENROUTER AI
 // =============================================================================
 
 async function callOpenRouter(messages, model = TEXT_MODEL) {
@@ -1457,7 +1711,6 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
   );
 
   const choice = response.data?.choices?.[0];
-
   if (!choice) throw new Error('OpenRouter returned no response');
 
   let reply = choice.message?.content;
@@ -1496,11 +1749,13 @@ async function generateAIResponse(
   }
 
   const context = getRecentConversationText(senderId, query);
+  const memoryContext = buildCustomerMemoryContext(senderId);
 
   const systemPrompt = buildSystemPrompt(
     findRelevantProducts(context),
     findRelevantFaqs(context),
-    history
+    history,
+    memoryContext
   );
 
   const priorMessages = history.map(item => ({
@@ -1526,7 +1781,7 @@ async function generateAIResponse(
       const audioBase64 =
         Buffer.from(audioResponse.data).toString('base64');
 
-      return await callOpenRouter([
+      const reply = await callOpenRouter([
         { role: 'system', content: systemPrompt },
         ...priorMessages,
         {
@@ -1534,7 +1789,7 @@ async function generateAIResponse(
           content: [
             {
               type: 'text',
-              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় উত্তর দিন।'
+              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
             },
             {
               type: 'input_audio',
@@ -1546,6 +1801,8 @@ async function generateAIResponse(
           ]
         }
       ], VOICE_MODEL);
+
+      return limitToFiveLines(reply);
     } catch (err) {
       console.error('[VOICE] Processing failed:', err.message);
     }
@@ -1572,7 +1829,7 @@ async function generateAIResponse(
       const contentType =
         imageResponse.headers['content-type'] || 'image/jpeg';
 
-      return await callOpenRouter([
+      const reply = await callOpenRouter([
         { role: 'system', content: systemPrompt },
         ...priorMessages,
         {
@@ -1582,7 +1839,7 @@ async function generateAIResponse(
               type: 'text',
               text:
                 `${query}\nছবিটি দেখে সাহায্য করুন। ` +
-                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করবেন না।'
+                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করবেন না। সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
             },
             {
               type: 'image_url',
@@ -1593,20 +1850,24 @@ async function generateAIResponse(
           ]
         }
       ], TEXT_MODEL);
+
+      return limitToFiveLines(reply);
     } catch (err) {
       console.error('[VISION] Processing failed:', err.message);
     }
   }
 
-  return callOpenRouter([
+  const reply = await callOpenRouter([
     { role: 'system', content: systemPrompt },
     ...priorMessages,
     { role: 'user', content: query }
   ]);
+
+  return limitToFiveLines(reply);
 }
 
 // =============================================================================
-// 17. CRITICAL HANDOVER
+// 19. CRITICAL HANDOVER
 // =============================================================================
 
 function isCriticalHandoverQuestion(text = '') {
@@ -1618,7 +1879,7 @@ function isCriticalHandoverQuestion(text = '') {
 }
 
 // =============================================================================
-// 18. CUSTOMER MESSAGE PROCESSING
+// 20. CUSTOMER MESSAGE PROCESSING
 // =============================================================================
 
 async function processCustomerMessage(
@@ -1635,10 +1896,7 @@ async function processCustomerMessage(
   const customerText = String(text || '').trim();
 
   try {
-    // -----------------------------------------------------------------------
-    // 1. ORDER INTENT: SAVE ORDER, PAUSE AI, SEND ONE CONFIRMATION
-    // -----------------------------------------------------------------------
-
+    // 1. ORDER INTENT
     if (isExplicitOrderIntent(customerText)) {
       const result = createMessengerOrder(
         senderId,
@@ -1646,7 +1904,6 @@ async function processCustomerMessage(
         messageId
       );
 
-      // If the event was already saved, do not create or acknowledge again.
       if (!result.created) {
         await setTakeoverState(
           senderId,
@@ -1658,7 +1915,6 @@ async function processCustomerMessage(
 
       const order = result.order;
 
-      // Enable takeover before sending confirmation.
       await setTakeoverState(
         senderId,
         true,
@@ -1677,43 +1933,31 @@ async function processCustomerMessage(
 
       if (!sent) {
         console.error(
-          `[ORDER] ${order.id} saved and takeover enabled, ` +
-          'but confirmation could not be sent'
+          `[ORDER] ${order.id} saved, but confirmation could not be sent`
         );
       }
 
       return;
     }
 
-    // -----------------------------------------------------------------------
-    // 2. Critical issues: transfer to human.
-    // -----------------------------------------------------------------------
-
+    // 2. CRITICAL ISSUES
     if (isCriticalHandoverQuestion(customerText)) {
       await transferToHuman(
         senderId,
         'Critical customer issue',
         `আপনার বিষয়টি গুরুত্ব দিয়ে দেখা প্রয়োজন। আমি কথোপকথনটি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
       );
-
       return;
     }
 
-    // -----------------------------------------------------------------------
-    // 3. Motorcycle/H4 compatibility.
-    // -----------------------------------------------------------------------
-
+    // 3. MOTORCYCLE / H4
     if (isBikeCompatibilityQuestion(customerText)) {
-      const context = getRecentConversationText(
-        senderId,
-        customerText
-      );
-
+      const context = getRecentConversationText(senderId, customerText);
       const match = identifyBikeModel(context);
       const verifiedReply = getH4CompatibilityReply(match);
 
       if (verifiedReply) {
-        await sendFacebookMessage(senderId, verifiedReply);
+        await sendFacebookMessage(senderId, limitToFiveLines(verifiedReply));
         return;
       }
 
@@ -1727,13 +1971,13 @@ async function processCustomerMessage(
         if (reply.includes(HANDOVER_MARKER)) {
           await sendFacebookMessage(
             senderId,
-            'আপনি জানিয়েছেন যে আপনার বাইকে H4 Socket আছে। এখন পণ্যের মডেল বা Connector-এর তথ্যটি জানালে বাকি Compatibility মিলিয়ে বলতে পারব।'
+            'আপনি জানিয়েছেন যে আপনার বাইকে H4 Socket আছে। পণ্যের মডেল বা Connector-এর তথ্যটি জানালে বাকি Compatibility মিলিয়ে বলতে পারব।'
           );
           return;
         }
 
         if (!getTakeoverState(senderId)) {
-          await sendFacebookMessage(senderId, reply);
+          await sendFacebookMessage(senderId, limitToFiveLines(reply));
         }
 
         return;
@@ -1745,7 +1989,7 @@ async function processCustomerMessage(
       );
 
       if (clarification) {
-        await sendFacebookMessage(senderId, clarification);
+        await sendFacebookMessage(senderId, limitToFiveLines(clarification));
         return;
       }
 
@@ -1758,37 +2002,31 @@ async function processCustomerMessage(
       if (bikeReply.includes(HANDOVER_MARKER)) {
         await sendFacebookMessage(
           senderId,
-          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে আপনার Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন?'
+          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন?'
         );
         return;
       }
 
       if (!getTakeoverState(senderId)) {
-        await sendFacebookMessage(senderId, bikeReply);
+        await sendFacebookMessage(senderId, limitToFiveLines(bikeReply));
       }
 
       return;
     }
 
-    // -----------------------------------------------------------------------
-    // 4. Price questions: always use catalog price.
-    // -----------------------------------------------------------------------
-
+    // 4. PRICE QUESTIONS
     if (isPriceQuestion(customerText)) {
-      if (isGenericPriceQuestion(customerText)) {
-        await sendFacebookMessage(
-          senderId,
-          getPriceClarificationReply()
-        );
-        return;
-      }
+      let product = findExactProductForPrice(customerText);
 
-      const product = findExactProductForPrice(customerText);
+      // Generic "price?" messages use the most recent explicit product.
+      if (!product && isGenericPriceQuestion(customerText)) {
+        product = findProductFromRecentContext(senderId);
+      }
 
       if (!product) {
         await sendFacebookMessage(
           senderId,
-          'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? সঠিক নাম বা মডেলটি বললে ক্যাটালগ থেকে দাম মিলিয়ে জানাতে পারব।'
+          getPriceClarificationReply()
         );
         return;
       }
@@ -1803,30 +2041,21 @@ async function processCustomerMessage(
         return;
       }
 
-      await sendFacebookMessage(senderId, priceReply);
+      await sendFacebookMessage(senderId, limitToFiveLines(priceReply));
       return;
     }
 
-    // -----------------------------------------------------------------------
-    // 5. Product media requests.
-    // -----------------------------------------------------------------------
-
+    // 5. PRODUCT MEDIA
     if (isMediaRequest(customerText)) {
-      const mediaReply = getProductMediaReply(
-        customerText,
-        senderId
-      );
+      const mediaReply = getProductMediaReply(customerText, senderId);
 
       if (mediaReply) {
-        await sendFacebookMessage(senderId, mediaReply);
+        await sendFacebookMessage(senderId, limitToFiveLines(mediaReply));
         return;
       }
     }
 
-    // -----------------------------------------------------------------------
-    // 6. Normal AI response.
-    // -----------------------------------------------------------------------
-
+    // 6. NORMAL AI RESPONSE
     let aiReply = await generateAIResponse(
       customerText,
       attachments,
@@ -1845,19 +2074,19 @@ async function processCustomerMessage(
           senderId,
           'AI identified a critical support issue',
           explanation
-            ? `${explanation}\n\nআমি বিষয়টি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
+            ? `${limitToFiveLines(explanation)}\nআমি বিষয়টি প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
             : undefined
         );
-
         return;
       }
 
       await sendFacebookMessage(
         senderId,
-        explanation ||
-        'আপনার প্রশ্নটি আরও ভালোভাবে বুঝতে একটি তথ্য জানতে চাই। আপনি কোন পণ্য বা মডেলটির কথা বলছেন?'
+        limitToFiveLines(
+          explanation ||
+          'আপনার প্রশ্নটি আরও ভালোভাবে বুঝতে একটি তথ্য জানতে চাই। আপনি কোন পণ্য বা মডেলটির কথা বলছেন?'
+        )
       );
-
       return;
     }
 
@@ -1871,13 +2100,13 @@ async function processCustomerMessage(
       normalizeText(previousReply) === normalizeText(aiReply)
     ) {
       aiReply =
-        'আগের উত্তরে বিষয়টি জানিয়েছি। আপনি চাইলে কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
+        'আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
     }
 
-    // Do not send AI replies after a takeover has been enabled.
+    // Recheck takeover immediately before sending.
     if (getTakeoverState(senderId)) return;
 
-    await sendFacebookMessage(senderId, aiReply);
+    await sendFacebookMessage(senderId, limitToFiveLines(aiReply));
   } catch (err) {
     console.error('[AI] Response error:', err.message);
 
@@ -1885,17 +2114,16 @@ async function processCustomerMessage(
 
     await sendFacebookMessage(
       senderId,
-      'দুঃখিত, এই মুহূর্তে উত্তর তৈরি করতে সমস্যা হচ্ছে। আপনি একটু পরে আবার লিখবেন? জরুরি প্রয়োজনে হেল্পলাইন: ' +
+      'দুঃখিত, এই মুহূর্তে উত্তর তৈরি করতে সমস্যা হচ্ছে। একটু পরে আবার লিখবেন? জরুরি প্রয়োজনে হেল্পলাইন: ' +
       HELPLINE +
       '। WhatsApp: ' +
       WHATSAPP_NUMBER +
       '।'
     );
   }
-}
-
+       }
 // =============================================================================
-// 19. FACEBOOK WEBHOOK
+// 21. FACEBOOK WEBHOOK
 // =============================================================================
 
 app.get('/webhook', (req, res) => {
@@ -1915,12 +2143,11 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  // Acknowledge Meta immediately.
+  // Acknowledge Meta immediately to prevent webhook retries.
   res.status(200).send('EVENT_RECEIVED');
 
   try {
     const body = req.body;
-
     if (body.object !== 'page') return;
 
     for (const entry of body.entry || []) {
@@ -1931,10 +2158,7 @@ app.post('/webhook', async (req, res) => {
 
         if (!message || message.is_echo || !senderId) continue;
 
-        if (
-          messageId &&
-          processedMessageIds.has(messageId)
-        ) {
+        if (messageId && processedMessageIds.has(messageId)) {
           continue;
         }
 
@@ -1959,6 +2183,7 @@ app.post('/webhook', async (req, res) => {
               return;
             }
 
+            const nowIso = new Date().toISOString();
             const isPaused = getTakeoverState(senderId);
 
             appendHistory(
@@ -1972,7 +2197,7 @@ app.post('/webhook', async (req, res) => {
               senderId,
               sender: 'customer',
               text: text || `[Media: ${attachments[0]?.type || 'file'}]`,
-              timestamp: new Date().toISOString(),
+              timestamp: nowIso,
               messageId: messageId || null
             });
 
@@ -1981,7 +2206,9 @@ app.post('/webhook', async (req, res) => {
                 id: senderId,
                 name: `Customer ${senderId.slice(-4)}`,
                 messageCount: 1,
-                lastActive: new Date().toISOString(),
+                lastActive: nowIso,
+                lastCustomerMessageAt: nowIso,
+                lastMessageId: messageId || null,
                 isPaused,
                 takeover: isPaused,
                 lastMessageText: text || '[Media]'
@@ -1992,8 +2219,21 @@ app.post('/webhook', async (req, res) => {
               customer.messageCount =
                 (customer.messageCount || 0) + 1;
 
-              customer.lastActive = new Date().toISOString();
+              customer.lastActive = nowIso;
+              customer.lastCustomerMessageAt = nowIso;
+              customer.lastMessageId = messageId || null;
               customer.lastMessageText = text || '[Media]';
+            }
+
+            // Keep a persistent customer memory in addition to history.
+            if (text) updateCustomerMemory(senderId, text);
+
+            // A new customer message invalidates the old follow-up.
+            // Schedule a new follow-up only if takeover/order rules allow it.
+            if (!isPaused && !customerHasOrder(senderId)) {
+              scheduleFollowup(senderId, Date.now());
+            } else {
+              cancelFollowup(senderId);
             }
 
             if (!saveStorage()) {
@@ -2032,7 +2272,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // =============================================================================
-// 20. CATALOG ADMIN API
+// 22. CATALOG ADMIN API
 // =============================================================================
 
 app.get('/api/catalog', (req, res) => {
@@ -2134,7 +2374,7 @@ app.post('/api/catalog/refresh', async (req, res) => {
 });
 
 // =============================================================================
-// 21. BOT STATUS AND TAKEOVER APIs
+// 23. BOT STATUS AND TAKEOVER APIs
 // =============================================================================
 
 app.get('/api/bot-status', (req, res) => {
@@ -2151,6 +2391,12 @@ app.get('/api/bot-status', (req, res) => {
 
 app.post('/api/toggle-bot', (req, res) => {
   db.isGlobalPaused = !!req.body.isPaused;
+
+  if (db.isGlobalPaused) {
+    for (const senderId of Object.keys(db.scheduledFollowups)) {
+      cancelFollowup(senderId);
+    }
+  }
 
   const saved = saveStorage();
 
@@ -2232,7 +2478,7 @@ app.post('/api/customers/:senderId/takeover/disable', async (req, res) => {
 });
 
 // =============================================================================
-// 22. CUSTOMERS, MESSAGES AND ORDERS APIs
+// 24. CUSTOMERS, MESSAGES, MEMORY AND ORDERS APIs
 // =============================================================================
 
 app.get('/api/customers', (req, res) => {
@@ -2249,13 +2495,68 @@ app.get('/api/customers', (req, res) => {
     takeover: getTakeoverState(customer.id),
     isPaused: getTakeoverState(customer.id),
     takeoverReason: db.takeovers[customer.id]?.reason || null,
-    takeoverUpdatedAt: db.takeovers[customer.id]?.timestamp || null
+    takeoverUpdatedAt: db.takeovers[customer.id]?.timestamp || null,
+    memoryUpdatedAt: customer.lastMemoryUpdatedAt || null
   }));
 
   res.json({
     success: true,
     total: list.length,
     data: list
+  });
+});
+
+// New API: inspect one customer's saved memory.
+app.get('/api/customers/:senderId/memory', (req, res) => {
+  const senderId = String(req.params.senderId);
+  const memory = db.customerMemory[senderId] || null;
+
+  res.json({
+    success: true,
+    senderId,
+    memory
+  });
+});
+
+// New API: update customer memory from the admin panel.
+app.put('/api/customers/:senderId/memory', (req, res) => {
+  const senderId = String(req.params.senderId);
+  const body = req.body || {};
+  const memory = getCustomerMemory(senderId);
+
+  if (Array.isArray(body.facts)) {
+    memory.facts = body.facts
+      .filter(value => typeof value === 'string')
+      .map(value => value.trim())
+      .filter(Boolean)
+      .slice(-30);
+  }
+
+  if (Array.isArray(body.preferences)) {
+    memory.preferences = body.preferences
+      .filter(value => typeof value === 'string')
+      .map(value => value.trim())
+      .filter(Boolean)
+      .slice(-20);
+  }
+
+  if (typeof body.summary === 'string') {
+    memory.summary = body.summary.slice(0, 3000);
+  }
+
+  memory.updatedAt = new Date().toISOString();
+
+  if (!saveStorage()) {
+    return res.status(500).json({
+      success: false,
+      message: 'Could not save customer memory'
+    });
+  }
+
+  res.json({
+    success: true,
+    senderId,
+    memory
   });
 });
 
@@ -2363,6 +2664,8 @@ app.post('/api/orders', (req, res) => {
     });
   }
 
+  cancelFollowup(senderId);
+
   res.status(201).json({
     success: true,
     order: newOrder
@@ -2381,10 +2684,7 @@ app.get('/api/orders/:orderId', (req, res) => {
     });
   }
 
-  res.json({
-    success: true,
-    order
-  });
+  res.json({ success: true, order });
 });
 
 app.put('/api/orders/:orderId', (req, res) => {
@@ -2417,10 +2717,11 @@ app.put('/api/orders/:orderId', (req, res) => {
     });
   }
 
-  res.json({
-    success: true,
-    order: db.orders[index]
-  });
+  if (customerHasOrder(oldOrder.senderId || oldOrder.customerId)) {
+    cancelFollowup(oldOrder.senderId || oldOrder.customerId);
+  }
+
+  res.json({ success: true, order: db.orders[index] });
 });
 
 app.delete('/api/orders/:orderId', (req, res) => {
@@ -2480,7 +2781,7 @@ app.post('/api/customers/:senderId/send', async (req, res) => {
 });
 
 // =============================================================================
-// 23. HEALTH, STATUS AND MEDIA DIAGNOSTICS
+// 25. HEALTH, STATUS AND MEDIA DIAGNOSTICS
 // =============================================================================
 
 app.get('/health', (req, res) => {
@@ -2515,6 +2816,9 @@ app.get('/api/status', (req, res) => {
     customers: Object.keys(db.customers).length,
     messages: db.messages.length,
     orders: db.orders.length,
+    customerMemories: Object.keys(db.customerMemory).length,
+    pendingFollowups: Object.values(db.scheduledFollowups)
+      .filter(task => task && task.status === 'PENDING').length,
     timestamp: new Date().toISOString()
   });
 });
@@ -2532,11 +2836,14 @@ app.get('/api/catalog/media-status', (req, res) => {
 });
 
 // =============================================================================
-// 24. START SERVER
+// 26. START SERVER
 // =============================================================================
 
 async function startServer() {
   await pullCatalogFromGitHub();
+
+  // Restore scheduled follow-ups from storage after restart.
+  restoreFollowupTasks();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[SERVER] ImpoTech Master Bot running on port ${PORT}`);
@@ -2548,7 +2855,8 @@ async function startServer() {
 
     console.log(`[CONTACT] Helpline: ${HELPLINE}`);
     console.log(`[CONTACT] WhatsApp: ${WHATSAPP_NUMBER}`);
-    console.log(`[MEMORY] Last ${HISTORY_LIMIT} conversation messages`);
+    console.log(`[MEMORY] Last ${HISTORY_LIMIT} messages + persistent customer memory`);
+    console.log('[FOLLOWUP] Scheduled follow-up enabled');
 
     if (catalogMeta.lastSyncError) {
       console.warn('[CATALOG] GitHub warning: ' + catalogMeta.lastSyncError);
@@ -2568,7 +2876,7 @@ startServer().catch(err => {
 });
 
 // =============================================================================
-// 25. DEDUPLICATION CLEANUP
+// 27. CLEANUP AND PERIODIC FOLLOW-UP VALIDATION
 // =============================================================================
 
 setInterval(() => {
@@ -2578,3 +2886,19 @@ setInterval(() => {
     if (timestamp < cutoff) processedMessageIds.delete(id);
   }
 }, 60 * 1000).unref();
+
+// Periodic validation helps remove stale follow-ups and restore overdue tasks.
+setInterval(() => {
+  for (const [senderId, task] of Object.entries(db.scheduledFollowups)) {
+    if (!task || task.status !== 'PENDING') continue;
+
+    if (getTakeoverState(senderId) || customerHasOrder(senderId)) {
+      cancelFollowup(senderId);
+      continue;
+    }
+
+    if (!followupTimers.has(senderId)) {
+      armFollowupTimer(senderId);
+    }
+  }
+}, FOLLOWUP_CHECK_INTERVAL_MS).unref();
