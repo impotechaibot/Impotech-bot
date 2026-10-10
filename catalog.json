@@ -86,8 +86,6 @@
         "fog light",
         "12 lens",
         "5 lens",
-        "দাম",
-        "price",
         "পার্থক্য",
         "brightness",
         "lumen",
@@ -166,13 +164,10 @@
         "angel wings",
         "ডানা লাইট",
         "dana light",
-        "দাম",
-        "price",
         "কালার",
         "color",
         "কোথায় লাগাবো",
-        "side light",
-        "650 taka"
+        "side light"
       ],
       "question": "এঞ্জেল উইংস লাইটের দাম, কালার ও কোথায় লাগানো যায়?"
     },
@@ -203,8 +198,6 @@
         "devil eye",
         "হেডলাইট",
         "headlight",
-        "দাম",
-        "price",
         "60W",
         "1099 taka",
         "warranty",
@@ -324,8 +317,6 @@
         "devil eye",
         "হেডলাইট",
         "headlight",
-        "দাম",
-        "price",
         "60W",
         "1099 taka",
         "warranty",
@@ -502,6 +493,6 @@
       ]
     }
   ],
-  "updatedAt": "2026-10-10T01:36:47Z",
-  "version": 13
+  "updatedAt": "2026-10-10T02:15:56Z",
+  "version": 14
 }
