@@ -1,3 +1,4 @@
+
 'use strict';
 
 /**
@@ -12,19 +13,18 @@
  * ADMIN       : Catalog, customers, messages, orders, bot status
  *
  * FEATURES:
- * - Sales assistant and customer support
+ * - Sales assistant, text, vision and voice support
  * - Last 20 conversation messages in AI context
- * - Conversation history restored from storage_data.json
- * - Motorcycle model/year/H4 compatibility assistance
- * - Ask clarification before handover
- * - Human takeover only for critical cases
- * - Takeover remains enabled until admin turns it off
- * - Messenger duplicate protection
- * - Customer-specific message queue
- * - Price and product media protection
- * - Admin chat send/takeover APIs
+ * - Persistent conversation history
+ * - Motorcycle model/year/H4 compatibility
+ * - Product price and media protection
+ * - Automatic order creation from Messenger
+ * - Automatic per-customer human takeover after order
+ * - Fixed order acknowledgement
+ * - Messenger message deduplication
+ * - Per-customer message queue
  * - GitHub catalog pull/push
- * - Helpline and WhatsApp
+ * - Admin customer/message/order APIs
  * =============================================================================
  */
 
@@ -54,9 +54,7 @@ app.use((req, res, next) => {
     'Content-Type, Authorization, x-admin-secret'
   );
 
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
 
   next();
 });
@@ -92,8 +90,7 @@ const OPENROUTER_URL =
 const TEXT_MODEL =
   process.env.TEXT_MODEL || 'google/gemini-3.1-flash-lite';
 
-const VOICE_MODEL =
-  process.env.VOICE_MODEL || TEXT_MODEL;
+const VOICE_MODEL = process.env.VOICE_MODEL || TEXT_MODEL;
 
 const HELPLINE = '+8809611042598';
 const WHATSAPP_NUMBER = '01884332067';
@@ -122,8 +119,11 @@ const REQUIRE_ADMIN_SECRET =
 
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 
+const ORDER_CONFIRMATION =
+  'আপনার অর্ডারটি গ্রহণ করা হয়েছে। আমাদের প্রতিনিধি শীঘ্রই আপনার অর্ডারটি কনফার্ম করবেন।';
+
 // =============================================================================
-// 3. IN-MEMORY STATE AND FILE STORAGE
+// 3. STATE AND STORAGE
 // =============================================================================
 
 let products = [];
@@ -152,13 +152,11 @@ const customerQueues = new Map();
 function loadStorage() {
   try {
     if (!fs.existsSync(DATA_FILE)) {
-      console.log('[STORAGE] No storage file found; using empty storage');
+      console.log('[STORAGE] No storage file found');
       return;
     }
 
-    const saved = JSON.parse(
-      fs.readFileSync(DATA_FILE, 'utf8')
-    );
+    const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
 
     db = {
       isGlobalPaused: false,
@@ -182,23 +180,18 @@ function loadStorage() {
 
     customerHistory.clear();
 
-    // Restore customer conversation history after restart.
     for (const message of db.messages) {
       const senderId = String(message.senderId || '');
-
       if (!senderId) continue;
 
       let role;
 
       if (
-        message.sender === 'customer' ||
-        message.sender === 'user'
+        ['customer', 'user'].includes(message.sender)
       ) {
         role = 'user';
       } else if (
-        message.sender === 'bot' ||
-        message.sender === 'assistant' ||
-        message.sender === 'admin'
+        ['bot', 'assistant', 'admin'].includes(message.sender)
       ) {
         role = 'assistant';
       } else {
@@ -223,8 +216,8 @@ function loadStorage() {
     }
 
     console.log(
-      `[STORAGE] Restored ${db.messages.length} stored messages; ` +
-      `${customerHistory.size} customer histories`
+      `[STORAGE] Restored ${db.messages.length} messages, ` +
+      `${db.orders.length} orders`
     );
   } catch (err) {
     console.error('[STORAGE] Load error:', err.message);
@@ -273,6 +266,44 @@ function tokenize(value = '') {
   return normalizeText(value)
     .split(/\s+/)
     .filter(word => word.length >= 2);
+}
+
+// =============================================================================
+// 4. CATALOG VALIDATION AND LOADING
+// =============================================================================
+
+function validateCatalogShape(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Catalog must be a JSON object');
+  }
+
+  if (!Array.isArray(data.products)) {
+    throw new Error('Catalog must contain a products array');
+  }
+
+  const ids = new Set();
+
+  for (const product of data.products) {
+    if (!product || typeof product !== 'object') {
+      throw new Error('Every product must be an object');
+    }
+
+    const id = String(product.id ?? '').trim();
+
+    if (!id) throw new Error('Every product must have an ID');
+
+    if (ids.has(id)) {
+      throw new Error('Duplicate product ID: ' + id);
+    }
+
+    ids.add(id);
+  }
+
+  if (data.faqs !== undefined && !Array.isArray(data.faqs)) {
+    throw new Error('Catalog FAQs must be an array');
+  }
+
+  return true;
 }
 
 function applyCatalog(data, source = 'local') {
@@ -338,7 +369,7 @@ loadStorage();
 loadLocalCatalog();
 
 // =============================================================================
-// 4. ADMIN AUTHENTICATION
+// 5. ADMIN AUTHENTICATION
 // =============================================================================
 
 function requireAdmin(req, res, next) {
@@ -382,44 +413,8 @@ app.use('/api', (req, res, next) => {
 });
 
 // =============================================================================
-// 5. CATALOG VALIDATION AND SEARCH
+// 6. PRODUCT AND FAQ SEARCH
 // =============================================================================
-
-function validateCatalogShape(data) {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new Error('Catalog must be a JSON object');
-  }
-
-  if (!Array.isArray(data.products)) {
-    throw new Error('Catalog must contain a products array');
-  }
-
-  const ids = new Set();
-
-  for (const product of data.products) {
-    if (!product || typeof product !== 'object') {
-      throw new Error('Every product must be an object');
-    }
-
-    const id = String(product.id ?? '').trim();
-
-    if (!id) {
-      throw new Error('Every product must have an ID');
-    }
-
-    if (ids.has(id)) {
-      throw new Error('Duplicate product ID: ' + id);
-    }
-
-    ids.add(id);
-  }
-
-  if (data.faqs !== undefined && !Array.isArray(data.faqs)) {
-    throw new Error('Catalog FAQs must be an array');
-  }
-
-  return true;
-}
 
 function scoreRecord(query, record, fields) {
   const q = normalizeText(query);
@@ -496,12 +491,11 @@ function findRelevantFaqs(query) {
 }
 
 // =============================================================================
-// 6. PERSISTENT CONVERSATION HISTORY
+// 7. CONVERSATION HISTORY
 // =============================================================================
 
 function getHistory(senderId) {
   const id = String(senderId || '');
-
   if (!id) return [];
 
   if (customerHistory.has(id)) {
@@ -515,15 +509,10 @@ function getHistory(senderId) {
 
     let role;
 
-    if (
-      message.sender === 'customer' ||
-      message.sender === 'user'
-    ) {
+    if (['customer', 'user'].includes(message.sender)) {
       role = 'user';
     } else if (
-      message.sender === 'bot' ||
-      message.sender === 'assistant' ||
-      message.sender === 'admin'
+      ['bot', 'assistant', 'admin'].includes(message.sender)
     ) {
       role = 'assistant';
     } else {
@@ -565,14 +554,10 @@ function appendHistory(senderId, role, text) {
 }
 
 function getRecentConversationText(senderId, additionalText = '') {
-  const history = getHistory(senderId);
-
   return [
-    ...history.slice(-HISTORY_LIMIT).map(item => item.text),
+    ...getHistory(senderId).slice(-HISTORY_LIMIT).map(item => item.text),
     additionalText
-  ]
-    .filter(Boolean)
-    .join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 function getPreviousAssistantReply(senderId, userText) {
@@ -596,7 +581,7 @@ function getPreviousAssistantReply(senderId, userText) {
 }
 
 // =============================================================================
-// 7. PRICE GUARD
+// 8. PRICE PROTECTION
 // =============================================================================
 
 function isPriceQuestion(text = '') {
@@ -633,7 +618,6 @@ function isGenericPriceQuestion(text = '') {
 
 function findExactProductForPrice(query) {
   const q = normalizeText(query);
-
   if (!q) return null;
 
   const matches = products.filter(product => {
@@ -672,7 +656,7 @@ function getPriceClarificationReply() {
 }
 
 // =============================================================================
-// 8. MOTORCYCLE H4 COMPATIBILITY
+// 9. MOTORCYCLE H4 COMPATIBILITY
 // =============================================================================
 
 function isBikeCompatibilityQuestion(text = '') {
@@ -722,16 +706,12 @@ function identifyBikeModel(text = '') {
       entry.source
     )
     .map(entry => {
-      const aliases = Array.isArray(entry.aliases)
-        ? entry.aliases
-        : [];
+      const aliases = Array.isArray(entry.aliases) ? entry.aliases : [];
 
       const names = [
         `${entry.brand} ${entry.model}`,
         ...aliases
-      ]
-        .map(normalizeText)
-        .filter(Boolean);
+      ].map(normalizeText).filter(Boolean);
 
       const matchedName = names
         .filter(name => value.includes(name))
@@ -752,13 +732,10 @@ function identifyBikeModel(text = '') {
 
   const conflicting = matches.some(item =>
     item.score === best.score &&
-    item.entry.originalH4Socket !==
-      best.entry.originalH4Socket
+    item.entry.originalH4Socket !== best.entry.originalH4Socket
   );
 
-  if (conflicting) return null;
-
-  return best;
+  return conflicting ? null : best;
 }
 
 function getH4CompatibilityReply(match) {
@@ -774,39 +751,30 @@ function getH4CompatibilityReply(match) {
     return null;
   }
 
-  const model =
-    `${entry.brand} ${entry.model}`.trim();
+  const model = `${entry.brand} ${entry.model}`.trim();
 
   if (entry.originalH4Socket) {
     return (
       `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
-      `Original Headlight-এ H4 Socket আছে। ` +
-      `তবে বাইকের উৎপাদন সাল বা Variant আলাদা হলে ` +
-      `সেটি মিলিয়ে নেওয়া প্রয়োজন হতে পারে।`
+      'Original Headlight-এ H4 Socket আছে। তবে বাইকের উৎপাদন সাল ' +
+      'বা Variant আলাদা হলে সেটি মিলিয়ে নেওয়া প্রয়োজন হতে পারে।'
     );
   }
 
   return (
     `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
-    `Original Headlight-এ H4 Socket নেই। ` +
-    `আপনার বাইকের Variant বা Headlight পরিবর্তন করা থাকলে ` +
-    `সেটি জানালে আরও নির্দিষ্টভাবে যাচাই করতে পারব।`
+    'Original Headlight-এ H4 Socket নেই। আপনার বাইকের Variant বা ' +
+    'Headlight পরিবর্তন করা থাকলে সেটি জানালে যাচাই করতে পারব।'
   );
 }
 
 function extractBikeYear(text = '') {
-  const matches = String(text).match(
-    /\b(?:19[89]\d|20[0-3]\d)\b/g
-  );
-
+  const matches = String(text).match(/\b(?:19[89]\d|20[0-3]\d)\b/g);
   return matches ? matches[matches.length - 1] : null;
 }
 
 function customerConfirmedH4(senderId, currentText = '') {
-  const context = getRecentConversationText(
-    senderId,
-    currentText
-  );
+  const context = getRecentConversationText(senderId, currentText);
 
   const hasH4 = /\bh.?4\b/i.test(context);
 
@@ -822,9 +790,8 @@ function getBikeClarificationReply(senderId, text = '') {
 
   if (!year) {
     return (
-      'আপনার বাইকের সঠিক ব্র্যান্ড, মডেল এবং কত সালের মডেল ' +
-      'তা জানাবেন? যেমন: Yamaha FZ, 2022। ' +
-      'এগুলো মিলিয়ে H4 Socket ও সরাসরি ফিট হওয়ার বিষয়টি যাচাই করে জানাব।'
+      'আপনার বাইকের সঠিক ব্র্যান্ড, মডেল এবং কত সালের মডেল জানাবেন? ' +
+      'যেমন: Yamaha FZ, 2022। এগুলো মিলিয়ে H4 Socket ও ফিটমেন্ট যাচাই করে জানাব।'
     );
   }
 
@@ -832,15 +799,13 @@ function getBikeClarificationReply(senderId, text = '') {
 }
 
 // =============================================================================
-// 9. PRODUCT MEDIA
+// 10. PRODUCT MEDIA
 // =============================================================================
 
 function getMediaType(text = '') {
   const value = normalizeText(text);
 
-  if (/ভিডিও|video|রিল|reel|clip/.test(value)) {
-    return 'videos';
-  }
+  if (/ভিডিও|video|রিল|reel|clip/.test(value)) return 'videos';
 
   if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture/.test(value)) {
     return 'images';
@@ -902,9 +867,7 @@ function findProductForMedia(query, senderId) {
     return candidates[0].product;
   }
 
-  const history = getHistory(senderId);
-
-  const previousProductQuery = history
+  const previousProductQuery = getHistory(senderId)
     .filter(item => item.role === 'user')
     .slice(-5)
     .map(item => item.text)
@@ -932,7 +895,6 @@ function findProductForMedia(query, senderId) {
 
 function getProductMediaReply(query, senderId) {
   const mediaType = getMediaType(query);
-
   if (!mediaType) return null;
 
   const product = findProductForMedia(query, senderId);
@@ -947,7 +909,7 @@ function getProductMediaReply(query, senderId) {
     return (
       `দুঃখিত, ${product.name}-এর ` +
       `${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক ` +
-      'বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না। অন্য কোনো পণ্যের তথ্য চাইলে বলুন।'
+      'বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।'
     );
   }
 
@@ -961,7 +923,144 @@ function getProductMediaReply(query, senderId) {
 }
 
 // =============================================================================
-// 10. HUMAN TAKEOVER
+// 11. ORDER INTENT DETECTION AND ORDER STORAGE
+// =============================================================================
+
+function isExplicitOrderIntent(text = '') {
+  const value = normalizeText(text);
+
+  if (!value) return false;
+
+  const patterns = [
+    /\b(i want to order|i would like to order|place my order|order this|i will buy|i want to buy|buy this|confirm my order|i will take it|i want this)\b/i,
+    /\b(order kore din|order korbo|order dibo|order dite chai|order korte chai|kinbo|kine nibo|eta nibo|eta kinbo)\b/i,
+    /অর্ডার করতে চাই|অর্ডার করব|অর্ডার করবো|অর্ডার দিন|অর্ডার করে দিন|অর্ডার দিব|অর্ডার দেব|অর্ডার দিতে চাই|অর্ডার কনফার্ম|কিনতে চাই|কিনব|কিনবো|নিতে চাই|নিব|নেব|পণ্যটি নেব|পণ্যটা নেব|এটা নেব|এটি নেব|এটা কিনব|এটি কিনব|কিনে নেব|কিনে নিব/
+  ];
+
+  return patterns.some(pattern => pattern.test(value));
+}
+
+function identifyOrderedProduct(senderId, customerText) {
+  const exact = findExactProductForPrice(customerText);
+
+  if (exact) return exact;
+
+  const currentMatches = products
+    .map(product => ({
+      product,
+      score: productScore(customerText, product)
+    }))
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (
+    currentMatches.length > 0 &&
+    (
+      currentMatches.length === 1 ||
+      currentMatches[0].score > currentMatches[1].score
+    )
+  ) {
+    return currentMatches[0].product;
+  }
+
+  // Check recent customer messages for a product reference.
+  const history = getHistory(senderId);
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role !== 'user') continue;
+
+    const previousText = history[i].text || '';
+
+    const matches = products
+      .map(product => ({
+        product,
+        score: productScore(previousText, product)
+      }))
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (
+      matches.length > 0 &&
+      (
+        matches.length === 1 ||
+        matches[0].score > matches[1].score
+      )
+    ) {
+      return matches[0].product;
+    }
+  }
+
+  return null;
+}
+
+function createMessengerOrder(senderId, customerText, messageId) {
+  const id = String(senderId || '').trim();
+
+  if (!id) throw new Error('Customer sender ID is required');
+
+  // Prevent duplicate orders after Messenger retries or server restarts.
+  if (messageId) {
+    const existing = db.orders.find(
+      order => order.sourceMessageId === messageId
+    );
+
+    if (existing) {
+      return {
+        order: existing,
+        created: false
+      };
+    }
+  }
+
+  const customer = db.customers[id] || {};
+  const product = identifyOrderedProduct(id, customerText);
+
+  const order = {
+    id: 'order_' + crypto.randomUUID(),
+    senderId: id,
+    customerId: id,
+    customerName:
+      customer.name || `Customer ${id.slice(-4)}`,
+    customerPhone: customer.phone || null,
+    productId: product?.id || null,
+    productName: product?.name || null,
+    productPrice: product?.price ?? null,
+    quantity: 1,
+    customerMessage: String(customerText || '').trim(),
+    source: 'MESSENGER',
+    sourceMessageId: messageId || null,
+    status: 'PENDING_CONFIRMATION',
+    humanTakeover: true,
+    createdAt: new Date().toISOString()
+  };
+
+  db.orders.push(order);
+
+  if (!db.customers[id]) {
+    db.customers[id] = {
+      id,
+      name: `Customer ${id.slice(-4)}`,
+      messageCount: 0,
+      lastActive: new Date().toISOString()
+    };
+  }
+
+  db.customers[id].lastOrderId = order.id;
+  db.customers[id].lastOrderAt = order.createdAt;
+
+  if (!saveStorage()) {
+    db.orders = db.orders.filter(item => item.id !== order.id);
+    throw new Error('Could not persist the customer order');
+  }
+
+  return {
+    order,
+    created: true
+  };
+}
+
+// =============================================================================
+// 12. HUMAN TAKEOVER
 // =============================================================================
 
 function getTakeoverState(customerId) {
@@ -1006,19 +1105,18 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   if (!db.customers[id]) {
     db.customers[id] = {
       id,
-      name: 'Customer ' + id.slice(-4),
-      messageCount: 0,
-      isPaused: isEnabled,
-      takeover: isEnabled,
-      takeoverUpdatedAt: timestamp
+      name: `Customer ${id.slice(-4)}`,
+      messageCount: 0
     };
-  } else {
-    db.customers[id].isPaused = isEnabled;
-    db.customers[id].takeover = isEnabled;
-    db.customers[id].takeoverUpdatedAt = timestamp;
   }
 
-  saveStorage();
+  db.customers[id].isPaused = isEnabled;
+  db.customers[id].takeover = isEnabled;
+  db.customers[id].takeoverUpdatedAt = timestamp;
+
+  if (!saveStorage()) {
+    console.error('[Takeover] Failed to persist state');
+  }
 
   console.log(
     `[Takeover] ${id}: ${isEnabled ? 'PAUSED' : 'ACTIVE'}`
@@ -1028,7 +1126,6 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
 }
 
 async function transferToHuman(senderId, reason, customMessage) {
-  // Persist takeover before sending the notification.
   await setTakeoverState(
     senderId,
     true,
@@ -1038,19 +1135,11 @@ async function transferToHuman(senderId, reason, customMessage) {
   const message = customMessage ||
     `আপনার বিষয়টি আমাদের প্রতিনিধির সহায়তা প্রয়োজন। আমি কথোপকথনটি প্রতিনিধির কাছে হস্তান্তর করছি। এখন থেকে প্রতিনিধি উত্তর দেবেন। জরুরি প্রয়োজনে হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`;
 
-  const sent = await sendFacebookMessage(senderId, message);
-
-  if (!sent) {
-    console.error(
-      `[Takeover] Enabled, but transfer notification failed for ${senderId}`
-    );
-  }
-
-  return sent;
+  return sendFacebookMessage(senderId, message);
 }
 
 // =============================================================================
-// 11. MESSENGER SEND
+// 13. MESSENGER SEND
 // =============================================================================
 
 async function sendFacebookMessage(recipientId, text) {
@@ -1064,10 +1153,7 @@ async function sendFacebookMessage(recipientId, text) {
   if (!finalText) return false;
 
   if (finalText.length > MAX_MESSENGER_TEXT_LENGTH) {
-    console.error(
-      `[Messenger] Message blocked: ${finalText.length} characters`
-    );
-
+    console.error('[Messenger] Message exceeds length limit');
     return false;
   }
 
@@ -1114,7 +1200,7 @@ async function sendFacebookMessage(recipientId, text) {
 }
 
 // =============================================================================
-// 12. GITHUB CATALOG SYNC
+// 14. GITHUB CATALOG SYNC
 // =============================================================================
 
 function replaceCatalogAtomically(catalogData, source = 'admin') {
@@ -1267,7 +1353,7 @@ async function pushCatalogToGitHub(
 }
 
 // =============================================================================
-// 13. SALES ASSISTANT SYSTEM PROMPT
+// 15. AI SYSTEM PROMPT
 // =============================================================================
 
 function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
@@ -1300,81 +1386,34 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history) {
     : 'পূর্ববর্তী কথোপকথন নেই।';
 
   return `
-আপনি ImpoTech BD ফেসবুক পেজের বিক্রয় সহকারী এবং কাস্টমার সাপোর্ট অ্যাসিস্ট্যান্ট।
+আপনি ImpoTech BD ফেসবুক পেজের বিক্রয় সহকারী ও কাস্টমার সাপোর্ট অ্যাসিস্ট্যান্ট।
 
-যোগাযোগ:
 হেল্পলাইন: ${HELPLINE}
 WhatsApp: ${WHATSAPP_NUMBER}
-
-ব্যবসার ঠিকানা:
-ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
+ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
 
 ডেলিভারি:
-গাজীপুরের ভেতরে ৫০ টাকা।
-গাজীপুরের বাইরে ১০০ টাকা।
+- গাজীপুরের ভেতরে ৫০ টাকা।
+- গাজীপুরের বাইরে ১০০ টাকা।
 
-আপনার কাজ:
-- কাস্টমারকে সাহায্য করা এবং বিক্রয় বাড়াতে সহায়তা করা।
-- পণ্যের বৈশিষ্ট্য সহজ ভাষায় বোঝানো।
-- কাস্টমারের প্রয়োজন বুঝে উপযুক্ত পণ্য বেছে নিতে সাহায্য করা।
-- উপযুক্ত হলে কাস্টমার অর্ডার করতে চান কি না জিজ্ঞেস করা।
-- বন্ধুত্বপূর্ণ, ভদ্র, স্বাভাবিক ও বিশ্বাসযোগ্যভাবে কথা বলা।
-- কথোপকথন সংক্ষিপ্ত রাখা; অপ্রয়োজনীয় দীর্ঘ উত্তর না দেওয়া।
-
-বিক্রয় সংক্রান্ত নিয়ম:
-১. কাস্টমার কী খুঁজছেন তা আগে বুঝুন।
-২. প্রাসঙ্গিক পণ্যের সুবিধা বলুন, তবে কেবল উপলভ্য তথ্যের ভিত্তিতে।
-৩. কাস্টমার কিনতে আগ্রহী হলে অর্ডার করার পরবর্তী ধাপ বুঝিয়ে দিন।
-৪. কাস্টমারকে চাপ দেবেন না এবং মিথ্যা জরুরি অবস্থা তৈরি করবেন না।
-৫. দাম ক্যাটালগে থাকলে সেই দাম বলুন। দাম না থাকলে অনুমান করবেন না।
-৬. স্টক, ওয়ারেন্টি, ডেলিভারি সময়, গ্যারান্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
-৭. পণ্যের ID, দাম বা মিডিয়া URL পরিবর্তন করবেন না।
-৮. কাস্টমার কোন পণ্য বোঝাচ্ছেন তা পরিষ্কার না হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
-৯. ক্যাটালগে কোনো তথ্য না থাকলেই Human Takeover চাইবেন না।
-১০. একই প্রশ্ন বারবার করে কাস্টমারকে বিরক্ত করবেন না।
-
-কথোপকথনের স্মৃতি:
-১. নিচে দেওয়া আগের কথোপকথনের সর্বশেষ ২০টি বার্তা বিবেচনা করুন।
-২. কাস্টমার আগে কোন মডেল, সাল, পণ্য বা বাজেট বলেছেন তা মনে রাখুন।
-৩. কাস্টমার ইতিমধ্যে তথ্য দিয়ে থাকলে আবার সেই তথ্য জিজ্ঞেস করবেন না।
-৪. আগের উত্তর ভুল বা অসম্পূর্ণ হলে নতুন তথ্যের ভিত্তিতে সংশোধন করুন।
-৫. একই প্রশ্নের উত্তর হুবহু পুনরাবৃত্তি না করে প্রয়োজন অনুযায়ী পরের ধাপে এগিয়ে যান।
-৬. অ্যাডমিন বা মানব প্রতিনিধি ইতিমধ্যে উত্তর দিয়ে থাকলে সেটিও কথোপকথনের অংশ হিসেবে বিবেচনা করুন।
-
-বাইক, গাড়ি, মডেল ও H4 Socket:
-১. বাইকের ব্র্যান্ড, মডেল, উৎপাদন সাল ও Variant গুরুত্বপূর্ণ হতে পারে।
-২. প্রয়োজনীয় তথ্য না থাকলে প্রথমে মডেল এবং উৎপাদন সাল জানতে চান।
-৩. কাস্টমার যদি ইতিমধ্যে মডেল ও সাল বলে থাকেন, সেগুলো আবার জিজ্ঞেস করবেন না।
-৪. কাস্টমার নিজে বলেন যে তাঁর বাইকে H4 Socket আছে, তাহলে সেই কথাকে বর্তমান কথোপকথনের নিশ্চিত করা তথ্য হিসেবে নিন।
-৫. কাস্টমার নিজে H4 Socket নিশ্চিত করলে অযথা আবার H4 আছে কি না জিজ্ঞেস করবেন না।
-৬. কাস্টমার নিজে Socket নিশ্চিত করলেও পণ্যের Connector, Voltage, Wattage বা অন্য কোনো অপরিহার্য বিষয় নিয়ে তথ্য না থাকলে কেবল সেই নির্দিষ্ট বিষয়টি জিজ্ঞেস করুন।
-৭. সাধারণ জ্ঞান দিয়ে সম্ভাব্য তথ্য ব্যাখ্যা করতে পারেন, কিন্তু অনুমানকে শতভাগ নিশ্চিত তথ্য হিসেবে বলবেন না।
-৮. একই মডেলের বিভিন্ন সাল বা Variant-এ পার্থক্য হতে পারে। তথ্য অস্পষ্ট হলে তা ব্যাখ্যা করে একটি প্রয়োজনীয় প্রশ্ন করুন।
-৯. কাস্টমারের মডেল ও সাল জানা থাকলে সেগুলো ক্যাটালগের যাচাইকৃত তথ্যের সঙ্গে মিলিয়ে দেখুন।
-১০. ক্যাটালগে রেকর্ড না থাকলেই সরাসরি Human Takeover করবেন না।
-১১. নিশ্চিত না হলে কোন তথ্যটি অনিশ্চিত তা পরিষ্কারভাবে বলুন এবং কাস্টমারের কাছে প্রয়োজনীয় তথ্য চান।
-১২. বাইক বা গাড়ির Compatibility নিয়ে উত্তর দিতে গিয়ে অপ্রাসঙ্গিকভাবে প্রতিনিধির কাছে পাঠাবেন না।
-
-Human Takeover:
-১. সাধারণ প্রশ্ন, শুভেচ্ছা, পণ্যের তথ্য, মডেল যাচাই বা সাধারণ অনিশ্চয়তায় Human Takeover করবেন না।
-২. প্রথমে একটি পরিষ্কার প্রশ্ন করে প্রয়োজনীয় তথ্য সংগ্রহের চেষ্টা করুন।
-৩. শুধু দাম, মডেল বা ক্যাটালগের তথ্য না থাকার কারণে Human Takeover করবেন না।
-৪. গুরুতর অভিযোগ, প্রতারণা/নিরাপত্তা-সংক্রান্ত অভিযোগ, সংবেদনশীল অর্ডার বা পেমেন্ট সমস্যা, অথবা মানব প্রতিনিধির সিদ্ধান্ত সত্যিই প্রয়োজন হলে তবেই নিচের মার্কার ব্যবহার করুন।
-৫. প্রযুক্তিগতভাবে উত্তর তৈরি করতে ব্যর্থ হলে আগে একবার পুনরায় চেষ্টা করুন; তবুও সম্ভব না হলে কাস্টমারকে প্রয়োজনীয় তথ্য জিজ্ঞেস করুন।
-৬. সত্যিই মানব সহায়তা প্রয়োজন হলে উত্তরের একেবারে শুরুতে ঠিক এই মার্কার লিখুন:
-${HANDOVER_MARKER}
-৭. মার্কারের পরে এক বাক্যে কারণ লিখুন।
-৮. এই মার্কার কাস্টমারের কাছে পাঠানোর জন্য নয়; ব্যাকএন্ড মার্কার শনাক্ত করে Takeover চালু করবে।
-৯. সাধারণ অনিশ্চয়তার অজুহাতে মার্কার ব্যবহার করবেন না।
-১০. Takeover চালু থাকলে AI উত্তর পাঠাবে না; অ্যাডমিন নিজে চালু না করা পর্যন্ত এই অবস্থা থাকবে।
-
-অন্যান্য নিয়ম:
-- সহজ ও স্বাভাবিক বাংলায় উত্তর দিন।
-- কাস্টমার ইংরেজিতে লিখলে প্রয়োজনমতো ইংরেজিতে উত্তর দিতে পারেন।
-- কোম্পানি সম্পর্কে বানানো তথ্য দেবেন না।
-- কাস্টমারের ব্যক্তিগত তথ্য প্রকাশ করবেন না।
-- পণ্য কেনার সিদ্ধান্ত নিতে সহায়ক বাস্তব তথ্য দিন।
-- ক্যাটালগের তথ্যকে অগ্রাধিকার দিন।
+নিয়ম:
+১. সহজ, স্বাভাবিক ও ভদ্র বাংলায় উত্তর দিন।
+২. কাস্টমার ইংরেজিতে লিখলে ইংরেজিতে উত্তর দিতে পারেন।
+৩. ক্যাটালগের বাইরে দাম, স্টক, ওয়ারেন্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
+৪. পণ্যের দাম কেবল ক্যাটালগ থেকে বলবেন।
+৫. কাস্টমারের প্রশ্ন অস্পষ্ট হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
+৬. শেষ ২০টি বার্তার প্রসঙ্গ মনে রাখুন; একই প্রশ্ন অযথা পুনরায় করবেন না।
+৭. পণ্যের নাম, ID, দাম বা মিডিয়া URL পরিবর্তন করবেন না।
+৮. বিক্রয়ের ক্ষেত্রে কাস্টমারকে চাপ দেবেন না।
+৯. অর্ডারের অনুরোধ শনাক্ত হলে ব্যাকএন্ড সেটি সংরক্ষণ করে Human Takeover চালু করবে। AI নিজে অর্ডার গ্রহণ হয়েছে বলে দাবি করবে না।
+১০. সাধারণ প্রশ্ন বা ক্যাটালগে তথ্য না থাকার কারণে Human Takeover চাইবেন না।
+১১. H4 Compatibility নিশ্চিত না হলে অনুমানকে নিশ্চিত তথ্য হিসেবে বলবেন না।
+১২. বাইকের মডেল, উৎপাদন সাল বা Variant প্রয়োজন হলে জিজ্ঞেস করুন।
+১৩. কাস্টমার নিজে H4 Socket নিশ্চিত করলে একই প্রশ্ন আবার করবেন না।
+১৪. গুরুতর অভিযোগ, নিরাপত্তা বা পেমেন্ট সমস্যা সত্যিই মানব সহায়তা চাইলে উত্তরের শুরুতে ${HANDOVER_MARKER} লিখুন।
+১৫. মার্কারটি কাস্টমারের কাছে পাঠানো হবে না; ব্যাকএন্ড এটি শনাক্ত করবে।
+১৬. Takeover চালু থাকলে AI-এর উত্তর পাঠানো হবে না।
+১৭. কাস্টমারের ব্যক্তিগত তথ্য প্রকাশ করবেন না।
 
 প্রাসঙ্গিক পণ্য:
 ${productContext}
@@ -1388,7 +1427,7 @@ ${historyContext}
 }
 
 // =============================================================================
-// 14. OPENROUTER
+// 16. OPENROUTER AI
 // =============================================================================
 
 async function callOpenRouter(messages, model = TEXT_MODEL) {
@@ -1419,9 +1458,7 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
 
   const choice = response.data?.choices?.[0];
 
-  if (!choice) {
-    throw new Error('OpenRouter returned no response');
-  }
+  if (!choice) throw new Error('OpenRouter returned no response');
 
   let reply = choice.message?.content;
 
@@ -1431,9 +1468,7 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
 
   reply = String(reply || '').trim();
 
-  if (!reply) {
-    throw new Error('OpenRouter returned an empty response');
-  }
+  if (!reply) throw new Error('OpenRouter returned an empty response');
 
   if (choice.finish_reason === 'length') {
     throw new Error('AI response was truncated');
@@ -1442,10 +1477,6 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
   return reply;
 }
 
-// =============================================================================
-// 15. AI TEXT, VISION AND VOICE
-// =============================================================================
-
 async function generateAIResponse(
   customerText,
   attachments = [],
@@ -1453,11 +1484,9 @@ async function generateAIResponse(
 ) {
   const query = customerText || 'ছবিটি বা পাঠানো ফাইলটি দেখে সাহায্য করুন';
 
-  const allHistory = getHistory(senderId);
-  const history = allHistory.slice();
+  const history = getHistory(senderId).slice();
 
-  // Incoming customer message has already been stored.
-  // Avoid sending it twice to the AI.
+  // Incoming customer message is already stored.
   if (
     history.length &&
     history[history.length - 1].role === 'user' &&
@@ -1466,17 +1495,11 @@ async function generateAIResponse(
     history.pop();
   }
 
-  const relevantProducts = findRelevantProducts(
-    getRecentConversationText(senderId, query)
-  );
-
-  const relevantFaqs = findRelevantFaqs(
-    getRecentConversationText(senderId, query)
-  );
+  const context = getRecentConversationText(senderId, query);
 
   const systemPrompt = buildSystemPrompt(
-    relevantProducts,
-    relevantFaqs,
+    findRelevantProducts(context),
+    findRelevantFaqs(context),
     history
   );
 
@@ -1511,9 +1534,7 @@ async function generateAIResponse(
           content: [
             {
               type: 'text',
-              text:
-                'গ্রাহকের ভয়েস বুঝে উত্তর দিন। ' +
-                'প্রয়োজন হলে তাঁর প্রশ্নটি সংক্ষেপে পরিষ্কার করুন।'
+              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় উত্তর দিন।'
             },
             {
               type: 'input_audio',
@@ -1560,8 +1581,8 @@ async function generateAIResponse(
             {
               type: 'text',
               text:
-                `${query}\nছবিটি দেখে প্রাসঙ্গিক পণ্য বা তথ্য শনাক্ত করুন। ` +
-                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করে বলবেন না।'
+                `${query}\nছবিটি দেখে সাহায্য করুন। ` +
+                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করবেন না।'
             },
             {
               type: 'image_url',
@@ -1581,11 +1602,11 @@ async function generateAIResponse(
     { role: 'system', content: systemPrompt },
     ...priorMessages,
     { role: 'user', content: query }
-  ], TEXT_MODEL);
+  ]);
 }
 
 // =============================================================================
-// 16. CRITICAL HANDOVER CLASSIFICATION
+// 17. CRITICAL HANDOVER
 // =============================================================================
 
 function isCriticalHandoverQuestion(text = '') {
@@ -1597,16 +1618,17 @@ function isCriticalHandoverQuestion(text = '') {
 }
 
 // =============================================================================
-// 17. MESSAGE PROCESSING
+// 18. CUSTOMER MESSAGE PROCESSING
 // =============================================================================
 
 async function processCustomerMessage(
   senderId,
   text,
-  attachments = []
+  attachments = [],
+  messageId = null
 ) {
   if (getTakeoverState(senderId)) {
-    console.log(`[Takeover] ${senderId} is paused; skipping AI`);
+    console.log(`[Takeover] ${senderId} paused; AI skipped`);
     return;
   }
 
@@ -1614,7 +1636,57 @@ async function processCustomerMessage(
 
   try {
     // -----------------------------------------------------------------------
-    // 1. Critical issue: transfer directly to a representative.
+    // 1. ORDER INTENT: SAVE ORDER, PAUSE AI, SEND ONE CONFIRMATION
+    // -----------------------------------------------------------------------
+
+    if (isExplicitOrderIntent(customerText)) {
+      const result = createMessengerOrder(
+        senderId,
+        customerText,
+        messageId
+      );
+
+      // If the event was already saved, do not create or acknowledge again.
+      if (!result.created) {
+        await setTakeoverState(
+          senderId,
+          true,
+          `Order already exists: ${result.order.id}`
+        );
+        return;
+      }
+
+      const order = result.order;
+
+      // Enable takeover before sending confirmation.
+      await setTakeoverState(
+        senderId,
+        true,
+        `Automatic takeover after order ${order.id}`
+      );
+
+      console.log(
+        `[ORDER] ${order.id} created for ${senderId}; ` +
+        `product=${order.productName || 'not identified'}`
+      );
+
+      const sent = await sendFacebookMessage(
+        senderId,
+        ORDER_CONFIRMATION
+      );
+
+      if (!sent) {
+        console.error(
+          `[ORDER] ${order.id} saved and takeover enabled, ` +
+          'but confirmation could not be sent'
+        );
+      }
+
+      return;
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Critical issues: transfer to human.
     // -----------------------------------------------------------------------
 
     if (isCriticalHandoverQuestion(customerText)) {
@@ -1628,7 +1700,7 @@ async function processCustomerMessage(
     }
 
     // -----------------------------------------------------------------------
-    // 2. H4 compatibility: use verified catalog information first.
+    // 3. Motorcycle/H4 compatibility.
     // -----------------------------------------------------------------------
 
     if (isBikeCompatibilityQuestion(customerText)) {
@@ -1645,8 +1717,6 @@ async function processCustomerMessage(
         return;
       }
 
-      // If the customer personally confirms H4, do not ask the same
-      // question again. Let AI explain next compatibility requirements.
       if (customerConfirmedH4(senderId, customerText)) {
         const reply = await generateAIResponse(
           customerText,
@@ -1655,7 +1725,6 @@ async function processCustomerMessage(
         );
 
         if (reply.includes(HANDOVER_MARKER)) {
-          // Do not transfer for an ordinary fitment uncertainty.
           await sendFacebookMessage(
             senderId,
             'আপনি জানিয়েছেন যে আপনার বাইকে H4 Socket আছে। এখন পণ্যের মডেল বা Connector-এর তথ্যটি জানালে বাকি Compatibility মিলিয়ে বলতে পারব।'
@@ -1663,12 +1732,13 @@ async function processCustomerMessage(
           return;
         }
 
-        await sendFacebookMessage(senderId, reply);
+        if (!getTakeoverState(senderId)) {
+          await sendFacebookMessage(senderId, reply);
+        }
+
         return;
       }
 
-      // Ask for model/year first instead of sending every question
-      // to the human representative.
       const clarification = getBikeClarificationReply(
         senderId,
         customerText
@@ -1679,9 +1749,6 @@ async function processCustomerMessage(
         return;
       }
 
-      // Model/year may already be in the conversation.
-      // Let the AI use its general knowledge and available catalog context.
-      // Uncertainty alone must not trigger human takeover.
       const bikeReply = await generateAIResponse(
         customerText,
         attachments,
@@ -1691,17 +1758,20 @@ async function processCustomerMessage(
       if (bikeReply.includes(HANDOVER_MARKER)) {
         await sendFacebookMessage(
           senderId,
-          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে আপনার Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন? তাহলে আরও নির্ভুলভাবে সাহায্য করতে পারব।'
+          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে আপনার Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন?'
         );
         return;
       }
 
-      await sendFacebookMessage(senderId, bikeReply);
+      if (!getTakeoverState(senderId)) {
+        await sendFacebookMessage(senderId, bikeReply);
+      }
+
       return;
     }
 
     // -----------------------------------------------------------------------
-    // 3. Product price.
+    // 4. Price questions: always use catalog price.
     // -----------------------------------------------------------------------
 
     if (isPriceQuestion(customerText)) {
@@ -1726,10 +1796,9 @@ async function processCustomerMessage(
       const priceReply = getPriceReply(product);
 
       if (!priceReply) {
-        // Missing price is not, by itself, a critical issue.
         await sendFacebookMessage(
           senderId,
-          `দুঃখিত, ${product.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই। আপনি চাইলে পণ্যটির অন্য তথ্য জানাতে পারি।`
+          `দুঃখিত, ${product.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই।`
         );
         return;
       }
@@ -1739,7 +1808,7 @@ async function processCustomerMessage(
     }
 
     // -----------------------------------------------------------------------
-    // 4. Product media.
+    // 5. Product media requests.
     // -----------------------------------------------------------------------
 
     if (isMediaRequest(customerText)) {
@@ -1755,7 +1824,7 @@ async function processCustomerMessage(
     }
 
     // -----------------------------------------------------------------------
-    // 5. Normal AI sales/support response.
+    // 6. Normal AI response.
     // -----------------------------------------------------------------------
 
     let aiReply = await generateAIResponse(
@@ -1764,11 +1833,8 @@ async function processCustomerMessage(
       senderId
     );
 
-    if (!aiReply) {
-      throw new Error('AI returned an empty response');
-    }
+    if (!aiReply) throw new Error('AI returned an empty response');
 
-    // AI marker is reserved for genuinely critical human support.
     if (aiReply.includes(HANDOVER_MARKER)) {
       const explanation = aiReply
         .replaceAll(HANDOVER_MARKER, '')
@@ -1786,7 +1852,6 @@ async function processCustomerMessage(
         return;
       }
 
-      // If it is not a critical issue, keep helping instead of pausing AI.
       await sendFacebookMessage(
         senderId,
         explanation ||
@@ -1809,7 +1874,7 @@ async function processCustomerMessage(
         'আগের উত্তরে বিষয়টি জানিয়েছি। আপনি চাইলে কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
     }
 
-    // Check takeover immediately before sending.
+    // Do not send AI replies after a takeover has been enabled.
     if (getTakeoverState(senderId)) return;
 
     await sendFacebookMessage(senderId, aiReply);
@@ -1818,8 +1883,6 @@ async function processCustomerMessage(
 
     if (getTakeoverState(senderId)) return;
 
-    // A transient API error should not automatically disable the bot.
-    // Tell the customer briefly and allow later messages to work.
     await sendFacebookMessage(
       senderId,
       'দুঃখিত, এই মুহূর্তে উত্তর তৈরি করতে সমস্যা হচ্ছে। আপনি একটু পরে আবার লিখবেন? জরুরি প্রয়োজনে হেল্পলাইন: ' +
@@ -1832,7 +1895,7 @@ async function processCustomerMessage(
 }
 
 // =============================================================================
-// 18. FACEBOOK WEBHOOK
+// 19. FACEBOOK WEBHOOK
 // =============================================================================
 
 app.get('/webhook', (req, res) => {
@@ -1888,6 +1951,14 @@ app.post('/webhook', async (req, res) => {
         const currentTask = previousTask
           .catch(() => {})
           .then(async () => {
+            // Persistent duplicate guard after a restart.
+            if (
+              messageId &&
+              db.messages.some(item => item.messageId === messageId)
+            ) {
+              return;
+            }
+
             const isPaused = getTakeoverState(senderId);
 
             appendHistory(
@@ -1908,7 +1979,7 @@ app.post('/webhook', async (req, res) => {
             if (!db.customers[senderId]) {
               db.customers[senderId] = {
                 id: senderId,
-                name: 'Customer ' + senderId.slice(-4),
+                name: `Customer ${senderId.slice(-4)}`,
                 messageCount: 1,
                 lastActive: new Date().toISOString(),
                 isPaused,
@@ -1925,7 +1996,9 @@ app.post('/webhook', async (req, res) => {
               customer.lastMessageText = text || '[Media]';
             }
 
-            saveStorage();
+            if (!saveStorage()) {
+              console.error('[Webhook] Failed to persist incoming message');
+            }
 
             if (isPaused) {
               console.log(
@@ -1937,7 +2010,8 @@ app.post('/webhook', async (req, res) => {
             await processCustomerMessage(
               senderId,
               text,
-              attachments
+              attachments,
+              messageId || null
             );
           });
 
@@ -1948,10 +2022,7 @@ app.post('/webhook', async (req, res) => {
             customerQueues.delete(senderId);
           }
         }).catch(err => {
-          console.error(
-            '[Webhook] Customer task failed:',
-            err.message
-          );
+          console.error('[Webhook] Customer task failed:', err.message);
         });
       }
     }
@@ -1961,7 +2032,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // =============================================================================
-// 19. CATALOG ADMIN API
+// 20. CATALOG ADMIN API
 // =============================================================================
 
 app.get('/api/catalog', (req, res) => {
@@ -1992,8 +2063,7 @@ app.post('/api/catalog/sync', async (req, res) => {
     res.json({
       success: true,
       message:
-        `Catalog processed: ${products.length} products, ` +
-        `${faqs.length} FAQs`,
+        `Catalog processed: ${products.length} products, ${faqs.length} FAQs`,
       totalProducts: products.length,
       totalFaqs: faqs.length,
       githubSynced: githubResult.synced,
@@ -2018,8 +2088,7 @@ app.post('/api/github/upload', async (req, res) => {
       githubFilePath
     } = req.body;
 
-    const targetCatalog =
-      catalogPayload || loadLocalCatalog();
+    const targetCatalog = catalogPayload || loadLocalCatalog();
 
     const result = await pushCatalogToGitHub(
       targetCatalog,
@@ -2065,7 +2134,7 @@ app.post('/api/catalog/refresh', async (req, res) => {
 });
 
 // =============================================================================
-// 20. BOT STATUS AND TAKEOVER API
+// 21. BOT STATUS AND TAKEOVER APIs
 // =============================================================================
 
 app.get('/api/bot-status', (req, res) => {
@@ -2083,10 +2152,10 @@ app.get('/api/bot-status', (req, res) => {
 app.post('/api/toggle-bot', (req, res) => {
   db.isGlobalPaused = !!req.body.isPaused;
 
-  saveStorage();
+  const saved = saveStorage();
 
   res.json({
-    success: true,
+    success: saved,
     isGlobalPaused: db.isGlobalPaused
   });
 });
@@ -2101,11 +2170,7 @@ app.post('/api/customers/:senderId/takeover', async (req, res) => {
         ? !!req.body.takeover
         : true;
 
-  await setTakeoverState(
-    senderId,
-    isPaused,
-    req.body.reason
-  );
+  await setTakeoverState(senderId, isPaused, req.body.reason);
 
   res.json({
     success: true,
@@ -2132,7 +2197,6 @@ app.get('/api/customers/:senderId/status', (req, res) => {
   });
 });
 
-// Convenience endpoints for admin chat UI.
 app.post('/api/customers/:senderId/takeover/enable', async (req, res) => {
   const { senderId } = req.params;
 
@@ -2168,19 +2232,20 @@ app.post('/api/customers/:senderId/takeover/disable', async (req, res) => {
 });
 
 // =============================================================================
-// 21. CUSTOMERS, MESSAGES AND ORDERS API
+// 22. CUSTOMERS, MESSAGES AND ORDERS APIs
 // =============================================================================
 
 app.get('/api/customers', (req, res) => {
   const list = Object.values(db.customers).map(customer => ({
     senderId: customer.id,
     displayName:
-      customer.name ||
-      `Customer ${String(customer.id).slice(-4)}`,
+      customer.name || `Customer ${String(customer.id).slice(-4)}`,
     phone: customer.phone || null,
     lastMessageText: customer.lastMessageText || null,
     lastMessageAt: customer.lastActive || null,
     messageCount: customer.messageCount || 0,
+    lastOrderId: customer.lastOrderId || null,
+    lastOrderAt: customer.lastOrderAt || null,
     takeover: getTakeoverState(customer.id),
     isPaused: getTakeoverState(customer.id),
     takeoverReason: db.takeovers[customer.id]?.reason || null,
@@ -2189,6 +2254,7 @@ app.get('/api/customers', (req, res) => {
 
   res.json({
     success: true,
+    total: list.length,
     data: list
   });
 });
@@ -2219,32 +2285,83 @@ app.get('/api/messages', (req, res) => {
 });
 
 app.get('/api/orders', (req, res) => {
+  const status = req.query.status
+    ? String(req.query.status)
+    : null;
+
+  const senderId = req.query.senderId
+    ? String(req.query.senderId)
+    : null;
+
+  let orders = db.orders;
+
+  if (status) {
+    orders = orders.filter(
+      order => String(order.status) === status
+    );
+  }
+
+  if (senderId) {
+    orders = orders.filter(
+      order => String(order.senderId || order.customerId) === senderId
+    );
+  }
+
   res.json({
     success: true,
-    total: db.orders.length,
-    data: db.orders
+    total: orders.length,
+    data: orders.slice().reverse()
   });
 });
 
 app.post('/api/orders', (req, res) => {
   const order = req.body || {};
 
-  if (!order.senderId && !order.customerId) {
+  const senderId = String(
+    order.senderId || order.customerId || ''
+  ).trim();
+
+  if (!senderId) {
     return res.status(400).json({
       success: false,
       message: 'senderId or customerId is required'
     });
   }
 
+  if (
+    order.sourceMessageId &&
+    db.orders.some(item =>
+      item.sourceMessageId === order.sourceMessageId
+    )
+  ) {
+    return res.status(200).json({
+      success: true,
+      duplicate: true,
+      order: db.orders.find(item =>
+        item.sourceMessageId === order.sourceMessageId
+      )
+    });
+  }
+
   const newOrder = {
     ...order,
+    senderId,
+    customerId: senderId,
     id: order.id || 'order_' + crypto.randomUUID(),
     status: order.status || 'PENDING',
     createdAt: order.createdAt || new Date().toISOString()
   };
 
   db.orders.push(newOrder);
-  saveStorage();
+
+  if (!saveStorage()) {
+    db.orders = db.orders.filter(item => item.id !== newOrder.id);
+
+    return res.status(500).json({
+      success: false,
+      message: 'Could not save order'
+    });
+  }
 
   res.status(201).json({
     success: true,
@@ -2282,14 +2399,23 @@ app.put('/api/orders/:orderId', (req, res) => {
     });
   }
 
+  const oldOrder = db.orders[index];
+
   db.orders[index] = {
-    ...db.orders[index],
+    ...oldOrder,
     ...req.body,
-    id: db.orders[index].id,
+    id: oldOrder.id,
     updatedAt: new Date().toISOString()
   };
 
-  saveStorage();
+  if (!saveStorage()) {
+    db.orders[index] = oldOrder;
+
+    return res.status(500).json({
+      success: false,
+      message: 'Could not update order'
+    });
+  }
 
   res.json({
     success: true,
@@ -2311,7 +2437,14 @@ app.delete('/api/orders/:orderId', (req, res) => {
 
   const removed = db.orders.splice(index, 1)[0];
 
-  saveStorage();
+  if (!saveStorage()) {
+    db.orders.splice(index, 0, removed);
+
+    return res.status(500).json({
+      success: false,
+      message: 'Could not delete order'
+    });
+  }
 
   res.json({
     success: true,
@@ -2319,7 +2452,7 @@ app.delete('/api/orders/:orderId', (req, res) => {
   });
 });
 
-// Admin sends a message from the chat UI.
+// Admin sends a message from the admin chat UI.
 app.post('/api/customers/:senderId/send', async (req, res) => {
   const { senderId } = req.params;
   const { text } = req.body || {};
@@ -2347,7 +2480,7 @@ app.post('/api/customers/:senderId/send', async (req, res) => {
 });
 
 // =============================================================================
-// 22. HEALTH AND DIAGNOSTICS
+// 23. HEALTH, STATUS AND MEDIA DIAGNOSTICS
 // =============================================================================
 
 app.get('/health', (req, res) => {
@@ -2379,6 +2512,9 @@ app.get('/api/status', (req, res) => {
     helpline: HELPLINE,
     whatsapp: WHATSAPP_NUMBER,
     historyLimit: HISTORY_LIMIT,
+    customers: Object.keys(db.customers).length,
+    messages: db.messages.length,
+    orders: db.orders.length,
     timestamp: new Date().toISOString()
   });
 });
@@ -2396,16 +2532,14 @@ app.get('/api/catalog/media-status', (req, res) => {
 });
 
 // =============================================================================
-// 23. START SERVER
+// 24. START SERVER
 // =============================================================================
 
 async function startServer() {
   await pullCatalogFromGitHub();
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `[SERVER] ImpoTech Master Bot running on port ${PORT}`
-    );
+    console.log(`[SERVER] ImpoTech Master Bot running on port ${PORT}`);
 
     console.log(
       `[CATALOG] ${products.length} products, ` +
@@ -2417,16 +2551,12 @@ async function startServer() {
     console.log(`[MEMORY] Last ${HISTORY_LIMIT} conversation messages`);
 
     if (catalogMeta.lastSyncError) {
-      console.warn(
-        '[CATALOG] GitHub warning: ' +
-        catalogMeta.lastSyncError
-      );
+      console.warn('[CATALOG] GitHub warning: ' + catalogMeta.lastSyncError);
     }
 
     if (!ADMIN_SECRET && REQUIRE_ADMIN_SECRET) {
       console.error(
-        '[SECURITY] ADMIN_SECRET is missing. ' +
-        'Admin API requests will be rejected.'
+        '[SECURITY] ADMIN_SECRET is missing. Admin API requests will be rejected.'
       );
     }
   });
@@ -2438,15 +2568,13 @@ startServer().catch(err => {
 });
 
 // =============================================================================
-// 24. CLEANUP
+// 25. DEDUPLICATION CLEANUP
 // =============================================================================
 
 setInterval(() => {
   const cutoff = Date.now() - DUPLICATE_WINDOW_MS;
 
   for (const [id, timestamp] of processedMessageIds) {
-    if (timestamp < cutoff) {
-      processedMessageIds.delete(id);
-    }
+    if (timestamp < cutoff) processedMessageIds.delete(id);
   }
 }, 60 * 1000).unref();
