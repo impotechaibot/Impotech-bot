@@ -494,7 +494,7 @@
         "ফিটিং: Universal (সব মোটরসাইকেল ও স্কুটারে সহজে ফিট হয়)",
         "ডিউরেবিলিটি: Waterproof \u0026 Dustproof"
       ],
-      "stockStatus": "IN_STOCK",
+      "stockStatus": "OUT_OF_STOCK",
       "tags": [
         "Angel_Wings",
         "Eagle_Light",
@@ -506,6 +506,6 @@
       ]
     }
   ],
-  "updatedAt": "2026-10-10T02:33:04Z",
-  "version": 16
+  "updatedAt": "2026-10-10T11:16:25Z",
+  "version": 17
 }
