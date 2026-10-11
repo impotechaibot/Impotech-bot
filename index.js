@@ -286,8 +286,6 @@ function tokenize(value = '') {
 // 4. PERSISTENT CUSTOMER MEMORY
 // =============================================================================
 
-// Memory is intentionally conservative: store customer-provided facts and
-// preferences, not guesses. Full message history remains available separately.
 function getCustomerMemory(senderId) {
   const id = String(senderId || '');
   if (!id) return null;
@@ -336,7 +334,6 @@ function updateCustomerMemory(senderId, customerText) {
   const memory = getCustomerMemory(senderId);
   const customer = db.customers[String(senderId)] || {};
 
-  // Save explicit product/model context, without inventing a match.
   const matchedProducts = products
     .map(product => ({
       product,
@@ -358,7 +355,6 @@ function updateCustomerMemory(senderId, customerText) {
     );
   }
 
-  // Only retain phone numbers when the customer explicitly provides one.
   const phoneMatch = text.match(
     /(?:\+?8801|01)[0-9\s-]{8,14}/
   );
@@ -380,7 +376,6 @@ function updateCustomerMemory(senderId, customerText) {
     if (match) addUniqueMemoryItem(memory.preferences, match[0], 20);
   }
 
-  // Keep a bounded, durable summary of recent customer-provided information.
   if (text.length >= 8 && !/^(হ্যাঁ|না|ok|okay|ধন্যবাদ|thanks)$/i.test(text)) {
     memory.summary = [
       memory.summary,
@@ -735,8 +730,6 @@ function getProductIdentifiers(product) {
     .filter(Boolean);
 }
 
-// Match a product only when a full identifier is present. A partial name
-// or one common token must not be enough to disclose the wrong price.
 function findExactProductForPrice(query) {
   const q = normalizeText(query);
   if (!q) return null;
@@ -765,7 +758,6 @@ function findExactProductForPrice(query) {
     if (matched) matches.push(product);
   }
 
-  // If identifiers collide across products, do not guess.
   return matches.length === 1 ? matches[0] : null;
 }
 
@@ -809,22 +801,477 @@ function getPriceClarificationReply() {
 }
 
 // =============================================================================
-// 10. MOTORCYCLE H4 COMPATIBILITY
+// 10. MOTORCYCLE H4 / HS1 / 3-PIN LED HEADLIGHT COMPATIBILITY
 // =============================================================================
+
+// -----------------------------------------------------------------------------
+// 10.1 BUILT-IN BIKE DATABASE
+// -----------------------------------------------------------------------------
+// H4 এবং HS1 — দুটোই P43t/PX43t সকেট ব্যবহার করে, তাই দুটোতেই ৩-পিন LED
+// হেডলাইট সরাসরি plug-and-play হিসেবে বসে। ImpoTech শুধু LED হেডলাইট বিক্রি
+// করে, তাই স্টক বাল্ব H4 হোক বা HS1 — উভয় ক্ষেত্রেই আমাদের LED fit হবে।
+
+const BUILTIN_BIKE_DATABASE = [
+  // -------- YAMAHA --------
+  {
+    brand: 'Yamaha',
+    model: 'FZ',
+    aliases: ['fz', 'fz-s', 'fz s', 'fz16', 'fz 16', 'fz v2', 'fz v3', 'fz-s v2', 'fz-s v3', 'fzs'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Yamaha',
+    model: 'FZ25',
+    aliases: ['fz25', 'fz 25', 'fz-25'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Yamaha',
+    model: 'Fazer',
+    aliases: ['fazer', 'fz-s fazer', 'fazer 150'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Yamaha',
+    model: 'R15',
+    aliases: ['r15', 'r 15', 'r15 v2', 'r15 v3', 'r15 v4', 'r15m'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Yamaha',
+    model: 'MT-15',
+    aliases: ['mt 15', 'mt-15', 'mt15'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Yamaha',
+    model: 'Saluto',
+    aliases: ['saluto', 'saluto 125'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Yamaha',
+    model: 'SZ-RR',
+    aliases: ['sz-rr', 'sz rr', 'szrr', 'sz-r'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+
+  // -------- BAJAJ --------
+  {
+    brand: 'Bajaj',
+    model: 'Pulsar 150',
+    aliases: ['pulsar 150', 'pulsar150', 'p150', 'pulsar 150 twin disc', 'pulsar 150 neon'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Bajaj',
+    model: 'Pulsar 180',
+    aliases: ['pulsar 180', 'pulsar180', 'p180'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Bajaj',
+    model: 'Pulsar 220',
+    aliases: ['pulsar 220', 'pulsar220', 'p220', 'pulsar 220f'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Bajaj',
+    model: 'Pulsar NS200',
+    aliases: ['pulsar ns200', 'ns 200', 'ns200', 'pulsar 200ns', 'pulsar ns 200'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Bajaj',
+    model: 'Pulsar RS200',
+    aliases: ['pulsar rs200', 'rs200', 'rs 200'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Bajaj',
+    model: 'Avenger',
+    aliases: ['avenger', 'avenger 150', 'avenger 220', 'avenger street 150', 'avenger street 220', 'avenger cruise'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Bajaj',
+    model: 'Discover',
+    aliases: ['discover', 'discover 125', 'discover 135', 'discover 150'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Bajaj',
+    model: 'Platina',
+    aliases: ['platina', 'platina 100', 'platina 110'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+
+  // -------- TVS --------
+  {
+    brand: 'TVS',
+    model: 'Apache RTR 160',
+    aliases: ['apache rtr 160', 'apache 160', 'rtr 160', 'rtr160', 'apache rtr160', 'apache rtr 160 2v', 'apache rtr 160 4v'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'TVS',
+    model: 'Apache RTR 180',
+    aliases: ['apache rtr 180', 'apache 180', 'rtr 180', 'rtr180'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'TVS',
+    model: 'Apache RTR 200',
+    aliases: ['apache rtr 200', 'apache 200', 'rtr 200', 'rtr200', 'apache rtr 200 4v'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'TVS',
+    model: 'Apache RR 310',
+    aliases: ['apache rr 310', 'rr 310', 'rr310'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'TVS',
+    model: 'Raider',
+    aliases: ['raider', 'raider 125'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'TVS',
+    model: 'Metro',
+    aliases: ['metro', 'tvs metro'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+
+  // -------- HERO --------
+  {
+    brand: 'Hero',
+    model: 'Splendor',
+    aliases: ['splendor', 'splendor plus', 'splendor pro', 'splendor ismart', 'splendor+', 'splendor +'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Hero',
+    model: 'Passion',
+    aliases: ['passion', 'passion pro', 'passion xpro', 'passion plus'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Hero',
+    model: 'HF Deluxe',
+    aliases: ['hf deluxe', 'hf-deluxe', 'hf'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Hero',
+    model: 'Hunk',
+    aliases: ['hunk', 'hunk 150'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Hero',
+    model: 'Xtreme',
+    aliases: ['xtreme', 'xtreme 150', 'xtreme 160r', 'xtreme 200r', 'xtreme 200s'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Hero',
+    model: 'Glamour',
+    aliases: ['glamour', 'glamour 125', 'glamour fi'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Hero',
+    model: 'Karizma',
+    aliases: ['karizma', 'karizma r', 'karizma zmar', 'karizma zmr'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+
+  // -------- HONDA --------
+  {
+    brand: 'Honda',
+    model: 'CB Shine',
+    aliases: ['cb shine', 'cbshine', 'shine', 'cb shine sp', 'shine sp'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Honda',
+    model: 'CB Unicorn',
+    aliases: ['cb unicorn', 'unicorn', 'unicorn 160', 'cb unicorn 160'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Honda',
+    model: 'Hornet',
+    aliases: ['hornet', 'hornet 160r', 'cb hornet', 'cb hornet 160r'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Honda',
+    model: 'CBR',
+    aliases: ['cbr', 'cbr 150', 'cbr 250', 'cbr150r', 'cbr250r'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Honda',
+    model: 'Livo',
+    aliases: ['livo', 'livo 110'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Honda',
+    model: 'Dream Yuga',
+    aliases: ['dream yuga', 'yuga'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Honda',
+    model: 'SP 125',
+    aliases: ['sp 125', 'sp125'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+
+  // -------- SUZUKI --------
+  {
+    brand: 'Suzuki',
+    model: 'Gixxer',
+    aliases: ['gixxer', 'gixxer 150', 'gixxer 155', 'gixxer sf', 'gixxer sf 150', 'gixxer sf 250'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Suzuki',
+    model: 'GS150R',
+    aliases: ['gs150r', 'gs 150r', 'gs150'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Suzuki',
+    model: 'Access',
+    aliases: ['access', 'access 125'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Suzuki',
+    model: 'Burgman',
+    aliases: ['burgman', 'burgman street', 'burgman 125'],
+    stockBulbType: 'HS1',
+    socketType: 'PX43t',
+    ledPlugAndPlay: true
+  },
+
+  // -------- KTM --------
+  {
+    brand: 'KTM',
+    model: 'Duke 125',
+    aliases: ['duke 125', 'duke125'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'KTM',
+    model: 'Duke 200',
+    aliases: ['duke 200', 'duke200', 'duke 200 ng'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'KTM',
+    model: 'Duke 390',
+    aliases: ['duke 390', 'duke390'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'KTM',
+    model: 'RC 200',
+    aliases: ['rc 200', 'rc200'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+
+  // -------- ROYAL ENFIELD --------
+  {
+    brand: 'Royal Enfield',
+    model: 'Classic 350',
+    aliases: ['classic 350', 'classic350', 're classic'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Royal Enfield',
+    model: 'Bullet 350',
+    aliases: ['bullet 350', 'bullet350', 're bullet'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  },
+  {
+    brand: 'Royal Enfield',
+    model: 'Hunter 350',
+    aliases: ['hunter 350', 'hunter350'],
+    stockBulbType: 'H4',
+    socketType: 'P43t',
+    ledPlugAndPlay: true
+  }
+];
+
+// -----------------------------------------------------------------------------
+// 10.2 H4-সামঞ্জস্যপূর্ণ ৩-পিন বাল্ব মডেল (কাস্টমার সরাসরি নাম বললে)
+// -----------------------------------------------------------------------------
+
+const H4_COMPATIBLE_THREE_PIN_MODELS = [
+  { keys: ['h4', 'h 4', 'h-4'], name: 'H4', label: 'H4 (স্ট্যান্ডার্ড, ৬০/৫৫W)' },
+  { keys: ['9003', 'hb2'], name: '9003 / HB2', label: '9003 / HB2 (H4-এর উত্তর আমেরিকান নাম)' },
+  { keys: ['hs1', 'hs 1', 'hs-1'], name: 'HS1', label: 'HS1 (মোটরসাইকেলের ৩৫/৩৫W সংস্করণ)' }
+];
+
+// H4 সকেটে সরাসরি বসে না — আলাদা অ্যাডাপ্টার দরকার
+const NON_COMPATIBLE_BULB_MODELS = [
+  { keys: ['h6m', 'h 6m', 'h6'], name: 'H6M' },
+  { keys: ['h7', 'h 7', 'h-7'], name: 'H7' },
+  { keys: ['h11', 'h 11'], name: 'H11' },
+  { keys: ['h13', 'h 13'], name: 'H13' },
+  { keys: ['h1', 'h-1'], name: 'H1' },
+  { keys: ['h3', 'h-3'], name: 'H3' }
+];
+
+// -----------------------------------------------------------------------------
+// 10.3 DETECTION HELPERS
+// -----------------------------------------------------------------------------
 
 function isBikeCompatibilityQuestion(text = '') {
   const value = normalizeText(text);
 
   const hasLightingTerm =
-    /h4|devil eye|headlight|head lamp|headlamp|হেডলাইট|হেড লাইট|plug and play|প্লাগ অ্যান্ড প্লে|socket|সকেট|বাল্ব|bulb/.test(value);
+    /h\s*-?\s*[0-9]+|9003|hb2|hs\s*-?\s*1|devil\s*eye|headlight|head\s*lamp|হেডলাইট|হেড\s*লাইট|plug\s*and\s*play|প্লাগ\s*অ্যান্ড\s*প্লে|socket|সকেট|ক্লার|clearance|বাল্ব|bulb|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন/.test(value);
 
   const hasBikeTerm =
-    /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট/.test(value);
+    /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট|পিন|pin|লাগবে|lagbe/.test(value);
 
   return hasLightingTerm && hasBikeTerm;
 }
 
-function getBikeCompatibilityEntries() {
+function detectH4CompatibleThreePinModels(text = '') {
+  const value = normalizeText(text);
+  const detected = [];
+
+  for (const item of H4_COMPATIBLE_THREE_PIN_MODELS) {
+    const found = item.keys.some(key => {
+      const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = new RegExp(
+        `(^|\\s)${escaped.replace(/\s+/g, '\\s*')}(?=\\s|$)`,
+        'i'
+      );
+      return pattern.test(value);
+    });
+    if (found) detected.push(item);
+  }
+
+  return detected;
+}
+
+function detectNonCompatibleBulbModels(text = '') {
+  const value = normalizeText(text);
+  const detected = [];
+
+  for (const item of NON_COMPATIBLE_BULB_MODELS) {
+    const found = item.keys.some(key => {
+      const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = new RegExp(
+        `(^|\\s)${escaped.replace(/\s+/g, '\\s*')}(?=\\s|$)`,
+        'i'
+      );
+      return pattern.test(value);
+    });
+    if (found) detected.push(item);
+  }
+
+  return detected;
+}
+
+function getAllBikeCompatibilityEntries() {
   const entries = [];
 
   for (const product of products) {
@@ -843,29 +1290,61 @@ function getBikeCompatibilityEntries() {
     }
   }
 
+  for (const item of BUILTIN_BIKE_DATABASE) {
+    entries.push({
+      brand: item.brand,
+      model: item.model,
+      aliases: item.aliases,
+      originalH4Socket: true,
+      stockBulbType: item.stockBulbType,
+      socketType: item.socketType,
+      ledPlugAndPlay: item.ledPlugAndPlay,
+      verified: true,
+      source: 'built-in-database'
+    });
+  }
+
   return entries;
 }
 
 function identifyBikeModel(text = '') {
   const value = normalizeText(text);
 
-  const matches = getBikeCompatibilityEntries()
+  const directPin = detectH4CompatibleThreePinModels(text);
+
+  if (directPin.length) {
+    return {
+      entry: {
+        brand: 'বাল্ব মডেল',
+        model: directPin.map(item => item.name).join(' / '),
+        originalH4Socket: true,
+        stockBulbType: directPin[0].name,
+        socketType: 'P43t / PX43t',
+        ledPlugAndPlay: true,
+        verified: true,
+        source: 'direct-bulb-name'
+      },
+      matchedName: directPin[0].name,
+      score: 200,
+      directBulb: true
+    };
+  }
+
+  const matches = getAllBikeCompatibilityEntries()
     .filter(entry =>
       entry &&
       entry.verified === true &&
-      typeof entry.originalH4Socket === 'boolean' &&
       entry.brand &&
-      entry.model &&
-      entry.source
+      entry.model
     )
     .map(entry => {
       const aliases = Array.isArray(entry.aliases) ? entry.aliases : [];
-      const names = [`${entry.brand} ${entry.model}`, ...aliases]
+      const names = [`${entry.brand} ${entry.model}`, entry.model, ...aliases]
         .map(normalizeText)
         .filter(Boolean);
 
       const matchedName = names
-        .filter(name => value.includes(name))
+        .filter(name => name.length >= 3 && value.includes(name))
         .sort((a, b) => b.length - a.length)[0];
 
       return {
@@ -879,42 +1358,57 @@ function identifyBikeModel(text = '') {
 
   if (!matches.length) return null;
 
-  const best = matches[0];
-
-  const conflicting = matches.some(item =>
-    item.score === best.score &&
-    item.entry.originalH4Socket !== best.entry.originalH4Socket
-  );
-
-  return conflicting ? null : best;
+  return matches[0];
 }
 
-function getH4CompatibilityReply(match) {
-  if (!match?.entry) return null;
+function getH4CompatibilityReply(match, customerText = '') {
+  const nonCompatible = detectNonCompatibleBulbModels(customerText);
 
-  const entry = match.entry;
-
-  if (
-    entry.verified !== true ||
-    typeof entry.originalH4Socket !== 'boolean' ||
-    !entry.source
-  ) {
-    return null;
-  }
-
-  const model = `${entry.brand} ${entry.model}`.trim();
-
-  if (entry.originalH4Socket) {
+  if (nonCompatible.length) {
+    const names = nonCompatible.map(item => item.name).join(', ');
     return (
-      `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
-      'Original Headlight-এ H4 Socket আছে। Variant বা উৎপাদন সাল আলাদা হলে সেটিও মিলিয়ে নেওয়া প্রয়োজন।'
+      `${names} বাল্বের বেস H4/HS1 সকেটের সাথে সরাসরি মেলে না। ` +
+      'এই বাল্ব লাগাতে হলে আলাদা অ্যাডাপ্টার বা হেডলাইট মডিফিকেশন লাগবে। ' +
+      'তবে আমাদের LED হেডলাইট H4/HS1 বেসে আসে, তাই এগুলো সরাসরি plug-and-play হবে।'
     );
   }
 
-  return (
-    `ক্যাটালগের যাচাইকৃত তথ্য অনুযায়ী ${model}-এর ` +
-    'Original Headlight-এ H4 Socket নেই। Variant বা Headlight পরিবর্তন করা থাকলে সেটি জানালে যাচাই করতে পারব।'
-  );
+  const detectedModels = detectH4CompatibleThreePinModels(customerText);
+
+  if (detectedModels.length) {
+    const modelList = detectedModels.map(item => `• ${item.label}`).join('\n');
+    return (
+      'আপনি যে মডেলটি বলেছেন সেটি H4 সকেটের সাথে সম্পূর্ণ সামঞ্জস্যপূর্ণ। ' +
+      'H4 সকেট (P43t) ৩-পিন plug-and-play সমর্থন করে। ' +
+      'আমাদের LED হেডলাইট সরাসরি আপনার বাইকের সকেটে বসবে — কোনো অ্যাডাপ্টার বা কাটাকাটি লাগবে না।\n' +
+      modelList
+    );
+  }
+
+  if (!match?.entry) return null;
+
+  const entry = match.entry;
+  const model = `${entry.brand} ${entry.model}`.trim();
+
+  if (entry.ledPlugAndPlay !== false && (entry.originalH4Socket === true || entry.socketType)) {
+    const stockType = entry.stockBulbType || 'H4';
+    const socketType = entry.socketType || 'P43t';
+
+    return (
+      `হ্যাঁ, আপনার ${model}-এ ${stockType} স্টক হেডলাইট আছে, সকেট টাইপ ${socketType}। ` +
+      'এই সকেটে ৩-পিন LED হেডলাইট সরাসরি plug-and-play হিসেবে ফিট হবে — ' +
+      'কোনো অ্যাডাপ্টার, কাটাকাটি বা ওয়্যারিং পরিবর্তন লাগবে না।'
+    );
+  }
+
+  if (entry.originalH4Socket === false) {
+    return (
+      `দুঃখিত, ক্যাটালগ অনুযায়ী ${model}-এর স্টক হেডলাইটে H4/HS1 সকেট নেই। ` +
+      'তবে আপনার বাইকে আগে থেকে হেডলাইট পরিবর্তন করা থাকলে সেটি জানালে মিলিয়ে বলতে পারব।'
+    );
+  }
+
+  return null;
 }
 
 function extractBikeYear(text = '') {
@@ -923,23 +1417,38 @@ function extractBikeYear(text = '') {
 }
 
 function customerConfirmedH4(senderId, currentText = '') {
-  const context = getRecentConversationText(senderId, currentText);
-  const hasH4 = /\bh.?4\b/i.test(context);
+  const context = normalizeText(
+    getRecentConversationText(senderId, currentText)
+  );
+
+  const hasH4Socket =
+    /(^|\s)h\s*-?\s*4(\s|$)/.test(context) ||
+    /(^|\s)9003(\s|$)/.test(context) ||
+    /(^|\s)hb2(\s|$)/.test(context) ||
+    /(^|\s)hs\s*-?\s*1(\s|$)/.test(context);
+
+  const hasThreePin =
+    /(^|\s)3\s*-?\s*pin(\s|$)/.test(context) ||
+    /তিন\s*পিন|৩\s*পিন|three\s*-?\s*pin/.test(context);
 
   const confirmation =
-    /আমার বাইকে h.?4 আছে|আমার বাইকে h.?4 সকেট আছে|বাইকে h.?4 socket আছে|h.?4 সকেট আছে|h.?4 socket আছে|already h.?4|it has h.?4|my bike has h.?4/i;
+    /আমার বাইকে|my bike has|বাইকে আছে|সকেট আছে|socket আছে|পিন আছে|pin আছে|fit হবে|ফিট হবে|plug and play|প্লাগ অ্যান্ড প্লে/;
 
-  return hasH4 && confirmation.test(context);
+  return (hasH4Socket || hasThreePin) && confirmation.test(context);
 }
 
 function getBikeClarificationReply(senderId, text = '') {
   const context = getRecentConversationText(senderId, text);
+
+  const bikeMatch = identifyBikeModel(context);
+  if (bikeMatch) return null;
+
   const year = extractBikeYear(context);
 
   if (!year) {
     return (
-      'আপনার বাইকের সঠিক ব্র্যান্ড, মডেল এবং কত সালের মডেল জানাবেন? ' +
-      'যেমন: Yamaha FZ, 2022। এগুলো মিলিয়ে H4 Socket ও ফিটমেন্ট যাচাই করে জানাব।'
+      'আপনার বাইকের ব্র্যান্ড ও মডেল জানাবেন? যেমন: Yamaha FZ, Bajaj Pulsar 150, TVS Apache, Honda CB Shine। ' +
+      'মডেল জানলে আমি সকেট টাইপ মিলিয়ে বলতে পারব আমাদের LED হেডলাইট plug-and-play হিসেবে ফিট হবে কিনা।'
     );
   }
 
@@ -1032,7 +1541,7 @@ function getProductMediaReply(query, senderId) {
   if (!urls.length) {
     return (
       `দুঃখিত, ${product.name}-এর ` +
-      `${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`
+      `${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`
     );
   }
 
@@ -1218,7 +1727,7 @@ async function transferToHuman(senderId, reason, customMessage) {
   );
 
   const message = customMessage ||
-    `আপনার বিষয়টি আমাদের প্রতিনিধির সহায়তা প্রয়োজন। আমি কথোপকথনটি প্রতিনিধির কাছে হস্তান্তর করছি। এখন থেকে প্রতিনিধি উত্তর দেবেন। জরুরি প্রয়োজনে হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`;
+    `আপনার বিষয়টি আমাদের প্রতিনিধির সহায়তা প্রয়োজন। আমি কথোপকথনটি প্রতিনিধির কাছে হস্তান্তর করছি। এখন থেকে প্রতিনিধি উত্তর দেবেন। জরুরি প্রয়োজনে হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`;
 
   return sendFacebookMessage(senderId, message);
 }
@@ -1293,14 +1802,11 @@ async function sendFacebookMessage(recipientId, text) {
 
     return false;
   }
-  }
+}
+
 // =============================================================================
 // 15. AUTOMATIC FOLLOW-UP SCHEDULER
 // =============================================================================
-
-// Follow-ups are persisted so pending tasks can be restored after a restart.
-// A follow-up is sent only if the customer has not messaged again, no order
-// exists, takeover is inactive, and the standard messaging window is valid.
 
 function cancelFollowup(senderId) {
   const id = String(senderId || '');
@@ -1398,8 +1904,6 @@ async function executeFollowup(senderId) {
     customer.lastCustomerMessageAt || customer.lastActive || 0
   ).getTime();
 
-  // Do not send outside the standard 24-hour customer-service window.
-  // If the saved timestamp is missing or invalid, fail closed.
   if (
     !Number.isFinite(lastCustomerAt) ||
     lastCustomerAt <= 0 ||
@@ -1411,7 +1915,6 @@ async function executeFollowup(senderId) {
     return;
   }
 
-  // If a newer message was received, the older follow-up is stale.
   if (lastCustomerAt > Number(task.lastCustomerMessageAt || 0)) {
     scheduleFollowup(id, lastCustomerAt);
     return;
@@ -1621,13 +2124,13 @@ function buildSystemPrompt(
         `ছবি: ${getProductMediaUrls(p, 'images').join(' | ') || 'নেই'}`,
         `ভিডিও: ${getProductMediaUrls(p, 'videos').join(' | ') || 'নেই'}`
       ].join('\n')).join('\n\n')
-    : 'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
+    : 'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
 
   const faqContext = relevantFaqs.length
     ? relevantFaqs.map((f, i) =>
         `[FAQ ${i + 1}] ${f.question || ''}\n${f.answer || ''}`
       ).join('\n\n')
-    : 'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
+    : 'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
 
   const historyContext = history.length
     ? history.map(item =>
@@ -1636,34 +2139,35 @@ function buildSystemPrompt(
     : 'পূর্ববর্তী কথোপকথন নেই।';
 
   return `
-আপনি ImpoTech BD ফেসবুক পেজের বিক্রয় সহকারী ও কাস্টমার সাপোর্ট অ্যাসিস্ট্যান্ট।
+আপনি ImpoTech BD ফেসবুক পেজের বিক্রয় সহকারী ও কাস্টমার সাপোর্ট অ্যাসিস্ট্যান্ট।
 
 হেল্পলাইন: ${HELPLINE}
 WhatsApp: ${WHATSAPP_NUMBER}
-ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
+ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
 
 ডেলিভারি:
 - গাজীপুরের ভেতরে ৫০ টাকা।
 - গাজীপুরের বাইরে ১০০ টাকা।
 
-কঠোর নিয়ম:
-১. সহজ, স্বাভাবিক ও ভদ্র বাংলায় উত্তর দিন। গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে উত্তর দিতে পারেন।
-২. প্রতিটি উত্তর সর্বোচ্চ ৫টি লাইনে রাখুন। অপ্রয়োজনীয় ব্যাখ্যা দেবেন না।
-৩. ক্যাটালগের বাইরে দাম, স্টক, ওয়ারেন্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
+কঠোর নিয়ম:
+১. সহজ, স্বাভাবিক ও ভদ্র বাংলায় উত্তর দিন। গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে উত্তর দিতে পারেন।
+২. প্রতিটি উত্তর সর্বোচ্চ ৫টি লাইনে রাখুন। অপ্রয়োজনীয় ব্যাখ্যা দেবেন না।
+৩. ক্যাটালগের বাইরে দাম, স্টক, ওয়ারেন্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
 ৪. পণ্যের দাম কেবল ক্যাটালগ থেকে বলবেন। সঠিক পণ্য শনাক্ত না হলে অনুমান করবেন না।
 ৫. প্রশ্ন অস্পষ্ট হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
 ৬. শেষ ২০টি বার্তার পাশাপাশি নিচের সংরক্ষিত গ্রাহক মেমোরিও ব্যবহার করুন।
-৭. পণ্যের নাম, ID, দাম বা মিডিয়া URL পরিবর্তন করবেন না।
-৮. বিক্রয়ের ক্ষেত্রে কাস্টমারকে চাপ দেবেন না।
+৭. পণ্যের নাম, ID, দাম বা মিডিয়া URL পরিবর্তন করবেন না।
+৮. বিক্রয়ের ক্ষেত্রে কাস্টমারকে চাপ দেবেন না।
 ৯. অর্ডারের অনুরোধ শনাক্ত হলে ব্যাকএন্ড অর্ডার সংরক্ষণ করে Human Takeover চালু করবে।
 ১০. সাধারণ প্রশ্নের জন্য Human Takeover চাইবেন না।
-১১. H4 Compatibility নিশ্চিত না হলে অনুমানকে নিশ্চিত তথ্য হিসেবে বলবেন না।
-১২. বাইকের মডেল, উৎপাদন সাল বা Variant প্রয়োজন হলে জিজ্ঞেস করুন।
-১৩. কাস্টমার নিজে H4 Socket নিশ্চিত করলে একই প্রশ্ন আবার করবেন না।
-১৪. গুরুতর অভিযোগ, নিরাপত্তা বা পেমেন্ট সমস্যা সত্যিই মানব সহায়তা চাইলে উত্তরের শুরুতে ${HANDOVER_MARKER} লিখুন।
+১১. ImpoTech শুধু LED হেডলাইট বিক্রি করে। H4 এবং HS1 — দুটো সকেটই ৩-পিন (P43t/PX43t), তাই দুটোতেই আমাদের LED হেডলাইট সরাসরি plug-and-play হিসেবে ফিট হবে।
+১২. কাস্টমার বাইকের মডেল বললে (যেমন: Pulsar 150, Yamaha FZ, Apache RTR 160, Splendor, CB Shine) — সেই মডেলের স্টক হেডলাইট H4 বা HS1 যেটাই হোক, LED plug-and-play হবে বলে নিশ্চিতভাবে উত্তর দিন।
+১২ক. H6M, H7, H11, H13 — এই মডেলগুলো H4 সকেটে সরাসরি বসে না, অ্যাডাপ্টার লাগবে বলে জানান।
+১৩. কাস্টমার নিজে H4/HS1 Socket নিশ্চিত করলে একই প্রশ্ন আবার করবেন না।
+১৪. গুরুতর অভিযোগ, নিরাপত্তা বা পেমেন্ট সমস্যা সত্যিই মানব সহায়তা চাইলে উত্তরের শুরুতে ${HANDOVER_MARKER} লিখুন।
 ১৫. মার্কারটি কাস্টমারের কাছে পাঠানো হবে না; ব্যাকএন্ড এটি শনাক্ত করবে।
 ১৬. Takeover চালু থাকলে AI-এর উত্তর পাঠানো হবে না।
-১৭. গ্রাহকের ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।
+১৭. গ্রাহকের ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।
 ১৮. সংরক্ষিত মেমোরিতে তথ্য না থাকলে সেটি আছে বলে দাবি করবেন না।
 
 সংরক্ষিত গ্রাহক মেমোরি:
@@ -1739,7 +2243,6 @@ async function generateAIResponse(
 
   const history = getHistory(senderId).slice();
 
-  // Incoming customer message is already stored.
   if (
     history.length &&
     history[history.length - 1].role === 'user' &&
@@ -1789,7 +2292,7 @@ async function generateAIResponse(
           content: [
             {
               type: 'text',
-              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
+              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
             },
             {
               type: 'input_audio',
@@ -1839,7 +2342,7 @@ async function generateAIResponse(
               type: 'text',
               text:
                 `${query}\nছবিটি দেখে সাহায্য করুন। ` +
-                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করবেন না। সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
+                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করবেন না। সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
             },
             {
               type: 'image_url',
@@ -1874,7 +2377,7 @@ function isCriticalHandoverQuestion(text = '') {
   const value = normalizeText(text);
 
   return (
-    /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/.test(value)
+    /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/.test(value)
   );
 }
 
@@ -1945,16 +2448,16 @@ async function processCustomerMessage(
       await transferToHuman(
         senderId,
         'Critical customer issue',
-        `আপনার বিষয়টি গুরুত্ব দিয়ে দেখা প্রয়োজন। আমি কথোপকথনটি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
+        `আপনার বিষয়টি গুরুত্ব দিয়ে দেখা প্রয়োজন। আমি কথোপকথনটি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
       );
       return;
     }
 
-    // 3. MOTORCYCLE / H4
+    // 3. MOTORCYCLE / H4 / HS1 / 3-PIN LED
     if (isBikeCompatibilityQuestion(customerText)) {
       const context = getRecentConversationText(senderId, customerText);
       const match = identifyBikeModel(context);
-      const verifiedReply = getH4CompatibilityReply(match);
+      const verifiedReply = getH4CompatibilityReply(match, context);
 
       if (verifiedReply) {
         await sendFacebookMessage(senderId, limitToFiveLines(verifiedReply));
@@ -1971,7 +2474,9 @@ async function processCustomerMessage(
         if (reply.includes(HANDOVER_MARKER)) {
           await sendFacebookMessage(
             senderId,
-            'আপনি জানিয়েছেন যে আপনার বাইকে H4 Socket আছে। পণ্যের মডেল বা Connector-এর তথ্যটি জানালে বাকি Compatibility মিলিয়ে বলতে পারব।'
+            'আপনি জানিয়েছেন যে আপনার বাইকে H4 বা HS1 সকেট আছে। ' +
+            'আমাদের LED হেডলাইট ৩-পিন plug-and-play হিসেবে সরাসরি ফিট হবে। ' +
+            'পণ্যের মডেল জানালে আরও নিশ্চিতভাবে মিলিয়ে বলতে পারব।'
           );
           return;
         }
@@ -2002,7 +2507,7 @@ async function processCustomerMessage(
       if (bikeReply.includes(HANDOVER_MARKER)) {
         await sendFacebookMessage(
           senderId,
-          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন?'
+          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন?'
         );
         return;
       }
@@ -2018,7 +2523,6 @@ async function processCustomerMessage(
     if (isPriceQuestion(customerText)) {
       let product = findExactProductForPrice(customerText);
 
-      // Generic "price?" messages use the most recent explicit product.
       if (!product && isGenericPriceQuestion(customerText)) {
         product = findProductFromRecentContext(senderId);
       }
@@ -2074,7 +2578,7 @@ async function processCustomerMessage(
           senderId,
           'AI identified a critical support issue',
           explanation
-            ? `${limitToFiveLines(explanation)}\nআমি বিষয়টি প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
+            ? `${limitToFiveLines(explanation)}\nআমি বিষয়টি প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
             : undefined
         );
         return;
@@ -2100,10 +2604,9 @@ async function processCustomerMessage(
       normalizeText(previousReply) === normalizeText(aiReply)
     ) {
       aiReply =
-        'আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
+        'আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
     }
 
-    // Recheck takeover immediately before sending.
     if (getTakeoverState(senderId)) return;
 
     await sendFacebookMessage(senderId, limitToFiveLines(aiReply));
@@ -2114,14 +2617,15 @@ async function processCustomerMessage(
 
     await sendFacebookMessage(
       senderId,
-      'দুঃখিত, এই মুহূর্তে উত্তর তৈরি করতে সমস্যা হচ্ছে। একটু পরে আবার লিখবেন? জরুরি প্রয়োজনে হেল্পলাইন: ' +
+      'দুঃখিত, এই মুহূর্তে উত্তর তৈরি করতে সমস্যা হচ্ছে। একটু পরে আবার লিখবেন? জরুরি প্রয়োজনে হেল্পলাইন: ' +
       HELPLINE +
       '। WhatsApp: ' +
       WHATSAPP_NUMBER +
       '।'
     );
   }
-       }
+}
+
 // =============================================================================
 // 21. FACEBOOK WEBHOOK
 // =============================================================================
@@ -2143,7 +2647,6 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  // Acknowledge Meta immediately to prevent webhook retries.
   res.status(200).send('EVENT_RECEIVED');
 
   try {
@@ -2175,7 +2678,6 @@ app.post('/webhook', async (req, res) => {
         const currentTask = previousTask
           .catch(() => {})
           .then(async () => {
-            // Persistent duplicate guard after a restart.
             if (
               messageId &&
               db.messages.some(item => item.messageId === messageId)
@@ -2225,11 +2727,8 @@ app.post('/webhook', async (req, res) => {
               customer.lastMessageText = text || '[Media]';
             }
 
-            // Keep a persistent customer memory in addition to history.
             if (text) updateCustomerMemory(senderId, text);
 
-            // A new customer message invalidates the old follow-up.
-            // Schedule a new follow-up only if takeover/order rules allow it.
             if (!isPaused && !customerHasOrder(senderId)) {
               scheduleFollowup(senderId, Date.now());
             } else {
@@ -2506,7 +3005,6 @@ app.get('/api/customers', (req, res) => {
   });
 });
 
-// New API: inspect one customer's saved memory.
 app.get('/api/customers/:senderId/memory', (req, res) => {
   const senderId = String(req.params.senderId);
   const memory = db.customerMemory[senderId] || null;
@@ -2518,7 +3016,6 @@ app.get('/api/customers/:senderId/memory', (req, res) => {
   });
 });
 
-// New API: update customer memory from the admin panel.
 app.put('/api/customers/:senderId/memory', (req, res) => {
   const senderId = String(req.params.senderId);
   const body = req.body || {};
@@ -2753,7 +3250,6 @@ app.delete('/api/orders/:orderId', (req, res) => {
   });
 });
 
-// Admin sends a message from the admin chat UI.
 app.post('/api/customers/:senderId/send', async (req, res) => {
   const { senderId } = req.params;
   const { text } = req.body || {};
@@ -2842,7 +3338,6 @@ app.get('/api/catalog/media-status', (req, res) => {
 async function startServer() {
   await pullCatalogFromGitHub();
 
-  // Restore scheduled follow-ups from storage after restart.
   restoreFollowupTasks();
 
   app.listen(PORT, '0.0.0.0', () => {
@@ -2887,7 +3382,6 @@ setInterval(() => {
   }
 }, 60 * 1000).unref();
 
-// Periodic validation helps remove stale follow-ups and restore overdue tasks.
 setInterval(() => {
   for (const [senderId, task] of Object.entries(db.scheduledFollowups)) {
     if (!task || task.status !== 'PENDING') continue;
