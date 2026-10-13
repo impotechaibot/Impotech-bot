@@ -2,17 +2,19 @@
 
 /**
  * =============================================================================
- * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND  (FINAL FIXED BUILD)
+ * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND  (FINAL — MULTI-MODEL BUILD)
  * =============================================================================
- * AI          : OpenRouter Qwen3.8 Omni Flash (Text + Voice + Image)
- * CATALOG     : GitHub catalog.json + Local cache
- * STORAGE     : storage_data.json  (persistent, no auto-expire takeover)
- * MEMORY      : Persistent customer memory + last 20 messages
- * FOLLOW-UP   : Scheduled ~23 hours after customer interaction
- * HUMAN       : Persistent per-customer + global takeover
- * CALL        : Auto Human Takeover on Facebook call events
- * ORDER       : Auto Human Takeover + stored order on order intent
- * ADMIN       : Catalog, customers, messages, orders, bot status
+ * AI TEXT   : OpenRouter Qwen3.8 Omni Flash
+ * AI VOICE  : OpenRouter Qwen3.8 Omni Flash
+ * AI VISION : OpenRouter Gemini 3.1 Flash Lite  (image understanding only)
+ * CATALOG   : GitHub catalog.json + Local cache
+ * STORAGE   : storage_data.json  (persistent, takeover never auto-expires)
+ * MEMORY    : Persistent customer memory + last 20 messages
+ * FOLLOW-UP : Scheduled ~23 hours after customer interaction
+ * HUMAN     : Persistent per-customer + global takeover
+ * CALL      : Auto Human Takeover on Facebook call events
+ * ORDER     : Auto Human Takeover + stored order on order/phone/address
+ * ADMIN     : Catalog, customers, messages, orders, bot status
  * =============================================================================
  */
 
@@ -71,12 +73,17 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const OPENROUTER_URL =
   'https://openrouter.ai/api/v1/chat/completions';
 
-// Qwen3.8 Omni Flash handles text + voice + image
+// ---- MODELS ----
+// Text + Voice → Qwen3.8 Omni Flash
+// Vision (image understanding) → Gemini 3.1 Flash Lite
 const TEXT_MODEL =
   process.env.TEXT_MODEL || 'qwen/qwen3.8-omni-flash';
 
-const VOICE_MODEL = process.env.VOICE_MODEL || TEXT_MODEL;
-const VISION_MODEL = process.env.VISION_MODEL || TEXT_MODEL;
+const VOICE_MODEL =
+  process.env.VOICE_MODEL || 'qwen/qwen3.8-omni-flash';
+
+const VISION_MODEL =
+  process.env.VISION_MODEL || 'google/gemini-3.1-flash-lite';
 
 const HELPLINE = '+8809611042598';
 const WHATSAPP_NUMBER = '01884332067';
@@ -96,8 +103,11 @@ const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
 const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
 const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
 
-// Human Takeover NEVER auto-expires (only admin can disable)
-const TAKEOVER_AUTO_EXPIRE_MS = 0; // 0 = disabled forever until manual off
+// Human Takeover NEVER auto-expires (admin must disable manually)
+const TAKEOVER_AUTO_EXPIRE_MS = 0;
+
+// Product memory recall: how many turns back to scan
+const PRODUCT_MEMORY_LOOKBACK = 40;
 
 const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
 const DATA_FILE = path.join(__dirname, 'storage_data.json');
@@ -137,7 +147,7 @@ let db = {
   orders: [],
   customerMemory: {},
   scheduledFollowups: {},
-  callEvents: []
+  callEvents: {}
 };
 
 const customerHistory = new Map();
@@ -162,7 +172,6 @@ function ensureStorageShape() {
 
   if (!Array.isArray(db.messages)) db.messages = [];
   if (!Array.isArray(db.orders)) db.orders = [];
-  if (!Array.isArray(db.callEvents)) db.callEvents = [];
 
   if (!db.customerMemory || typeof db.customerMemory !== 'object') {
     db.customerMemory = {};
@@ -174,6 +183,8 @@ function ensureStorageShape() {
   ) {
     db.scheduledFollowups = {};
   }
+
+  if (!Array.isArray(db.callEvents)) db.callEvents = [];
 }
 
 function loadStorage() {
@@ -200,7 +211,7 @@ function loadStorage() {
 
     ensureStorageShape();
 
-    // Normalize takeovers & customers so nothing is lost
+    // Normalize takeovers
     for (const id of Object.keys(db.takeovers)) {
       const entry = db.takeovers[id];
       if (!entry || typeof entry !== 'object') {
@@ -213,6 +224,7 @@ function loadStorage() {
       if (!entry.timestamp) entry.timestamp = new Date().toISOString();
     }
 
+    // Normalize customers
     for (const id of Object.keys(db.customers)) {
       const c = db.customers[id];
       if (!c || typeof c !== 'object') {
@@ -220,13 +232,10 @@ function loadStorage() {
         continue;
       }
       c.id = c.id || id;
-      c.takeover = Boolean(
-        c.takeover || db.takeovers[id]?.isPaused
-      );
+      c.takeover = Boolean(c.takeover || db.takeovers[id]?.isPaused);
       c.isPaused = c.takeover;
     }
 
-    // Rebuild in-memory history
     customerHistory.clear();
 
     for (const message of db.messages) {
@@ -335,6 +344,7 @@ function getCustomerMemory(senderId) {
       facts: [],
       preferences: [],
       summary: '',
+      productDiscussions: [],
       updatedAt: null
     };
   }
@@ -343,6 +353,9 @@ function getCustomerMemory(senderId) {
 
   if (!Array.isArray(memory.facts)) memory.facts = [];
   if (!Array.isArray(memory.preferences)) memory.preferences = [];
+  if (!Array.isArray(memory.productDiscussions)) {
+    memory.productDiscussions = [];
+  }
   if (typeof memory.summary !== 'string') memory.summary = '';
 
   return memory;
@@ -364,6 +377,110 @@ function addUniqueMemoryItem(list, value, maxItems = 30) {
   }
 
   return list;
+}
+
+/**
+ * রেকর্ড করে কাস্টমার কোন পণ্য নিয়ে কথা বলেছে,
+ * কি প্রশ্ন করেছে, বট কি উত্তর দিয়েছে।
+ */
+function recordProductDiscussion(senderId, product, customerText, botReply) {
+  if (!senderId || !product) return;
+
+  const memory = getCustomerMemory(senderId);
+  if (!memory) return;
+
+  const entry = {
+    productId: String(product.id || ''),
+    productName: String(product.name || ''),
+    customerQuestion: String(customerText || '').slice(0, 300),
+    botAnswer: String(botReply || '').slice(0, 400),
+    at: new Date().toISOString()
+  };
+
+  memory.productDiscussions.push(entry);
+
+  if (memory.productDiscussions.length > 60) {
+    memory.productDiscussions.splice(
+      0,
+      memory.productDiscussions.length - 60
+    );
+  }
+
+  memory.updatedAt = new Date().toISOString();
+
+  addUniqueMemoryItem(
+    memory.facts,
+    `আলোচিত পণ্য: ${product.name} (ID: ${product.id})`
+  );
+}
+
+/**
+ * কাস্টমার আগে এই পণ্যের ব্যাপারে কি জিজ্ঞেস করেছিল
+ * এবং বট কি উত্তর দিয়েছিল সেটি খুঁজে বের করে।
+ */
+function findPreviousDiscussionAboutProduct(senderId, product) {
+  if (!senderId || !product) return null;
+
+  const memory = getCustomerMemory(senderId);
+  const productId = String(product.id || '');
+  const productName = normalizeText(product.name || '');
+
+  // First check persistent productDiscussions (most reliable)
+  if (memory && Array.isArray(memory.productDiscussions)) {
+    for (let i = memory.productDiscussions.length - 1; i >= 0; i--) {
+      const entry = memory.productDiscussions[i];
+      if (!entry) continue;
+
+      const idMatch = productId && String(entry.productId) === productId;
+      const nameMatch =
+        productName &&
+        normalizeText(entry.productName || '') === productName;
+
+      if (idMatch || nameMatch) {
+        return {
+          productName: entry.productName,
+          customerQuestion: entry.customerQuestion,
+          botAnswer: entry.botAnswer,
+          at: entry.at,
+          source: 'memory'
+        };
+      }
+    }
+  }
+
+  // Fallback: scan history
+  const history = getHistory(senderId);
+  const identifiers = getProductIdentifiers(product).filter(
+    x => x.length >= 3
+  );
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role !== 'user') continue;
+
+    const text = normalizeText(history[i].text || '');
+
+    const mentioned = identifiers.some(id => text.includes(id));
+    if (!mentioned) continue;
+
+    let botAnswer = null;
+
+    for (let j = i + 1; j < history.length; j++) {
+      if (history[j].role === 'assistant') {
+        botAnswer = history[j].text;
+        break;
+      }
+    }
+
+    return {
+      productName: product.name,
+      customerQuestion: history[i].text,
+      botAnswer: botAnswer || '',
+      at: new Date(history[i].timestamp || Date.now()).toISOString(),
+      source: 'history'
+    };
+  }
+
+  return null;
 }
 
 function updateCustomerMemory(senderId, customerText) {
@@ -403,15 +520,12 @@ function updateCustomerMemory(senderId, customerText) {
   }
 
   const addressMatch = text.match(
-    /(?:ঠিকানা|address|গ্রাম|বাসা|বাজার|রোড|road|village|house|জেলা|জিলা|district)[^\n।.!?]{2,120}/i
+    /(?:ঠিকানা|address|গ্রাম|বাসা|বাজার|রোড|road|village|house|জেলা|জিলা|district)[^\n।.!?]{2,160}/i
   );
 
   if (addressMatch) {
     customer.address = addressMatch[0].trim();
-    addUniqueMemoryItem(
-      memory.facts,
-      `ঠিকানা: ${customer.address}`
-    );
+    addUniqueMemoryItem(memory.facts, `ঠিকানা: ${customer.address}`);
   }
 
   const nameMatch = text.match(
@@ -425,7 +539,7 @@ function updateCustomerMemory(senderId, customerText) {
 
   const preferencePatterns = [
     /আমি (?:সাধারণত )?(?:কালো|সাদা|লাল|নীল|কালার|রঙের)[^।.!?]{0,100}/i,
-    /আমার (?:বাইক|মোটরসাইকেল|গাড়ি)[^।.!?]{0,120}/i,
+    /আমার (?:বাইক|মোটরসাইকেল|গাড়ি)[^।.!?]{0,120}/i,
     /আমার (?:পছন্দ|বাজেট)[^।.!?]{0,120}/i,
     /বাজেট [^।.!?]{0,80}/i,
     /ডেলিভারি (?:গাজীপুর|ঢাকা|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা)[^।.!?]{0,80}/i
@@ -456,12 +570,24 @@ function buildCustomerMemoryContext(senderId) {
   const facts = memory.facts.slice(-15);
   const preferences = memory.preferences.slice(-10);
 
+  // Recent product discussions — LAST 8
+  const recentDiscussions = (memory.productDiscussions || [])
+    .slice(-8)
+    .map(
+      (d, i) =>
+        `${i + 1}. পণ্য: ${d.productName}\n   গ্রাহক জিজ্ঞেস: ${d.customerQuestion}\n   বট উত্তর: ${d.botAnswer}`
+    )
+    .join('\n');
+
   return [
     facts.length
       ? `গুরুত্বপূর্ণ তথ্য:\n- ${facts.join('\n- ')}`
       : '',
     preferences.length
       ? `গ্রাহকের পছন্দ/প্রসঙ্গ:\n- ${preferences.join('\n- ')}`
+      : '',
+    recentDiscussions
+      ? `আগের পণ্য সংক্রান্ত কথোপকথন:\n${recentDiscussions}`
       : '',
     memory.summary
       ? `সংরক্ষিত কথোপকথনের সারাংশ:\n${memory.summary}`
@@ -838,6 +964,16 @@ function findProductFromRecentContext(senderId) {
 
   for (const fact of recentFacts) {
     const match = findExactProductForPrice(fact);
+    if (match) return match;
+  }
+
+  // Also check productDiscussions
+  const discussions = (memory?.productDiscussions || []).slice().reverse();
+
+  for (const d of discussions) {
+    const match = products.find(
+      p => String(p.id) === String(d.productId)
+    );
     if (match) return match;
   }
 
@@ -1466,7 +1602,7 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   }
 
   console.log(
-    `[Takeover] ${id}: ${isEnabled ? 'PAUSED' : 'ACTIVE'} (persistent, no auto-expire)`
+    `[Takeover] ${id}: ${isEnabled ? 'PAUSED' : 'ACTIVE'} (persistent)`
   );
 
   return isEnabled;
@@ -1896,7 +2032,7 @@ function buildSystemPrompt(
 
 হেল্পলাইন: ${HELPLINE}
 WhatsApp: ${WHATSAPP_NUMBER}
-ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
+ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়েদেবপুর, গাজীপুর।
 
 ডেলিভারি:
 - গাজীপুরের ভেতরে ৫০ টাকা।
@@ -1922,7 +2058,8 @@ WhatsApp: ${WHATSAPP_NUMBER}
 ১৬. Takeover চালু থাকলে AI-এর উত্তর পাঠানো হবে না।
 ১৭. গ্রাহকের ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।
 ১৮. সংরক্ষিত মেমোরিতে তথ্য না থাকলে সেটি আছে বলে দাবি করবেন না।
-১৯. গ্রাহক যদি নাম, ফোন নম্বর বা ঠিকানা দেয় — সেটি মনে রাখুন এবং নিশ্চিত করুন।
+১৯. **গ্রাহকের মেমোরি ও পূর্বের পণ্য-কথোপকথন ভালোভাবে দেখুন। যদি একই পণ্য নিয়ে গ্রাহক আগে জিজ্ঞেস করে থাকেন এবং আপনি আগে যেভাবে উত্তর দিয়েছিলেন সেটি এখনো সঠিক হয় — সেটিই পুনরায় ব্যবহার করুন। ভিন্নভাবে বলার দরকার নেই।**
+২০. ছবি দেখে যদি নিশ্চিতভাবে পণ্য শনাক্ত করতে পারেন, তবে সেই পণ্যের নাম বলুন এবং সেটি সম্পর্কে সাহায্য করুন। নিশ্চিত না হলে "কোন পণ্যটি দেখতে চান?" বলে সংক্ষেপে জিজ্ঞেস করুন।
 
 সংরক্ষিত গ্রাহক মেমোরি:
 ${memoryContext || 'কোনো মেমোরি নেই।'}
@@ -1939,7 +2076,7 @@ ${historyContext}
 }
 
 // =============================================================================
-// 18. OPENROUTER AI  (Qwen3.8 Omni Flash — Text + Voice + Image)
+// 18. OPENROUTER AI  (TEXT = Qwen, VOICE = Qwen, VISION = Gemini 3.1 Flash Lite)
 // =============================================================================
 
 async function callOpenRouter(messages, model = TEXT_MODEL) {
@@ -2045,7 +2182,7 @@ async function generateAIResponse(
     content: item.text
   }));
 
-  // -------- Audio (Voice) --------
+  // -------- AUDIO (VOICE) → Qwen3.8 Omni Flash --------
   const audioAttachment = attachments.find(
     item => item.type === 'audio' && item.payload?.url
   );
@@ -2085,7 +2222,7 @@ async function generateAIResponse(
     }
   }
 
-  // -------- Image --------
+  // -------- IMAGE → Gemini 3.1 Flash Lite --------
   const imageAttachment = attachments.find(
     item => item.type === 'image' && item.payload?.url
   );
@@ -2105,8 +2242,12 @@ async function generateAIResponse(
             {
               type: 'text',
               text:
-                `${query}\nছবিটি দেখে সাহায্য করুন। ` +
-                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করবেন না। সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
+                `${query}\n` +
+                'ছবিটি মনোযোগ দিয়ে দেখুন। যদি নিশ্চিতভাবে পণ্য শনাক্ত করতে পারেন ' +
+                '(যেমন: LED হেডলাইট H4, HS1, Devil Eye, Bike LED ইত্যাদি) — তবে ' +
+                'সেই পণ্যের নাম বলে সেটি সম্পর্কে সাহায্য করুন। ' +
+                'নিশ্চিত না হলে অনুমান করবেন না, শুধু সংক্ষেপে "কোন পণ্যটি দেখতে চান?" ' +
+                'বলে জিজ্ঞেস করুন। সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
             },
             {
               type: 'image_url',
@@ -2124,7 +2265,7 @@ async function generateAIResponse(
     }
   }
 
-  // -------- Plain Text --------
+  // -------- TEXT → Qwen3.8 Omni Flash --------
   const reply = await callOpenRouter([
     { role: 'system', content: systemPrompt },
     ...priorMessages,
@@ -2169,7 +2310,6 @@ async function handleCallEvent(event) {
     db.callEvents.splice(0, db.callEvents.length - 2000);
   }
 
-  // Auto human takeover whenever customer calls
   if (getTakeoverState(senderId)) {
     saveStorage();
     console.log(`[CALL] ${senderId} already in takeover; call logged`);
@@ -2183,7 +2323,6 @@ async function handleCallEvent(event) {
   );
 
   cancelFollowup(senderId);
-
   saveStorage();
 
   console.log(
@@ -2379,6 +2518,14 @@ async function processCustomerMessage(
         return;
       }
 
+      // Record that we discussed this product
+      recordProductDiscussion(
+        senderId,
+        product,
+        customerText,
+        priceReply
+      );
+
       await sendFacebookMessage(senderId, limitToFiveLines(priceReply));
       return;
     }
@@ -2388,6 +2535,17 @@ async function processCustomerMessage(
       const mediaReply = getProductMediaReply(customerText, senderId);
 
       if (mediaReply) {
+        const matchedProduct = findProductForMedia(customerText, senderId);
+
+        if (matchedProduct) {
+          recordProductDiscussion(
+            senderId,
+            matchedProduct,
+            customerText,
+            mediaReply
+          );
+        }
+
         await sendFacebookMessage(senderId, limitToFiveLines(mediaReply));
         return;
       }
@@ -2428,6 +2586,7 @@ async function processCustomerMessage(
       return;
     }
 
+    // Previous reply duplicate check
     const previousReply = getPreviousAssistantReply(
       senderId,
       customerText
@@ -2439,6 +2598,17 @@ async function processCustomerMessage(
     ) {
       aiReply =
         'আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
+    }
+
+    // Save product-related discussion for future memory recall
+    const discussedProduct = findProductFromRecentContext(senderId);
+    if (discussedProduct) {
+      recordProductDiscussion(
+        senderId,
+        discussedProduct,
+        customerText,
+        aiReply
+      );
     }
 
     if (getTakeoverState(senderId)) return;
@@ -2488,7 +2658,7 @@ app.post('/webhook', async (req, res) => {
     if (body.object !== 'page') return;
 
     for (const entry of body.entry || []) {
-      // -------- CALL EVENTS (audio/video call from Messenger) --------
+      // -------- CALL EVENTS --------
       for (const callEvent of entry.call || []) {
         try {
           await handleCallEvent({
@@ -2770,7 +2940,7 @@ app.post('/api/customers/:senderId/takeover', async (req, res) => {
     isPaused,
     takeover: isPaused,
     message: isPaused
-      ? 'Human takeover enabled. It stays until an admin disables it.'
+      ? 'Human takeover enabled. Stays until admin disables it.'
       : 'AI resumed for this customer.'
   });
 });
@@ -2887,6 +3057,10 @@ app.put('/api/customers/:senderId/memory', (req, res) => {
       .map(value => value.trim())
       .filter(Boolean)
       .slice(-20);
+  }
+
+  if (Array.isArray(body.productDiscussions)) {
+    memory.productDiscussions = body.productDiscussions.slice(-60);
   }
 
   if (typeof body.summary === 'string') {
@@ -3151,6 +3325,11 @@ app.get('/api/status', (req, res) => {
   res.json({
     success: true,
     status: 'LIVE_PRODUCTION',
+    models: {
+      text: TEXT_MODEL,
+      voice: VOICE_MODEL,
+      vision: VISION_MODEL
+    },
     catalogProducts: products.length,
     catalogFaqs: faqs.length,
     catalogFile: CATALOG_FILE,
@@ -3206,12 +3385,15 @@ async function startServer() {
 
     console.log(`[CONTACT] Helpline: ${HELPLINE}`);
     console.log(`[CONTACT] WhatsApp: ${WHATSAPP_NUMBER}`);
-    console.log(`[MEMORY] Last ${HISTORY_LIMIT} messages + persistent customer memory`);
+    console.log(
+      `[AI] text=${TEXT_MODEL} | voice=${VOICE_MODEL} | vision=${VISION_MODEL}`
+    );
+    console.log('[MEMORY] Last 20 messages + persistent customer memory');
+    console.log('[MEMORY] Product-discussion recall enabled');
     console.log('[FOLLOWUP] Scheduled follow-up enabled');
-    console.log('[TAKEOVER] Persistent — no auto-expire (admin must disable)');
+    console.log('[TAKEOVER] Persistent — no auto-expire');
     console.log('[CALL] Auto Human Takeover on customer call');
     console.log('[ORDER] Auto Human Takeover on order/phone/address');
-    console.log('[AI] Qwen3.8 Omni Flash — text + voice + image');
 
     if (catalogMeta.lastSyncError) {
       console.warn('[CATALOG] GitHub warning: ' + catalogMeta.lastSyncError);
@@ -3231,7 +3413,7 @@ startServer().catch(err => {
 });
 
 // =============================================================================
-// 28. CLEANUP AND PERIODIC FOLLOW-UP VALIDATION
+// 28. CLEANUP AND PERIODIC VALIDATION
 // =============================================================================
 
 setInterval(() => {
@@ -3288,14 +3470,15 @@ setInterval(() => {
  * PAGE_ACCESS_TOKEN=xxxxxxxx
  * VERIFY_TOKEN=xxxxxxxx
  * OPENROUTER_API_KEY=sk-or-v1-xxxxxxxx
+ *
  * TEXT_MODEL=qwen/qwen3.8-omni-flash
  * VOICE_MODEL=qwen/qwen3.8-omni-flash
- * VISION_MODEL=qwen/qwen3.8-omni-flash
+ * VISION_MODEL=google/gemini-3.1-flash-lite
+ *
  * GITHUB_TOKEN=ghp_xxxxxxxx
  * GITHUB_REPO=impotechaibot/Impotech-bot
  * GITHUB_BRANCH=main
  * CATALOG_FILE=data/catalog.json
  * ADMIN_SECRET=your-secret
  * REQUIRE_ADMIN_SECRET=true
- * GRAPH_API_VERSION=v18.0
  */
