@@ -4,13 +4,17 @@
  * =============================================================================
  * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND
  * =============================================================================
- * AI          : OpenRouter Gemini
- * CATALOG     : GitHub catalog.json + Local cache
- * STORAGE     : storage_data.json
- * MEMORY      : Persistent customer memory + last 20 messages
- * FOLLOW-UP   : Scheduled around 23 hours after customer interaction
- * HUMAN       : Persistent per-customer + global takeover
- * ADMIN       : Catalog, customers, messages, orders, bot status
+ * AI TEXT   : Google Gemini 2.5 Flash Lite via OpenRouter
+ * AI VOICE  : Google Gemini 2.5 Flash Lite via OpenRouter
+ * AI VISION : Google Gemini 2.5 Flash Lite via OpenRouter
+ * CATALOG   : GitHub catalog.json + Local cache
+ * STORAGE   : storage_data.json
+ * MEMORY    : Persistent customer memory + last 20 messages
+ * FOLLOW-UP : Scheduled after approximately 23 hours
+ * HUMAN     : Persistent per-customer + global takeover
+ * ORDER     : Persistent order storage + multi-message order collection
+ * CALL      : Human handover on supported call events
+ * ADMIN     : Catalog, customers, messages, memory, orders, bot status
  * =============================================================================
  */
 
@@ -26,26 +30,7 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '50mb' }));
 
 // =============================================================================
-// 1. CORS
-// =============================================================================
-
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
-  );
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, x-admin-secret'
-  );
-
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
-// =============================================================================
-// 2. CONFIGURATION
+// 1. CONFIGURATION
 // =============================================================================
 
 const PORT = Number(process.env.PORT) || 10000;
@@ -58,47 +43,54 @@ const PAGE_ACCESS_TOKEN =
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 
 const GITHUB_REPO =
   process.env.GITHUB_REPO || 'impotechaibot/Impotech-bot';
 
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 const CATALOG_FILE = process.env.CATALOG_FILE || 'data/catalog.json';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
+
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
 
 const OPENROUTER_URL =
   'https://openrouter.ai/api/v1/chat/completions';
 
 const TEXT_MODEL =
-  process.env.TEXT_MODEL || 'google/gemini-3.1-flash-lite';
+  process.env.TEXT_MODEL || 'google/gemini-2.5-flash-lite';
 
-const VOICE_MODEL = process.env.VOICE_MODEL || TEXT_MODEL;
+const VOICE_MODEL =
+  process.env.VOICE_MODEL || 'google/gemini-2.5-flash-lite';
+
+const VISION_MODEL =
+  process.env.VISION_MODEL || 'google/gemini-2.5-flash-lite';
 
 const HELPLINE = '+8809611042598';
 const WHATSAPP_NUMBER = '01884332067';
 
-const MAX_PRODUCTS_TO_AI = 5;
-const MAX_FAQS_TO_AI = 5;
+const DATA_FILE = path.join(__dirname, 'storage_data.json');
+const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
+
+const REQUIRE_ADMIN_SECRET =
+  process.env.REQUIRE_ADMIN_SECRET !== 'false';
+
+const HISTORY_LIMIT = 20;
+const MESSAGE_RETENTION_LIMIT = 20000;
 const MAX_OUTPUT_TOKENS = 500;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
 const MAX_AI_LINES = 5;
+const MAX_PRODUCTS_TO_AI = 5;
+const MAX_FAQS_TO_AI = 5;
 
-const HISTORY_LIMIT = 20;
-const MESSAGE_RETENTION_LIMIT = 20000;
-const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
-
-// Follow-up is scheduled at 23 hours, leaving a safety margin
-// before the standard 24-hour Messenger messaging window closes.
 const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
 const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
+const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
+const CUSTOMER_RETENTION_DAYS = 20;
 
-const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
-const DATA_FILE = path.join(__dirname, 'storage_data.json');
-
-const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
-const REQUIRE_ADMIN_SECRET =
-  process.env.REQUIRE_ADMIN_SECRET !== 'false';
+// Pending order collection expires after seven days.
+const PENDING_ORDER_RETENTION_MS =
+  7 * 24 * 60 * 60 * 1000;
 
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 
@@ -109,7 +101,31 @@ const FOLLOWUP_MESSAGE =
   'আপনি কি পণ্যটি সম্পর্কে আরও কিছু জানতে চান? কোনো প্রশ্ন থাকলে জানাবেন, আমরা সাহায্য করতে প্রস্তুত।';
 
 // =============================================================================
-// 3. STATE AND STORAGE
+// 2. CORS
+// =============================================================================
+
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+  );
+
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, x-admin-secret'
+  );
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
+
+// =============================================================================
+// 3. DATABASE STATE
 // =============================================================================
 
 let products = [];
@@ -130,7 +146,9 @@ let db = {
   messages: [],
   orders: [],
   customerMemory: {},
-  scheduledFollowups: {}
+  scheduledFollowups: {},
+  callEvents: [],
+  pendingOrders: {}
 };
 
 const customerHistory = new Map();
@@ -145,91 +163,46 @@ function ensureStorageShape() {
     db.isGlobalPaused = false;
   }
 
-  if (!db.takeovers || typeof db.takeovers !== 'object') {
-    db.takeovers = {};
+  for (const key of [
+    'takeovers',
+    'customers',
+    'customerMemory',
+    'scheduledFollowups',
+    'pendingOrders'
+  ]) {
+    if (
+      !db[key] ||
+      typeof db[key] !== 'object' ||
+      Array.isArray(db[key])
+    ) {
+      db[key] = {};
+    }
   }
 
-  if (!db.customers || typeof db.customers !== 'object') {
-    db.customers = {};
-  }
-
-  if (!Array.isArray(db.messages)) db.messages = [];
-  if (!Array.isArray(db.orders)) db.orders = [];
-
-  if (!db.customerMemory || typeof db.customerMemory !== 'object') {
-    db.customerMemory = {};
-  }
-
-  if (
-    !db.scheduledFollowups ||
-    typeof db.scheduledFollowups !== 'object'
-  ) {
-    db.scheduledFollowups = {};
+  for (const key of ['messages', 'orders', 'callEvents']) {
+    if (!Array.isArray(db[key])) db[key] = [];
   }
 }
 
 function loadStorage() {
   try {
     if (!fs.existsSync(DATA_FILE)) {
-      console.log('[STORAGE] No storage file found; using empty storage');
       ensureStorageShape();
       return;
     }
 
-    const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const parsed = JSON.parse(
+      fs.readFileSync(DATA_FILE, 'utf8')
+    );
 
-    db = {
-      isGlobalPaused: false,
-      takeovers: {},
-      customers: {},
-      messages: [],
-      orders: [],
-      customerMemory: {},
-      scheduledFollowups: {},
-      ...saved
-    };
-
-    ensureStorageShape();
-    customerHistory.clear();
-
-    for (const message of db.messages) {
-      const senderId = String(message.senderId || '');
-      if (!senderId) continue;
-
-      let role;
-
-      if (['customer', 'user'].includes(message.sender)) {
-        role = 'user';
-      } else if (
-        ['bot', 'assistant', 'admin'].includes(message.sender)
-      ) {
-        role = 'assistant';
-      } else {
-        continue;
-      }
-
-      const history = customerHistory.get(senderId) || [];
-
-      history.push({
-        role,
-        text: String(message.text || ''),
-        timestamp: new Date(
-          message.timestamp || Date.now()
-        ).getTime()
-      });
-
-      if (history.length > HISTORY_LIMIT) {
-        history.splice(0, history.length - HISTORY_LIMIT);
-      }
-
-      customerHistory.set(senderId, history);
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Invalid storage JSON');
     }
 
-    console.log(
-      `[STORAGE] Restored ${db.messages.length} messages, ` +
-      `${db.orders.length} orders and ` +
-      `${Object.keys(db.customerMemory).length} customer memories`
-    );
+    db = parsed;
+    ensureStorageShape();
+
+    console.log('[STORAGE] Loaded persistent storage');
   } catch (err) {
     console.error('[STORAGE] Load error:', err.message);
     ensureStorageShape();
@@ -282,8 +255,101 @@ function tokenize(value = '') {
     .filter(word => word.length >= 2);
 }
 
+function newId(prefix) {
+  return prefix + '_' + crypto.randomUUID();
+}
+
+function customerDisplayName(senderId) {
+  return 'Customer ' + String(senderId || '').slice(-4);
+}
+
+loadStorage();
+
 // =============================================================================
-// 4. PERSISTENT CUSTOMER MEMORY
+// 4. CUSTOMER HISTORY
+// =============================================================================
+
+function getHistory(senderId) {
+  const id = String(senderId || '');
+  if (!id) return [];
+
+  if (customerHistory.has(id)) {
+    return customerHistory.get(id);
+  }
+
+  const history = db.messages
+    .filter(message => String(message.senderId) === id)
+    .filter(message =>
+      message.role === 'user' || message.role === 'assistant'
+    )
+    .map(message => ({
+      role: message.role,
+      text: String(message.text || ''),
+      timestamp: Number(message.timestamp) || Date.now()
+    }))
+    .slice(-HISTORY_LIMIT);
+
+  customerHistory.set(id, history);
+  return history;
+}
+
+function appendHistory(senderId, role, text) {
+  if (!senderId || !text) return;
+
+  const id = String(senderId);
+  const history = getHistory(id);
+
+  history.push({
+    role,
+    text: String(text).trim(),
+    timestamp: Date.now()
+  });
+
+  if (history.length > HISTORY_LIMIT) {
+    history.splice(0, history.length - HISTORY_LIMIT);
+  }
+
+  customerHistory.set(id, history);
+}
+
+function getRecentConversationText(senderId, additionalText = '') {
+  return [
+    ...getHistory(senderId).map(item => item.text),
+    additionalText
+  ].filter(Boolean).join('\n');
+}
+
+function storeConversationMessage(
+  senderId,
+  role,
+  text,
+  messageId = null
+) {
+  const message = {
+    id: newId('msg'),
+    senderId: String(senderId),
+    role,
+    text: String(text || '').slice(0, 10000),
+    messageId: messageId || null,
+    timestamp: Date.now(),
+    createdAt: new Date().toISOString()
+  };
+
+  addStoredMessage(message);
+  appendHistory(senderId, role, message.text);
+
+  const customer = db.customers[String(senderId)];
+
+  if (customer) {
+    customer.messageCount = Number(customer.messageCount || 0) + 1;
+    customer.lastActive = new Date().toISOString();
+  }
+
+  return message;
+}
+
+// =============================================================================
+// 5. PERSISTENT CUSTOMER MEMORY
 // =============================================================================
 
 function getCustomerMemory(senderId) {
@@ -296,6 +362,7 @@ function getCustomerMemory(senderId) {
       facts: [],
       preferences: [],
       summary: '',
+      productDiscussions: [],
       updatedAt: null
     };
   }
@@ -304,6 +371,11 @@ function getCustomerMemory(senderId) {
 
   if (!Array.isArray(memory.facts)) memory.facts = [];
   if (!Array.isArray(memory.preferences)) memory.preferences = [];
+
+  if (!Array.isArray(memory.productDiscussions)) {
+    memory.productDiscussions = [];
+  }
+
   if (typeof memory.summary !== 'string') memory.summary = '';
 
   return memory;
@@ -311,6 +383,7 @@ function getCustomerMemory(senderId) {
 
 function addUniqueMemoryItem(list, value, maxItems = 30) {
   const text = String(value || '').trim();
+
   if (!text || text.length > 220) return list;
 
   const key = normalizeText(text);
@@ -327,14 +400,99 @@ function addUniqueMemoryItem(list, value, maxItems = 30) {
   return list;
 }
 
-function updateCustomerMemory(senderId, customerText) {
-  const text = String(customerText || '').trim();
-  if (!senderId || !text || text.length > 1000) return;
+function getProductIdentifiers(product) {
+  return [
+    product.name,
+    product.id,
+    product.sku,
+    product.model,
+    ...(Array.isArray(product.aliases) ? product.aliases : [])
+  ]
+    .filter(Boolean)
+    .map(normalizeText)
+    .filter(Boolean);
+}
+
+function recordProductDiscussion(
+  senderId,
+  product,
+  customerQuestion,
+  botAnswer
+) {
+  if (!senderId || !product) return;
 
   const memory = getCustomerMemory(senderId);
-  const customer = db.customers[String(senderId)] || {};
 
-  const matchedProducts = products
+  memory.productDiscussions.push({
+    productId: String(product.id || ''),
+    productName: String(product.name || ''),
+    customerQuestion: String(customerQuestion || '').slice(0, 300),
+    botAnswer: String(botAnswer || '').slice(0, 400),
+    at: new Date().toISOString()
+  });
+
+  if (memory.productDiscussions.length > 60) {
+    memory.productDiscussions.splice(
+      0,
+      memory.productDiscussions.length - 60
+    );
+  }
+
+  addUniqueMemoryItem(
+    memory.facts,
+    `আলোচিত পণ্য: ${product.name} (ID: ${product.id})`
+  );
+
+  memory.updatedAt = new Date().toISOString();
+}
+
+function updateCustomerMemory(senderId, customerText) {
+  const id = String(senderId || '');
+  const text = String(customerText || '').trim();
+
+  if (!id || !text || text.length > 1000) return;
+
+  const memory = getCustomerMemory(id);
+
+  if (!db.customers[id]) {
+    db.customers[id] = {
+      id,
+      name: customerDisplayName(id),
+      messageCount: 0,
+      lastActive: new Date().toISOString()
+    };
+  }
+
+  const customer = db.customers[id];
+
+  const phone = extractPhoneNumber(text);
+
+  if (phone) {
+    customer.phone = phone;
+    addUniqueMemoryItem(memory.facts, `ফোন: ${phone}`);
+  }
+
+  const address = extractAddressText(text);
+
+  if (address) {
+    customer.address = address;
+    addUniqueMemoryItem(memory.facts, `ঠিকানা: ${address}`);
+  }
+
+  const nameMatch = text.match(
+    /(?:আমার নাম|my name is|name)[:\s]+([\p{L}\s.]{2,40})/iu
+  );
+
+  if (nameMatch) {
+    customer.name = nameMatch[1].trim();
+
+    addUniqueMemoryItem(
+      memory.facts,
+      `নাম: ${customer.name}`
+    );
+  }
+
+  const matched = products
     .map(product => ({
       product,
       score: productScore(text, product)
@@ -343,44 +501,42 @@ function updateCustomerMemory(senderId, customerText) {
     .sort((a, b) => b.score - a.score);
 
   if (
-    matchedProducts.length &&
-    (
-      matchedProducts.length === 1 ||
-      matchedProducts[0].score > matchedProducts[1].score
-    )
+    matched.length &&
+    (matched.length === 1 ||
+      matched[0].score > matched[1].score)
   ) {
     addUniqueMemoryItem(
       memory.facts,
-      `আলোচিত পণ্য: ${matchedProducts[0].product.name} (ID: ${matchedProducts[0].product.id})`
+      `আলোচিত পণ্য: ${matched[0].product.name} (ID: ${matched[0].product.id})`
     );
   }
 
-  const phoneMatch = text.match(
-    /(?:\+?8801|01)[0-9\s-]{8,14}/
-  );
-
-  if (phoneMatch) {
-    customer.phone = phoneMatch[0].replace(/[\s-]/g, '');
-  }
-
-  const preferencePatterns = [
-    /আমি (?:সাধারণত )?(?:কালো|সাদা|লাল|নীল|কালার|রঙের)[^।.!?]{0,100}/i,
-    /আমার (?:বাইক|মোটরসাইকেল|গাড়ি)[^।.!?]{0,120}/i,
-    /আমার (?:পছন্দ|বাজেট)[^।.!?]{0,120}/i,
-    /বাজেট [^।.!?]{0,80}/i,
-    /ডেলিভারি (?:গাজীপুর|ঢাকা|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা)[^।.!?]{0,80}/i
+  const preferences = [
+    /আমার (?:বাইক|মোটরসাইকেল|গাড়ি)[^।.!?\n]{0,100}/i,
+    /আমার (?:পছন্দ|বাজেট)[^।.!?\n]{0,100}/i,
+    /বাজেট [^।.!?\n]{0,80}/i,
+    /ডেলিভারি (?:গাজীপুর|ঢাকা|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা)[^।.!?\n]{0,80}/i
   ];
 
-  for (const pattern of preferencePatterns) {
+  for (const pattern of preferences) {
     const match = text.match(pattern);
-    if (match) addUniqueMemoryItem(memory.preferences, match[0], 20);
+
+    if (match) {
+      addUniqueMemoryItem(memory.preferences, match[0], 20);
+    }
   }
 
-  if (text.length >= 8 && !/^(হ্যাঁ|না|ok|okay|ধন্যবাদ|thanks)$/i.test(text)) {
-    memory.summary = [
-      memory.summary,
-      `গ্রাহক বলেছেন: ${text.slice(0, 240)}`
-    ].filter(Boolean).slice(-8).join('\n');
+  if (
+    text.length >= 8 &&
+    !/^(হ্যাঁ|না|ok|okay|ধন্যবাদ|thanks)$/i.test(text)
+  ) {
+    const summaryLines = memory.summary
+      ? memory.summary.split('\n')
+      : [];
+
+    summaryLines.push(`গ্রাহক বলেছেন: ${text.slice(0, 240)}`);
+
+    memory.summary = summaryLines.slice(-8).join('\n');
   }
 
   memory.updatedAt = new Date().toISOString();
@@ -391,26 +547,54 @@ function updateCustomerMemory(senderId, customerText) {
 
 function buildCustomerMemoryContext(senderId) {
   const memory = getCustomerMemory(senderId);
-  if (!memory) return 'কোনো সংরক্ষিত গ্রাহক মেমোরি নেই।';
+
+  if (!memory) return 'কোনো সংরক্ষিত মেমোরি নেই।';
 
   const facts = memory.facts.slice(-15);
   const preferences = memory.preferences.slice(-10);
 
+  const discussions = memory.productDiscussions
+    .slice(-8)
+    .map((item, index) =>
+      `${index + 1}. পণ্য: ${item.productName}\n` +
+      `গ্রাহকের প্রশ্ন: ${item.customerQuestion}\n` +
+      `আগের উত্তর: ${item.botAnswer}`
+    )
+    .join('\n');
+
   return [
-    facts.length
-      ? `গুরুত্বপূর্ণ তথ্য:\n- ${facts.join('\n- ')}`
-      : '',
+    facts.length ? `তথ্য:\n- ${facts.join('\n- ')}` : '',
     preferences.length
-      ? `গ্রাহকের পছন্দ/প্রসঙ্গ:\n- ${preferences.join('\n- ')}`
+      ? `পছন্দ:\n- ${preferences.join('\n- ')}`
       : '',
-    memory.summary
-      ? `সংরক্ষিত কথোপকথনের সারাংশ:\n${memory.summary}`
-      : ''
-  ].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত গ্রাহক মেমোরি নেই।';
+    discussions ? `আগের পণ্য আলোচনা:\n${discussions}` : '',
+    memory.summary ? `সারাংশ:\n${memory.summary}` : ''
+  ].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত মেমোরি নেই।';
+}
+
+function findPreviousDiscussionAboutProduct(senderId, product) {
+  if (!senderId || !product) return null;
+
+  const memory = getCustomerMemory(senderId);
+  const id = String(product.id || '');
+
+  for (
+    let i = memory.productDiscussions.length - 1;
+    i >= 0;
+    i--
+  ) {
+    const entry = memory.productDiscussions[i];
+
+    if (String(entry.productId) === id) {
+      return entry;
+    }
+  }
+
+  return null;
 }
 
 // =============================================================================
-// 5. CATALOG VALIDATION AND LOADING
+// 6. CATALOG LOADING AND VALIDATION
 // =============================================================================
 
 function validateCatalogShape(data) {
@@ -429,12 +613,28 @@ function validateCatalogShape(data) {
       throw new Error('Every product must be an object');
     }
 
-    const id = String(product.id ?? '').trim();
+    if (
+      product.id === undefined ||
+      product.id === null ||
+      String(product.id).trim() === ''
+    ) {
+      throw new Error('Every product must have an ID');
+    }
 
-    if (!id) throw new Error('Every product must have an ID');
-    if (ids.has(id)) throw new Error('Duplicate product ID: ' + id);
+    const id = String(product.id);
+
+    if (ids.has(id)) {
+      throw new Error(`Duplicate product ID: ${id}`);
+    }
 
     ids.add(id);
+
+    if (
+      product.media !== undefined &&
+      (!product.media || typeof product.media !== 'object')
+    ) {
+      throw new Error(`Invalid media object for product ${id}`);
+    }
   }
 
   if (data.faqs !== undefined && !Array.isArray(data.faqs)) {
@@ -460,25 +660,7 @@ function applyCatalog(data, source = 'local') {
 }
 
 function loadLocalCatalog() {
-  try {
-    if (!fs.existsSync(LOCAL_CATALOG_PATH)) {
-      return {
-        products,
-        faqs,
-        version: catalogMeta.version,
-        updatedAt: catalogMeta.updatedAt
-      };
-    }
-
-    const data = JSON.parse(
-      fs.readFileSync(LOCAL_CATALOG_PATH, 'utf8')
-    );
-
-    applyCatalog(data, 'local');
-    return data;
-  } catch (err) {
-    console.error('[CATALOG] Local load error:', err.message);
-
+  if (!fs.existsSync(LOCAL_CATALOG_PATH)) {
     return {
       products,
       faqs,
@@ -486,6 +668,25 @@ function loadLocalCatalog() {
       updatedAt: catalogMeta.updatedAt
     };
   }
+
+  const data = JSON.parse(
+    fs.readFileSync(LOCAL_CATALOG_PATH, 'utf8')
+  );
+
+  validateCatalogShape(data);
+
+  products = data.products;
+  faqs = Array.isArray(data.faqs) ? data.faqs : [];
+
+  catalogMeta = {
+    version: data.version ?? null,
+    updatedAt: data.updatedAt ?? null,
+    source: 'local',
+    lastSyncAt: null,
+    lastSyncError: null
+  };
+
+  return data;
 }
 
 function saveLocalCatalog(data, source = 'local') {
@@ -503,11 +704,35 @@ function saveLocalCatalog(data, source = 'local') {
   applyCatalog(data, source);
 }
 
-loadStorage();
-loadLocalCatalog();
+function replaceCatalogAtomically(data, source = 'admin') {
+  validateCatalogShape(data);
+
+  const normalized = {
+    ...data,
+    version: data.version ?? Date.now(),
+    updatedAt: data.updatedAt ?? new Date().toISOString(),
+    products: data.products,
+    faqs: Array.isArray(data.faqs) ? data.faqs : []
+  };
+
+  saveLocalCatalog(normalized, source);
+
+  console.log(
+    `[CATALOG] Replaced from ${source}: ` +
+    `${products.length} products, ${faqs.length} FAQs`
+  );
+
+  return normalized;
+}
+
+try {
+  loadLocalCatalog();
+} catch (err) {
+  console.error('[CATALOG] Local catalog error:', err.message);
+}
 
 // =============================================================================
-// 6. ADMIN AUTHENTICATION
+// 7. ADMIN AUTHENTICATION
 // =============================================================================
 
 function requireAdmin(req, res, next) {
@@ -543,37 +768,46 @@ function requireAdmin(req, res, next) {
 }
 
 app.use('/api', (req, res, next) => {
-  if (['/health', '/status'].includes(req.path)) return next();
+  if (['/health', '/status'].includes(req.path)) {
+    return next();
+  }
+
   return requireAdmin(req, res, next);
 });
 
 // =============================================================================
-// 7. PRODUCT AND FAQ SEARCH
+// 8. PRODUCT AND FAQ SEARCH
 // =============================================================================
+
+function fieldValues(value) {
+  if (Array.isArray(value)) return value.map(String);
+  if (value === undefined || value === null) return [];
+  return [String(value)];
+}
 
 function scoreRecord(query, record, fields) {
   const q = normalizeText(query);
   const tokens = tokenize(q);
 
-  if (!tokens.length) return 0;
+  if (!tokens.length || !record) return 0;
 
   let score = 0;
 
   for (const field of fields) {
-    const raw = record?.[field];
+    const values = fieldValues(record[field])
+      .map(normalizeText)
+      .filter(Boolean);
 
-    const value = normalizeText(
-      Array.isArray(raw) ? raw.join(' ') : raw || ''
-    );
+    for (const value of values) {
+      if (value === q) {
+        score += field === 'name' || field === 'id' ? 30 : 20;
+      } else if (value.includes(q)) {
+        score += 12;
+      }
 
-    if (!value) continue;
-
-    if (q.length >= 4 && value === q) score += 50;
-    else if (q.length >= 4 && value.includes(q)) score += 20;
-
-    for (const token of tokens) {
-      if (value === token) score += 12;
-      else if (value.includes(token)) score += 4;
+      for (const token of tokens) {
+        if (value.includes(token)) score += 2;
+      }
     }
   }
 
@@ -582,14 +816,26 @@ function scoreRecord(query, record, fields) {
 
 function productScore(query, product) {
   return scoreRecord(query, product, [
-    'id', 'name', 'description', 'shortDescription', 'category',
-    'brand', 'model', 'sku', 'keywords', 'tags', 'aliases'
+    'id',
+    'name',
+    'description',
+    'shortDescription',
+    'category',
+    'brand',
+    'model',
+    'sku',
+    'keywords',
+    'tags',
+    'aliases'
   ]);
 }
 
 function findRelevantProducts(query) {
   return products
-    .map(product => ({ product, score: productScore(query, product) }))
+    .map(product => ({
+      product,
+      score: productScore(query, product)
+    }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, MAX_PRODUCTS_TO_AI)
@@ -601,7 +847,10 @@ function findRelevantFaqs(query) {
     .map(faq => ({
       faq,
       score: scoreRecord(query, faq, [
-        'question', 'answer', 'category', 'keywords'
+        'question',
+        'answer',
+        'category',
+        'keywords'
       ])
     }))
     .filter(item => item.score > 0)
@@ -611,88 +860,7 @@ function findRelevantFaqs(query) {
 }
 
 // =============================================================================
-// 8. CONVERSATION HISTORY
-// =============================================================================
-
-function getHistory(senderId) {
-  const id = String(senderId || '');
-  if (!id) return [];
-
-  if (customerHistory.has(id)) return customerHistory.get(id);
-
-  const history = [];
-
-  for (const message of db.messages) {
-    if (String(message.senderId) !== id) continue;
-
-    let role;
-
-    if (['customer', 'user'].includes(message.sender)) {
-      role = 'user';
-    } else if (['bot', 'assistant', 'admin'].includes(message.sender)) {
-      role = 'assistant';
-    } else {
-      continue;
-    }
-
-    history.push({
-      role,
-      text: String(message.text || ''),
-      timestamp: new Date(message.timestamp || Date.now()).getTime()
-    });
-  }
-
-  const limited = history.slice(-HISTORY_LIMIT);
-  customerHistory.set(id, limited);
-  return limited;
-}
-
-function appendHistory(senderId, role, text) {
-  if (!senderId || !text) return;
-
-  const id = String(senderId);
-  const history = getHistory(id);
-
-  history.push({
-    role,
-    text: String(text).trim(),
-    timestamp: Date.now()
-  });
-
-  if (history.length > HISTORY_LIMIT) {
-    history.splice(0, history.length - HISTORY_LIMIT);
-  }
-
-  customerHistory.set(id, history);
-}
-
-function getRecentConversationText(senderId, additionalText = '') {
-  return [
-    ...getHistory(senderId).slice(-HISTORY_LIMIT).map(item => item.text),
-    additionalText
-  ].filter(Boolean).join('\n');
-}
-
-function getPreviousAssistantReply(senderId, userText) {
-  const history = getHistory(senderId);
-  const normalized = normalizeText(userText);
-
-  for (let i = history.length - 2; i >= 0; i--) {
-    if (
-      history[i].role === 'user' &&
-      normalizeText(history[i].text) === normalized
-    ) {
-      for (let j = i + 1; j < history.length; j++) {
-        if (history[j].role === 'assistant') return history[j].text;
-      }
-    }
-  }
-
-  return null;
-}
-
-// =============================================================================
-// 9. EXACT PRODUCT MATCHING AND PRICE PROTECTION
+// 9. EXACT PRODUCT AND PRICE PROTECTION
 // =============================================================================
 
 function isPriceQuestion(text = '') {
@@ -710,53 +878,38 @@ function isGenericPriceQuestion(text = '') {
   const value = normalizeText(text);
 
   return [
-    /^দাম$/, /^দাম কত$/, /^দামটা কত$/, /^প্রাইস$/,
-    /^প্রাইস কত$/, /^মূল্য$/, /^মূল্য কত$/, /^কত টাকা$/,
-    /^কত দাম$/, /^price$/, /^price please$/, /^how much$/,
-    /^how much is it$/, /^what is the price$/
+    /^দাম$/,
+    /^দাম কত$/,
+    /^দামটা কত$/,
+    /^প্রাইস$/,
+    /^প্রাইস কত$/,
+    /^মূল্য$/,
+    /^মূল্য কত$/,
+    /^কত টাকা$/,
+    /^কত দাম$/,
+    /^price$/,
+    /^price please$/,
+    /^how much$/,
+    /^how much is it$/,
+    /^what is the price$/
   ].some(pattern => pattern.test(value));
-}
-
-function getProductIdentifiers(product) {
-  return [
-    product.name,
-    product.id,
-    product.sku,
-    product.model,
-    ...(Array.isArray(product.aliases) ? product.aliases : [])
-  ]
-    .filter(Boolean)
-    .map(normalizeText)
-    .filter(Boolean);
 }
 
 function findExactProductForPrice(query) {
   const q = normalizeText(query);
   if (!q) return null;
 
-  const matches = [];
-
-  for (const product of products) {
-    const identifiers = getProductIdentifiers(product);
-
-    const matched = identifiers.some(identifier => {
-      if (identifier.length < 3) return false;
-
-      const escaped = identifier.replace(
-        /[.*+?^${}()|[\]\\]/g,
-        '\\$&'
-      );
-
-      const pattern = new RegExp(
-        `(^|\\s)${escaped.replace(/\s+/g, '\\s+')}(?=\\s|$)`,
-        'i'
-      );
-
-      return pattern.test(q);
+  const matches = products.filter(product => {
+    return getProductIdentifiers(product).some(identifier => {
+      return identifier === q ||
+        (
+          identifier.length >= 3 &&
+          new RegExp(
+            `(^|\\s)${identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`
+          ).test(q)
+        );
     });
-
-    if (matched) matches.push(product);
-  }
+  });
 
   return matches.length === 1 ? matches[0] : null;
 }
@@ -767,18 +920,19 @@ function findProductFromRecentContext(senderId) {
   for (let i = history.length - 1; i >= 0; i--) {
     if (history[i].role !== 'user') continue;
 
-    const previousText = history[i].text || '';
-    const match = findExactProductForPrice(previousText);
+    const product = findExactProductForPrice(history[i].text);
 
-    if (match) return match;
+    if (product) return product;
   }
 
   const memory = getCustomerMemory(senderId);
-  const recentFacts = (memory?.facts || []).slice().reverse();
 
-  for (const fact of recentFacts) {
-    const match = findExactProductForPrice(fact);
-    if (match) return match;
+  for (const discussion of memory.productDiscussions.slice().reverse()) {
+    const product = products.find(
+      item => String(item.id) === String(discussion.productId)
+    );
+
+    if (product) return product;
   }
 
   return null;
@@ -786,6 +940,7 @@ function findProductFromRecentContext(senderId) {
 
 function getPriceReply(product) {
   if (
+    !product ||
     product.price === undefined ||
     product.price === null ||
     String(product.price).trim() === ''
@@ -801,658 +956,154 @@ function getPriceClarificationReply() {
 }
 
 // =============================================================================
-// 10. MOTORCYCLE H4 / HS1 / 3-PIN LED HEADLIGHT COMPATIBILITY
+// 10. MOTORCYCLE BULB COMPATIBILITY
 // =============================================================================
 
-// -----------------------------------------------------------------------------
-// 10.1 BUILT-IN BIKE DATABASE
-// -----------------------------------------------------------------------------
-// H4 এবং HS1 — দুটোই P43t/PX43t সকেট ব্যবহার করে, তাই দুটোতেই ৩-পিন LED
-// হেডলাইট সরাসরি plug-and-play হিসেবে বসে। ImpoTech শুধু LED হেডলাইট বিক্রি
-// করে, তাই স্টক বাল্ব H4 হোক বা HS1 — উভয় ক্ষেত্রেই আমাদের LED fit হবে।
-
 const BUILTIN_BIKE_DATABASE = [
-  // -------- YAMAHA --------
   {
     brand: 'Yamaha',
     model: 'FZ',
-    aliases: ['fz', 'fz-s', 'fz s', 'fz16', 'fz 16', 'fz v2', 'fz v3', 'fz-s v2', 'fz-s v3', 'fzs'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['fz', 'fz-s', 'fz s', 'fz16', 'fz 16', 'fzs']
   },
   {
     brand: 'Yamaha',
     model: 'FZ25',
-    aliases: ['fz25', 'fz 25', 'fz-25'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'Fazer',
-    aliases: ['fazer', 'fz-s fazer', 'fazer 150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['fz25', 'fz 25']
   },
   {
     brand: 'Yamaha',
     model: 'R15',
-    aliases: ['r15', 'r 15', 'r15 v2', 'r15 v3', 'r15 v4', 'r15m'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
+    aliases: ['r15', 'r 15', 'r15 v2', 'r15 v3', 'r15 v4']
   },
   {
     brand: 'Yamaha',
     model: 'MT-15',
-    aliases: ['mt 15', 'mt-15', 'mt15'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
+    aliases: ['mt15', 'mt 15']
   },
-  {
-    brand: 'Yamaha',
-    model: 'Saluto',
-    aliases: ['saluto', 'saluto 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'SZ-RR',
-    aliases: ['sz-rr', 'sz rr', 'szrr', 'sz-r'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-
-  // -------- BAJAJ --------
   {
     brand: 'Bajaj',
     model: 'Pulsar 150',
-    aliases: ['pulsar 150', 'pulsar150', 'p150', 'pulsar 150 twin disc', 'pulsar 150 neon'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar 180',
-    aliases: ['pulsar 180', 'pulsar180', 'p180'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar 220',
-    aliases: ['pulsar 220', 'pulsar220', 'p220', 'pulsar 220f'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['pulsar 150', 'pulsar150', 'p150']
   },
   {
     brand: 'Bajaj',
     model: 'Pulsar NS200',
-    aliases: ['pulsar ns200', 'ns 200', 'ns200', 'pulsar 200ns', 'pulsar ns 200'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['ns200', 'ns 200', 'pulsar ns200']
   },
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar RS200',
-    aliases: ['pulsar rs200', 'rs200', 'rs 200'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Avenger',
-    aliases: ['avenger', 'avenger 150', 'avenger 220', 'avenger street 150', 'avenger street 220', 'avenger cruise'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Discover',
-    aliases: ['discover', 'discover 125', 'discover 135', 'discover 150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Platina',
-    aliases: ['platina', 'platina 100', 'platina 110'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-
-  // -------- TVS --------
   {
     brand: 'TVS',
     model: 'Apache RTR 160',
-    aliases: ['apache rtr 160', 'apache 160', 'rtr 160', 'rtr160', 'apache rtr160', 'apache rtr 160 2v', 'apache rtr 160 4v'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Apache RTR 180',
-    aliases: ['apache rtr 180', 'apache 180', 'rtr 180', 'rtr180'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
+    aliases: ['apache rtr 160', 'rtr160', 'apache 160']
   },
   {
     brand: 'TVS',
     model: 'Apache RTR 200',
-    aliases: ['apache rtr 200', 'apache 200', 'rtr 200', 'rtr200', 'apache rtr 200 4v'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['apache rtr 200', 'rtr200']
   },
-  {
-    brand: 'TVS',
-    model: 'Apache RR 310',
-    aliases: ['apache rr 310', 'rr 310', 'rr310'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Raider',
-    aliases: ['raider', 'raider 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Metro',
-    aliases: ['metro', 'tvs metro'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-
-  // -------- HERO --------
   {
     brand: 'Hero',
     model: 'Splendor',
-    aliases: ['splendor', 'splendor plus', 'splendor pro', 'splendor ismart', 'splendor+', 'splendor +'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['splendor', 'splendor plus']
   },
-  {
-    brand: 'Hero',
-    model: 'Passion',
-    aliases: ['passion', 'passion pro', 'passion xpro', 'passion plus'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'HF Deluxe',
-    aliases: ['hf deluxe', 'hf-deluxe', 'hf'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Hunk',
-    aliases: ['hunk', 'hunk 150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Xtreme',
-    aliases: ['xtreme', 'xtreme 150', 'xtreme 160r', 'xtreme 200r', 'xtreme 200s'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Glamour',
-    aliases: ['glamour', 'glamour 125', 'glamour fi'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Karizma',
-    aliases: ['karizma', 'karizma r', 'karizma zmar', 'karizma zmr'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-
-  // -------- HONDA --------
   {
     brand: 'Honda',
     model: 'CB Shine',
-    aliases: ['cb shine', 'cbshine', 'shine', 'cb shine sp', 'shine sp'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['cb shine', 'cbshine', 'shine']
   },
-  {
-    brand: 'Honda',
-    model: 'CB Unicorn',
-    aliases: ['cb unicorn', 'unicorn', 'unicorn 160', 'cb unicorn 160'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'Hornet',
-    aliases: ['hornet', 'hornet 160r', 'cb hornet', 'cb hornet 160r'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'CBR',
-    aliases: ['cbr', 'cbr 150', 'cbr 250', 'cbr150r', 'cbr250r'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'Livo',
-    aliases: ['livo', 'livo 110'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'Dream Yuga',
-    aliases: ['dream yuga', 'yuga'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'SP 125',
-    aliases: ['sp 125', 'sp125'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-
-  // -------- SUZUKI --------
   {
     brand: 'Suzuki',
     model: 'Gixxer',
-    aliases: ['gixxer', 'gixxer 150', 'gixxer 155', 'gixxer sf', 'gixxer sf 150', 'gixxer sf 250'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Suzuki',
-    model: 'GS150R',
-    aliases: ['gs150r', 'gs 150r', 'gs150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Suzuki',
-    model: 'Access',
-    aliases: ['access', 'access 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Suzuki',
-    model: 'Burgman',
-    aliases: ['burgman', 'burgman street', 'burgman 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-
-  // -------- KTM --------
-  {
-    brand: 'KTM',
-    model: 'Duke 125',
-    aliases: ['duke 125', 'duke125'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'KTM',
-    model: 'Duke 200',
-    aliases: ['duke 200', 'duke200', 'duke 200 ng'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'KTM',
-    model: 'Duke 390',
-    aliases: ['duke 390', 'duke390'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'KTM',
-    model: 'RC 200',
-    aliases: ['rc 200', 'rc200'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-
-  // -------- ROYAL ENFIELD --------
-  {
-    brand: 'Royal Enfield',
-    model: 'Classic 350',
-    aliases: ['classic 350', 'classic350', 're classic'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Royal Enfield',
-    model: 'Bullet 350',
-    aliases: ['bullet 350', 'bullet350', 're bullet'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Royal Enfield',
-    model: 'Hunter 350',
-    aliases: ['hunter 350', 'hunter350'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
+    aliases: ['gixxer', 'gixxer 150', 'gixxer sf']
   }
 ];
-
-// -----------------------------------------------------------------------------
-// 10.2 H4-সামঞ্জস্যপূর্ণ ৩-পিন বাল্ব মডেল (কাস্টমার সরাসরি নাম বললে)
-// -----------------------------------------------------------------------------
-
-const H4_COMPATIBLE_THREE_PIN_MODELS = [
-  { keys: ['h4', 'h 4', 'h-4'], name: 'H4', label: 'H4 (স্ট্যান্ডার্ড, ৬০/৫৫W)' },
-  { keys: ['9003', 'hb2'], name: '9003 / HB2', label: '9003 / HB2 (H4-এর উত্তর আমেরিকান নাম)' },
-  { keys: ['hs1', 'hs 1', 'hs-1'], name: 'HS1', label: 'HS1 (মোটরসাইকেলের ৩৫/৩৫W সংস্করণ)' }
-];
-
-// H4 সকেটে সরাসরি বসে না — আলাদা অ্যাডাপ্টার দরকার
-const NON_COMPATIBLE_BULB_MODELS = [
-  { keys: ['h6m', 'h 6m', 'h6'], name: 'H6M' },
-  { keys: ['h7', 'h 7', 'h-7'], name: 'H7' },
-  { keys: ['h11', 'h 11'], name: 'H11' },
-  { keys: ['h13', 'h 13'], name: 'H13' },
-  { keys: ['h1', 'h-1'], name: 'H1' },
-  { keys: ['h3', 'h-3'], name: 'H3' }
-];
-
-// -----------------------------------------------------------------------------
-// 10.3 DETECTION HELPERS
-// -----------------------------------------------------------------------------
-
-function isBikeCompatibilityQuestion(text = '') {
-  const value = normalizeText(text);
-
-  const hasLightingTerm =
-    /h\s*-?\s*[0-9]+|9003|hb2|hs\s*-?\s*1|devil\s*eye|headlight|head\s*lamp|হেডলাইট|হেড\s*লাইট|plug\s*and\s*play|প্লাগ\s*অ্যান্ড\s*প্লে|socket|সকেট|ক্লার|clearance|বাল্ব|bulb|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন/.test(value);
-
-  const hasBikeTerm =
-    /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট|পিন|pin|লাগবে|lagbe/.test(value);
-
-  return hasLightingTerm && hasBikeTerm;
-}
-
-function detectH4CompatibleThreePinModels(text = '') {
-  const value = normalizeText(text);
-  const detected = [];
-
-  for (const item of H4_COMPATIBLE_THREE_PIN_MODELS) {
-    const found = item.keys.some(key => {
-      const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const pattern = new RegExp(
-        `(^|\\s)${escaped.replace(/\s+/g, '\\s*')}(?=\\s|$)`,
-        'i'
-      );
-      return pattern.test(value);
-    });
-    if (found) detected.push(item);
-  }
-
-  return detected;
-}
-
-function detectNonCompatibleBulbModels(text = '') {
-  const value = normalizeText(text);
-  const detected = [];
-
-  for (const item of NON_COMPATIBLE_BULB_MODELS) {
-    const found = item.keys.some(key => {
-      const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const pattern = new RegExp(
-        `(^|\\s)${escaped.replace(/\s+/g, '\\s*')}(?=\\s|$)`,
-        'i'
-      );
-      return pattern.test(value);
-    });
-    if (found) detected.push(item);
-  }
-
-  return detected;
-}
-
-function getAllBikeCompatibilityEntries() {
-  const entries = [];
-
-  for (const product of products) {
-    if (Array.isArray(product.bikeCompatibility)) {
-      entries.push(...product.bikeCompatibility);
-    } else if (product.bikeCompatibility) {
-      entries.push(product.bikeCompatibility);
-    }
-  }
-
-  for (const faq of faqs) {
-    if (Array.isArray(faq.bikeCompatibility)) {
-      entries.push(...faq.bikeCompatibility);
-    } else if (faq.bikeCompatibility) {
-      entries.push(faq.bikeCompatibility);
-    }
-  }
-
-  for (const item of BUILTIN_BIKE_DATABASE) {
-    entries.push({
-      brand: item.brand,
-      model: item.model,
-      aliases: item.aliases,
-      originalH4Socket: true,
-      stockBulbType: item.stockBulbType,
-      socketType: item.socketType,
-      ledPlugAndPlay: item.ledPlugAndPlay,
-      verified: true,
-      source: 'built-in-database'
-    });
-  }
-
-  return entries;
-}
 
 function identifyBikeModel(text = '') {
   const value = normalizeText(text);
 
-  const directPin = detectH4CompatibleThreePinModels(text);
+  for (const entry of BUILTIN_BIKE_DATABASE) {
+    const identifiers = [
+      `${entry.brand} ${entry.model}`,
+      entry.model,
+      ...(entry.aliases || [])
+    ].map(normalizeText);
 
-  if (directPin.length) {
-    return {
-      entry: {
-        brand: 'বাল্ব মডেল',
-        model: directPin.map(item => item.name).join(' / '),
-        originalH4Socket: true,
-        stockBulbType: directPin[0].name,
-        socketType: 'P43t / PX43t',
-        ledPlugAndPlay: true,
-        verified: true,
-        source: 'direct-bulb-name'
-      },
-      matchedName: directPin[0].name,
-      score: 200,
-      directBulb: true
-    };
-  }
-
-  const matches = getAllBikeCompatibilityEntries()
-    .filter(entry =>
-      entry &&
-      entry.verified === true &&
-      entry.brand &&
-      entry.model
-    )
-    .map(entry => {
-      const aliases = Array.isArray(entry.aliases) ? entry.aliases : [];
-      const names = [`${entry.brand} ${entry.model}`, entry.model, ...aliases]
-        .map(normalizeText)
-        .filter(Boolean);
-
-      const matchedName = names
-        .filter(name => name.length >= 3 && value.includes(name))
-        .sort((a, b) => b.length - a.length)[0];
-
+    if (identifiers.some(identifier =>
+      identifier.length >= 3 && value.includes(identifier)
+    )) {
       return {
         entry,
-        matchedName,
-        score: matchedName ? matchedName.length : 0
+        verified: false
       };
-    })
-    .filter(item => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-
-  if (!matches.length) return null;
-
-  return matches[0];
-}
-
-function getH4CompatibilityReply(match, customerText = '') {
-  const nonCompatible = detectNonCompatibleBulbModels(customerText);
-
-  if (nonCompatible.length) {
-    const names = nonCompatible.map(item => item.name).join(', ');
-    return (
-      `${names} বাল্বের বেস H4/HS1 সকেটের সাথে সরাসরি মেলে না। ` +
-      'এই বাল্ব লাগাতে হলে আলাদা অ্যাডাপ্টার বা হেডলাইট মডিফিকেশন লাগবে। ' +
-      'তবে আমাদের LED হেডলাইট H4/HS1 বেসে আসে, তাই এগুলো সরাসরি plug-and-play হবে।'
-    );
-  }
-
-  const detectedModels = detectH4CompatibleThreePinModels(customerText);
-
-  if (detectedModels.length) {
-    const modelList = detectedModels.map(item => `• ${item.label}`).join('\n');
-    return (
-      'আপনি যে মডেলটি বলেছেন সেটি H4 সকেটের সাথে সম্পূর্ণ সামঞ্জস্যপূর্ণ। ' +
-      'H4 সকেট (P43t) ৩-পিন plug-and-play সমর্থন করে। ' +
-      'আমাদের LED হেডলাইট সরাসরি আপনার বাইকের সকেটে বসবে — কোনো অ্যাডাপ্টার বা কাটাকাটি লাগবে না।\n' +
-      modelList
-    );
-  }
-
-  if (!match?.entry) return null;
-
-  const entry = match.entry;
-  const model = `${entry.brand} ${entry.model}`.trim();
-
-  if (entry.ledPlugAndPlay !== false && (entry.originalH4Socket === true || entry.socketType)) {
-    const stockType = entry.stockBulbType || 'H4';
-    const socketType = entry.socketType || 'P43t';
-
-    return (
-      `হ্যাঁ, আপনার ${model}-এ ${stockType} স্টক হেডলাইট আছে, সকেট টাইপ ${socketType}। ` +
-      'এই সকেটে ৩-পিন LED হেডলাইট সরাসরি plug-and-play হিসেবে ফিট হবে — ' +
-      'কোনো অ্যাডাপ্টার, কাটাকাটি বা ওয়্যারিং পরিবর্তন লাগবে না।'
-    );
-  }
-
-  if (entry.originalH4Socket === false) {
-    return (
-      `দুঃখিত, ক্যাটালগ অনুযায়ী ${model}-এর স্টক হেডলাইটে H4/HS1 সকেট নেই। ` +
-      'তবে আপনার বাইকে আগে থেকে হেডলাইট পরিবর্তন করা থাকলে সেটি জানালে মিলিয়ে বলতে পারব।'
-    );
+    }
   }
 
   return null;
 }
 
-function extractBikeYear(text = '') {
-  const matches = String(text).match(/\b(?:19[89]\d|20[0-3]\d)\b/g);
-  return matches ? matches[matches.length - 1] : null;
-}
+function getCatalogBikeCompatibility(text = '') {
+  const value = normalizeText(text);
+  const matches = [];
 
-function customerConfirmedH4(senderId, currentText = '') {
-  const context = normalizeText(
-    getRecentConversationText(senderId, currentText)
-  );
+  for (const product of products) {
+    const entries = Array.isArray(product.bikeCompatibility)
+      ? product.bikeCompatibility
+      : product.bikeCompatibility
+        ? [product.bikeCompatibility]
+        : [];
 
-  const hasH4Socket =
-    /(^|\s)h\s*-?\s*4(\s|$)/.test(context) ||
-    /(^|\s)9003(\s|$)/.test(context) ||
-    /(^|\s)hb2(\s|$)/.test(context) ||
-    /(^|\s)hs\s*-?\s*1(\s|$)/.test(context);
+    for (const entry of entries) {
+      if (!entry || entry.verified !== true) continue;
 
-  const hasThreePin =
-    /(^|\s)3\s*-?\s*pin(\s|$)/.test(context) ||
-    /তিন\s*পিন|৩\s*পিন|three\s*-?\s*pin/.test(context);
+      const identifiers = [
+        `${entry.brand || ''} ${entry.model || ''}`,
+        entry.model,
+        ...(Array.isArray(entry.aliases) ? entry.aliases : [])
+      ].map(normalizeText).filter(Boolean);
 
-  const confirmation =
-    /আমার বাইকে|my bike has|বাইকে আছে|সকেট আছে|socket আছে|পিন আছে|pin আছে|fit হবে|ফিট হবে|plug and play|প্লাগ অ্যান্ড প্লে/;
-
-  return (hasH4Socket || hasThreePin) && confirmation.test(context);
-}
-
-function getBikeClarificationReply(senderId, text = '') {
-  const context = getRecentConversationText(senderId, text);
-
-  const bikeMatch = identifyBikeModel(context);
-  if (bikeMatch) return null;
-
-  const year = extractBikeYear(context);
-
-  if (!year) {
-    return (
-      'আপনার বাইকের ব্র্যান্ড ও মডেল জানাবেন? যেমন: Yamaha FZ, Bajaj Pulsar 150, TVS Apache, Honda CB Shine। ' +
-      'মডেল জানলে আমি সকেট টাইপ মিলিয়ে বলতে পারব আমাদের LED হেডলাইট plug-and-play হিসেবে ফিট হবে কিনা।'
-    );
+      if (identifiers.some(identifier =>
+        identifier.length >= 3 && value.includes(identifier)
+      )) {
+        matches.push(entry);
+      }
+    }
   }
 
-  return null;
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function isBikeCompatibilityQuestion(text = '') {
+  const value = normalizeText(text);
+
+  const lighting =
+    /h4|hs1|h6m|h7|h11|h13|headlight|head lamp|হেডলাইট|বাল্ব|socket|সকেট|plug and play|ফিট হবে/.test(value);
+
+  const bike =
+    /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|মডেল|model|সাল|বছর|year|ফিট|fit|সাপোর্ট|support/.test(value);
+
+  return lighting && bike;
+}
+
+function getBikeClarificationReply() {
+  return 'আপনার বাইকের ব্র্যান্ড, সঠিক মডেল ও সাল জানাবেন? সম্ভব হলে বর্তমান বাল্বের বেস/সকেটের ছবিও দিন। যাচাই করে ফিটমেন্ট জানাতে পারব।';
+}
+
+function getH4CompatibilityReply(text = '') {
+  const match = getCatalogBikeCompatibility(text);
+
+  if (match) {
+    if (match.originalH4Socket === false) {
+      return 'ক্যাটালগ অনুযায়ী এই মডেলের স্টক সকেট আমাদের LED হেডলাইটের সঙ্গে সরাসরি মেলে না। সঠিক অ্যাডাপ্টার বা বিকল্প যাচাই করা দরকার।';
+    }
+
+    if (
+      match.originalH4Socket === true &&
+      match.ledPlugAndPlay === true
+    ) {
+      return 'ক্যাটালগে এই বাইকের ফিটমেন্ট যাচাই করা আছে। আপনার বাইকের সাল ও বর্তমান সকেট মিলিয়ে নিলে সরাসরি ফিটমেন্ট নিশ্চিত করা যাবে।';
+    }
+  }
+
+  return getBikeClarificationReply();
 }
 
 // =============================================================================
@@ -1472,7 +1123,7 @@ function getMediaType(text = '') {
 }
 
 function isMediaRequest(text = '') {
-  return Boolean(getMediaType(text));
+  return getMediaType(text) !== null;
 }
 
 function isFacebookLink(url) {
@@ -1484,7 +1135,8 @@ function isFacebookLink(url) {
       (
         parsed.hostname === 'facebook.com' ||
         parsed.hostname.endsWith('.facebook.com') ||
-        parsed.hostname === 'fb.watch'
+        parsed.hostname === 'fb.watch' ||
+        parsed.hostname.endsWith('.fb.watch')
       )
     );
   } catch (_) {
@@ -1504,12 +1156,14 @@ function getProductMediaUrls(product, mediaType) {
 
 function findProductForMedia(query, senderId) {
   const exact = findExactProductForPrice(query);
+
   if (exact) return exact;
 
-  const q = normalizeText(query);
-
   const candidates = products
-    .map(product => ({ product, score: productScore(q, product) }))
+    .map(product => ({
+      product,
+      score: productScore(query, product)
+    }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score);
 
@@ -1528,6 +1182,7 @@ function findProductForMedia(query, senderId) {
 
 function getProductMediaReply(query, senderId) {
   const mediaType = getMediaType(query);
+
   if (!mediaType) return null;
 
   const product = findProductForMedia(query, senderId);
@@ -1539,31 +1194,61 @@ function getProductMediaReply(query, senderId) {
   const urls = getProductMediaUrls(product, mediaType);
 
   if (!urls.length) {
-    return (
-      `দুঃখিত, ${product.name}-এর ` +
-      `${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`
-    );
+    return `দুঃখিত, ${product.name}-এর ${mediaType === 'images' ? 'ছবি' : 'ভিডিও'} লিংক ক্যাটালগে পাওয়া যাচ্ছে না।`;
   }
 
   const label = mediaType === 'images' ? 'ছবি' : 'ভিডিও';
 
-  return (
-    `অবশ্যই! ${product.name} পণ্যের ${label} লিংক:\n` +
-    urls.map((url, index) => `${index + 1}. ${url}`).join('\n')
-  );
+  return `অবশ্যই! ${product.name}-এর ${label} লিংক:\n` +
+    urls.map((url, index) => `${index + 1}. ${url}`).join('\n');
 }
 
 // =============================================================================
-// 12. ORDER INTENT AND ORDER STORAGE
+// 12. PHONE, ADDRESS AND ORDER HELPERS
 // =============================================================================
+
+function extractPhoneNumber(text = '') {
+  const match = String(text).match(
+    /(?:\+?8801|01)[0-9\s-]{8,14}/
+  );
+
+  if (!match) return null;
+
+  let phone = match[0].replace(/[\s-]/g, '');
+
+  if (phone.startsWith('+880')) phone = phone.slice(1);
+
+  // Normalize +8801XXXXXXXXX to 01XXXXXXXXX.
+  if (/^8801\d{9}$/.test(phone)) {
+    phone = '0' + phone.slice(3);
+  }
+
+  if (!/^01\d{9}$/.test(phone)) return null;
+
+  return phone;
+}
+
+function extractAddressText(text = '') {
+  const patterns = [
+    /(?:আমার ঠিকানা|ডেলিভারি ঠিকানা|ঠিকানা|address|গ্রাম|বাসা|বাজার|রোড|road|village|house|জেলা|জিলা|district)\s*[:：-]?\s*[^\n।.!?]{2,160}/i,
+    /(?:গাজীপুর|ঢাকা|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা|বরিশাল|রংপুর|ময়মনসিংহ)[^\n।.!?]{2,160}/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = String(text).match(pattern);
+
+    if (match) return match[0].trim();
+  }
+
+  return null;
+}
 
 function isExplicitOrderIntent(text = '') {
   const value = normalizeText(text);
-  if (!value) return false;
 
   const patterns = [
     /\b(i want to order|i would like to order|place my order|order this|i will buy|i want to buy|buy this|confirm my order|i will take it|i want this)\b/i,
-    /\b(order kore din|order korbo|order dibo|order dite chai|order korte chai|kinbo|kine nibo|eta nibo|eta kinbo)\b/i,
+    /\b(order korbo|order dibo|order dite chai|order korte chai|kinbo|kine nibo|eta nibo|eta kinbo)\b/i,
     /অর্ডার করতে চাই|অর্ডার করব|অর্ডার করবো|অর্ডার দিন|অর্ডার করে দিন|অর্ডার দিব|অর্ডার দেব|অর্ডার দিতে চাই|অর্ডার কনফার্ম|কিনতে চাই|কিনব|কিনবো|নিতে চাই|নিব|নেব|পণ্যটি নেব|পণ্যটা নেব|এটা নেব|এটি নেব|এটা কিনব|এটি কিনব|কিনে নেব|কিনে নিব/
   ];
 
@@ -1572,9 +1257,10 @@ function isExplicitOrderIntent(text = '') {
 
 function identifyOrderedProduct(senderId, customerText) {
   const exact = findExactProductForPrice(customerText);
+
   if (exact) return exact;
 
-  const currentMatches = products
+  const candidates = products
     .map(product => ({
       product,
       score: productScore(customerText, product)
@@ -1583,73 +1269,184 @@ function identifyOrderedProduct(senderId, customerText) {
     .sort((a, b) => b.score - a.score);
 
   if (
-    currentMatches.length &&
+    candidates.length &&
     (
-      currentMatches.length === 1 ||
-      currentMatches[0].score > currentMatches[1].score
+      candidates.length === 1 ||
+      candidates[0].score > candidates[1].score
     )
   ) {
-    return currentMatches[0].product;
+    return candidates[0].product;
   }
 
   return findProductFromRecentContext(senderId);
 }
 
-function createMessengerOrder(senderId, customerText, messageId) {
-  const id = String(senderId || '').trim();
-  if (!id) throw new Error('Customer sender ID is required');
+function getPendingOrder(senderId) {
+  const id = String(senderId || '');
+  if (!id) return null;
 
-  if (messageId) {
-    const existing = db.orders.find(
-      order => order.sourceMessageId === messageId
-    );
+  const pending = db.pendingOrders[id];
 
-    if (existing) return { order: existing, created: false };
+  if (!pending) return null;
+
+  const updatedAt = Number(pending.updatedAt || pending.createdAt || 0);
+
+  if (
+    updatedAt &&
+    Date.now() - updatedAt > PENDING_ORDER_RETENTION_MS
+  ) {
+    delete db.pendingOrders[id];
+    saveStorage();
+    return null;
   }
+
+  return pending;
+}
+
+function updatePendingOrderFromMessage(senderId, customerText) {
+  const id = String(senderId || '');
+  const text = String(customerText || '').trim();
+
+  const pending = getPendingOrder(id);
+
+  if (!pending || !text) return pending;
+
+  const customer = db.customers[id] || {};
+  const phone = extractPhoneNumber(text);
+  const address = extractAddressText(text);
+  const product = identifyOrderedProduct(id, text);
+
+  if (phone) {
+    pending.customerPhone = phone;
+    customer.phone = phone;
+  } else if (!pending.customerPhone && customer.phone) {
+    pending.customerPhone = customer.phone;
+  }
+
+  if (address) {
+    pending.customerAddress = address;
+    customer.address = address;
+  } else if (!pending.customerAddress && customer.address) {
+    pending.customerAddress = customer.address;
+  }
+
+  if (product) {
+    pending.productId = product.id;
+    pending.productName = product.name;
+    pending.productPrice = product.price ?? null;
+  }
+
+  const quantityMatch = text.match(
+    /(?:পরিমাণ|কয়টি|কয়টি|quantity|qty)\s*[:：]?\s*(\d{1,3})/i
+  );
+
+  if (quantityMatch) {
+    const quantity = Number(quantityMatch[1]);
+
+    if (quantity >= 1 && quantity <= 100) {
+      pending.quantity = quantity;
+    }
+  }
+
+  pending.updatedAt = Date.now();
+  pending.updatedAtISO = new Date().toISOString();
+
+  db.customers[id] = customer;
+  db.pendingOrders[id] = pending;
+
+  saveStorage();
+
+  return pending;
+}
+
+function startPendingOrder(senderId, customerText, messageId) {
+  const id = String(senderId || '').trim();
+
+  if (!id) throw new Error('Customer sender ID is required');
 
   const customer = db.customers[id] || {};
   const product = identifyOrderedProduct(id, customerText);
+  const phone = extractPhoneNumber(customerText) || customer.phone || null;
+  const address = extractAddressText(customerText) || customer.address || null;
 
-  const order = {
-    id: 'order_' + crypto.randomUUID(),
+  const existing = getPendingOrder(id);
+
+  const pending = existing || {
     senderId: id,
-    customerId: id,
-    customerName: customer.name || `Customer ${id.slice(-4)}`,
-    customerPhone: customer.phone || null,
-    productId: product?.id || null,
-    productName: product?.name || null,
-    productPrice: product?.price ?? null,
+    createdAt: Date.now(),
+    createdAtISO: new Date().toISOString(),
     quantity: 1,
-    customerMessage: String(customerText || '').trim(),
-    source: 'MESSENGER',
-    sourceMessageId: messageId || null,
-    status: 'PENDING_CONFIRMATION',
-    humanTakeover: true,
-    createdAt: new Date().toISOString()
+    sourceMessageId: messageId || null
   };
 
-  db.orders.push(order);
+  pending.orderIntentConfirmed = true;
+  pending.lastOrderIntentText = String(customerText || '').slice(0, 1000);
+  pending.updatedAt = Date.now();
+  pending.updatedAtISO = new Date().toISOString();
 
-  if (!db.customers[id]) {
-    db.customers[id] = {
-      id,
-      name: `Customer ${id.slice(-4)}`,
-      messageCount: 0,
-      lastActive: new Date().toISOString()
-    };
+  if (product) {
+    pending.productId = product.id;
+    pending.productName = product.name;
+    pending.productPrice = product.price ?? null;
   }
 
-  db.customers[id].lastOrderId = order.id;
-  db.customers[id].lastOrderAt = order.createdAt;
+  if (phone) pending.customerPhone = phone;
+  if (address) pending.customerAddress = address;
+
+  if (customer.phone && !pending.customerPhone) {
+    pending.customerPhone = customer.phone;
+  }
+
+  if (customer.address && !pending.customerAddress) {
+    pending.customerAddress = customer.address;
+  }
+
+  db.pendingOrders[id] = pending;
 
   cancelFollowup(id);
+  saveStorage();
 
-  if (!saveStorage()) {
-    db.orders = db.orders.filter(item => item.id !== order.id);
-    throw new Error('Could not persist the customer order');
+  return pending;
+}
+
+function getMissingOrderFields(pending) {
+  const missing = [];
+
+  if (!pending.productId || !pending.productName) {
+    missing.push('product');
   }
 
-  return { order, created: true };
+  if (!pending.customerPhone) {
+    missing.push('phone');
+  }
+
+  if (!pending.customerAddress) {
+    missing.push('address');
+  }
+
+  return missing;
+}
+
+function getOrderInformationRequest(pending) {
+  const missing = getMissingOrderFields(pending);
+
+  if (missing.includes('product')) {
+    return 'আপনি কোন পণ্যটি অর্ডার করতে চান? পণ্যের সঠিক নাম বা মডেলটি জানাবেন।';
+  }
+
+  if (missing.includes('phone') && missing.includes('address')) {
+    return 'অর্ডারটি সম্পন্ন করতে আপনার মোবাইল নম্বর ও সম্পূর্ণ ডেলিভারি ঠিকানা পাঠাবেন।';
+  }
+
+  if (missing.includes('phone')) {
+    return 'অর্ডারটি সম্পন্ন করতে আপনার সচল মোবাইল নম্বরটি পাঠাবেন।';
+  }
+
+  if (missing.includes('address')) {
+    return 'অর্ডারটি সম্পন্ন করতে আপনার সম্পূর্ণ ডেলিভারি ঠিকানা পাঠাবেন—এলাকা, থানা/উপজেলা ও জেলা-সহ।';
+  }
+
+  return null;
 }
 
 // =============================================================================
@@ -1660,6 +1457,7 @@ function getTakeoverState(customerId) {
   if (!customerId) return !!db.isGlobalPaused;
 
   const id = String(customerId).trim();
+
   if (db.isGlobalPaused) return true;
 
   if (
@@ -1679,7 +1477,22 @@ function getTakeoverState(customerId) {
   return false;
 }
 
-async function setTakeoverState(customerId, enabled, reasonStr) {
+function cancelFollowup(senderId) {
+  const id = String(senderId || '');
+
+  const timer = followupTimers.get(id);
+
+  if (timer) clearTimeout(timer);
+
+  followupTimers.delete(id);
+
+  if (db.scheduledFollowups[id]) {
+    delete db.scheduledFollowups[id];
+    saveStorage();
+  }
+}
+
+async function setTakeoverState(customerId, enabled, reason) {
   if (!customerId) return false;
 
   const id = String(customerId).trim();
@@ -1688,7 +1501,7 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
 
   db.takeovers[id] = {
     isPaused: isEnabled,
-    reason: reasonStr || (
+    reason: reason || (
       isEnabled ? 'Human takeover' : 'Admin resumed AI'
     ),
     timestamp
@@ -1697,7 +1510,7 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   if (!db.customers[id]) {
     db.customers[id] = {
       id,
-      name: `Customer ${id.slice(-4)}`,
+      name: customerDisplayName(id),
       messageCount: 0
     };
   }
@@ -1705,11 +1518,14 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   db.customers[id].isPaused = isEnabled;
   db.customers[id].takeover = isEnabled;
   db.customers[id].takeoverUpdatedAt = timestamp;
+  db.customers[id].takeoverReason = reason || null;
 
   if (isEnabled) cancelFollowup(id);
 
-  if (!saveStorage()) {
-    console.error('[Takeover] Failed to persist state');
+  const saved = saveStorage();
+
+  if (!saved) {
+    console.error('[Takeover] Could not persist takeover state');
   }
 
   console.log(
@@ -1723,17 +1539,130 @@ async function transferToHuman(senderId, reason, customMessage) {
   await setTakeoverState(
     senderId,
     true,
-    reason || 'Critical issue requiring human support'
+    reason || 'Human support required'
   );
 
   const message = customMessage ||
-    `আপনার বিষয়টি আমাদের প্রতিনিধির সহায়তা প্রয়োজন। আমি কথোপকথনটি প্রতিনিধির কাছে হস্তান্তর করছি। এখন থেকে প্রতিনিধি উত্তর দেবেন। জরুরি প্রয়োজনে হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`;
+    `আপনার বিষয়টি আমাদের প্রতিনিধির সহায়তা প্রয়োজন। ` +
+    `আমি কথোপকথনটি প্রতিনিধির কাছে হস্তান্তর করছি। ` +
+    `জরুরি প্রয়োজনে হেল্পলাইন: ${HELPLINE}। ` +
+    `WhatsApp: ${WHATSAPP_NUMBER}।`;
 
   return sendFacebookMessage(senderId, message);
 }
 
 // =============================================================================
-// 14. MESSENGER SEND AND RESPONSE LENGTH
+// 14. ORDER CREATION
+// =============================================================================
+
+function createMessengerOrder(senderId, customerText, messageId) {
+  const id = String(senderId || '').trim();
+
+  if (!id) throw new Error('Customer sender ID is required');
+
+  if (messageId) {
+    const existing = db.orders.find(
+      order => order.sourceMessageId === messageId
+    );
+
+    if (existing) return { order: existing, created: false };
+  }
+
+  // Prevent duplicate active orders for the same customer and product.
+  const pendingData = getPendingOrder(id);
+  const product = identifyOrderedProduct(
+    id,
+    customerText || pendingData?.productName || ''
+  );
+
+  const productId =
+    product?.id ??
+    pendingData?.productId ??
+    null;
+
+  const existingActiveOrder = db.orders.find(order =>
+    String(order.senderId || order.customerId || '') === id &&
+    String(order.productId || '') === String(productId || '') &&
+    !['CANCELLED', 'CANCELED', 'REJECTED', 'COMPLETED']
+      .includes(String(order.status || '').toUpperCase()) &&
+    Date.now() - new Date(order.createdAt || 0).getTime() <
+      PENDING_ORDER_RETENTION_MS
+  );
+
+  if (existingActiveOrder) {
+    return {
+      order: existingActiveOrder,
+      created: false,
+      duplicate: true
+    };
+  }
+
+  const customer = db.customers[id] || {};
+  const phone =
+    pendingData?.customerPhone ||
+    extractPhoneNumber(customerText) ||
+    customer.phone ||
+    null;
+
+  const address =
+    pendingData?.customerAddress ||
+    extractAddressText(customerText) ||
+    customer.address ||
+    null;
+
+  if (!productId || !phone || !address) {
+    throw new Error('Order is missing required product, phone, or address');
+  }
+
+  const order = {
+    id: newId('order'),
+    senderId: id,
+    customerId: id,
+    customerName: customer.name || customerDisplayName(id),
+    customerPhone: phone,
+    customerAddress: address,
+    productId,
+    productName: product?.name || pendingData?.productName || null,
+    productPrice: product?.price ?? pendingData?.productPrice ?? null,
+    quantity: Number(pendingData?.quantity) || 1,
+    customerMessage: String(customerText || '').trim(),
+    source: 'MESSENGER',
+    sourceMessageId: messageId || pendingData?.sourceMessageId || null,
+    status: 'PENDING_CONFIRMATION',
+    humanTakeover: true,
+    createdAt: new Date().toISOString()
+  };
+
+  db.orders.push(order);
+
+  if (!db.customers[id]) {
+    db.customers[id] = {
+      id,
+      name: customerDisplayName(id),
+      messageCount: 0,
+      lastActive: new Date().toISOString()
+    };
+  }
+
+  db.customers[id].phone = phone;
+  db.customers[id].address = address;
+  db.customers[id].lastOrderId = order.id;
+  db.customers[id].lastOrderAt = order.createdAt;
+
+  delete db.pendingOrders[id];
+
+  cancelFollowup(id);
+
+  if (!saveStorage()) {
+    db.orders = db.orders.filter(item => item.id !== order.id);
+    throw new Error('Could not persist the customer order');
+  }
+
+  return { order, created: true };
+}
+
+// =============================================================================
+// 15. MESSENGER MESSAGE SENDING
 // =============================================================================
 
 function limitToFiveLines(text) {
@@ -1742,8 +1671,6 @@ function limitToFiveLines(text) {
     .split('\n')
     .map(line => line.trim())
     .filter(Boolean);
-
-  if (lines.length <= MAX_AI_LINES) return lines.join('\n');
 
   return lines.slice(0, MAX_AI_LINES).join('\n');
 }
@@ -1755,44 +1682,31 @@ async function sendFacebookMessage(recipientId, text) {
   }
 
   const finalText = String(text || '').trim();
-  if (!finalText) return false;
 
-  if (finalText.length > MAX_MESSENGER_TEXT_LENGTH) {
-    console.error('[Messenger] Message exceeds length limit');
+  if (!finalText || finalText.length > MAX_MESSENGER_TEXT_LENGTH) {
+    console.error('[Messenger] Empty or oversized message');
     return false;
   }
 
   try {
     const url =
-      `https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages` +
-      `?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
+      `https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages`;
 
-    const response = await axios.post(
+    await axios.post(
       url,
       {
-        recipient: { id: recipientId },
-        message: { text: finalText },
-        messaging_type: 'RESPONSE'
+        recipient: { id: String(recipientId) },
+        message: { text: finalText }
       },
-      { timeout: 15000 }
+      {
+        params: { access_token: PAGE_ACCESS_TOKEN },
+        timeout: 15000
+      }
     );
 
-    console.log(
-      `[Messenger] Sent to ${recipientId}; ` +
-      `message_id=${response.data?.message_id || 'accepted'}`
-    );
-
-    appendHistory(recipientId, 'assistant', finalText);
-
-    addStoredMessage({
-      id: 'msg_bot_' + crypto.randomUUID(),
-      senderId: recipientId,
-      sender: 'bot',
-      text: finalText,
-      timestamp: new Date().toISOString()
-    });
-
+    storeConversationMessage(recipientId, 'assistant', finalText);
     saveStorage();
+
     return true;
   } catch (err) {
     console.error(
@@ -1805,30 +1719,15 @@ async function sendFacebookMessage(recipientId, text) {
 }
 
 // =============================================================================
-// 15. AUTOMATIC FOLLOW-UP SCHEDULER
+// 16. FOLLOW-UP SCHEDULER
 // =============================================================================
-
-function cancelFollowup(senderId) {
-  const id = String(senderId || '');
-  if (!id) return;
-
-  const timer = followupTimers.get(id);
-  if (timer) clearTimeout(timer);
-
-  followupTimers.delete(id);
-
-  if (db.scheduledFollowups[id]) {
-    delete db.scheduledFollowups[id];
-    saveStorage();
-  }
-}
 
 function customerHasOrder(senderId) {
   const id = String(senderId || '');
 
   return db.orders.some(order =>
     String(order.senderId || order.customerId || '') === id &&
-    !['CANCELLED', 'CANCELED', 'REJECTED'].includes(
+    !['CANCELLED', 'CANCELED', 'REJECTED', 'COMPLETED'].includes(
       String(order.status || '').toUpperCase()
     )
   );
@@ -1836,11 +1735,18 @@ function customerHasOrder(senderId) {
 
 function scheduleFollowup(senderId, lastCustomerMessageAt = Date.now()) {
   const id = String(senderId || '');
+
   if (!id) return;
 
   cancelFollowup(id);
 
-  if (getTakeoverState(id) || customerHasOrder(id)) return;
+  if (
+    getTakeoverState(id) ||
+    customerHasOrder(id) ||
+    getPendingOrder(id)
+  ) {
+    return;
+  }
 
   const customer = db.customers[id] || {};
   const lastAt = new Date(lastCustomerMessageAt).getTime();
@@ -1866,6 +1772,7 @@ function armFollowupTimer(senderId) {
   if (!task || task.status !== 'PENDING') return;
 
   const existing = followupTimers.get(id);
+
   if (existing) clearTimeout(existing);
 
   const delay = Math.max(0, Number(task.dueAt) - Date.now());
@@ -1888,35 +1795,40 @@ async function executeFollowup(senderId) {
 
   const customer = db.customers[id];
 
-  if (!customer || getTakeoverState(id) || customerHasOrder(id)) {
+  if (
+    !customer ||
+    getTakeoverState(id) ||
+    customerHasOrder(id) ||
+    getPendingOrder(id)
+  ) {
     delete db.scheduledFollowups[id];
     saveStorage();
     return;
   }
 
-  const dueAt = Number(task.dueAt);
-  if (Date.now() < dueAt) {
+  if (Date.now() < Number(task.dueAt)) {
     armFollowupTimer(id);
     return;
   }
 
-  const lastCustomerAt = new Date(
+  const lastAt = new Date(
     customer.lastCustomerMessageAt || customer.lastActive || 0
   ).getTime();
 
   if (
-    !Number.isFinite(lastCustomerAt) ||
-    lastCustomerAt <= 0 ||
-    Date.now() - lastCustomerAt >= 24 * 60 * 60 * 1000
+    !Number.isFinite(lastAt) ||
+    lastAt <= 0 ||
+    Date.now() - lastAt >= 24 * 60 * 60 * 1000
   ) {
     delete db.scheduledFollowups[id];
     saveStorage();
+
     console.log(`[FOLLOWUP] Skipped ${id}: messaging window expired`);
     return;
   }
 
-  if (lastCustomerAt > Number(task.lastCustomerMessageAt || 0)) {
-    scheduleFollowup(id, lastCustomerAt);
+  if (lastAt > Number(task.lastCustomerMessageAt || 0)) {
+    scheduleFollowup(id, lastAt);
     return;
   }
 
@@ -1924,20 +1836,21 @@ async function executeFollowup(senderId) {
 
   task.status = sent ? 'SENT' : 'FAILED';
   task.sentAt = new Date().toISOString();
-  task.result = sent ? 'sent' : 'send_failed';
 
   saveStorage();
 
-  console.log(
-    `[FOLLOWUP] ${id}: ${sent ? 'sent' : 'failed'}`
-  );
+  console.log(`[FOLLOWUP] ${id}: ${sent ? 'sent' : 'failed'}`);
 }
 
 function restoreFollowupTasks() {
   for (const [senderId, task] of Object.entries(db.scheduledFollowups)) {
     if (!task || task.status !== 'PENDING') continue;
 
-    if (getTakeoverState(senderId) || customerHasOrder(senderId)) {
+    if (
+      getTakeoverState(senderId) ||
+      customerHasOrder(senderId) ||
+      getPendingOrder(senderId)
+    ) {
       delete db.scheduledFollowups[senderId];
       continue;
     }
@@ -1949,42 +1862,20 @@ function restoreFollowupTasks() {
 }
 
 // =============================================================================
-// 16. GITHUB CATALOG SYNC
+// 17. GITHUB CATALOG SYNC
 // =============================================================================
-
-function replaceCatalogAtomically(catalogData, source = 'admin') {
-  validateCatalogShape(catalogData);
-
-  const normalized = {
-    ...catalogData,
-    version: catalogData.version ?? Date.now(),
-    updatedAt: catalogData.updatedAt ?? new Date().toISOString(),
-    products: catalogData.products,
-    faqs: Array.isArray(catalogData.faqs) ? catalogData.faqs : []
-  };
-
-  saveLocalCatalog(normalized, source);
-
-  console.log(
-    `[CATALOG] Replaced from ${source}: ` +
-    `${products.length} products, ${faqs.length} FAQs`
-  );
-
-  return normalized;
-}
 
 async function pullCatalogFromGitHub() {
   if (!GITHUB_TOKEN) {
     catalogMeta.lastSyncError = 'GITHUB_TOKEN is not configured';
-    console.warn('[GITHUB] Token missing; local catalog retained');
+    console.warn('[GITHUB] Token missing; using local catalog');
     return false;
   }
 
   try {
     const url =
-      `https://api.github.com/repos/${GITHUB_REPO}` +
-      `/contents/${CATALOG_FILE}` +
-      `?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
+      `https://api.github.com/repos/${GITHUB_REPO}/contents/` +
+      `${CATALOG_FILE}?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
 
     const response = await axios.get(url, {
       headers: {
@@ -1995,22 +1886,25 @@ async function pullCatalogFromGitHub() {
       timeout: 15000
     });
 
-    if (!response.data?.content) {
-      throw new Error('GitHub response contains no file content');
-    }
+    const decoded = Buffer.from(
+      response.data.content,
+      'base64'
+    ).toString('utf8');
 
-    const parsed = JSON.parse(
-      Buffer.from(response.data.content, 'base64').toString('utf8')
-    );
+    const data = JSON.parse(decoded);
 
-    validateCatalogShape(parsed);
-    replaceCatalogAtomically(parsed, 'github');
+    validateCatalogShape(data);
+    saveLocalCatalog(data, 'github');
+
+    console.log('[GITHUB] Catalog pulled successfully');
+
     return true;
   } catch (err) {
     catalogMeta.lastSyncError =
       err.response?.data?.message || err.message;
 
-    console.error('[GITHUB] Pull failed:', catalogMeta.lastSyncError);
+    console.error('[GITHUB] Pull error:', catalogMeta.lastSyncError);
+
     return false;
   }
 }
@@ -2028,69 +1922,56 @@ async function pushCatalogToGitHub(
   const filePath = customPath || CATALOG_FILE;
 
   if (!token) {
-    return {
-      synced: false,
-      message: 'GitHub Token is not configured'
-    };
+    return { synced: false, error: 'GitHub Token is not configured' };
   }
 
   try {
     validateCatalogShape(catalogData);
-  } catch (err) {
-    return { synced: false, error: err.message };
-  }
 
-  const url =
-    `https://api.github.com/repos/${repo}/contents/${filePath}`;
+    const url =
+      `https://api.github.com/repos/${repo}/contents/${filePath}`;
 
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    Accept: 'application/vnd.github+json',
-    'User-Agent': 'Impotech-Admin-Server'
-  };
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'Impotech-Admin-Server'
+    };
 
-  let sha = null;
+    let sha = null;
 
-  try {
-    const existing = await axios.get(
-      `${url}?ref=${encodeURIComponent(branch)}`,
-      { headers, timeout: 10000 }
-    );
+    try {
+      const existing = await axios.get(url, {
+        params: { ref: branch },
+        headers,
+        timeout: 10000
+      });
 
-    sha = existing.data?.sha || null;
-  } catch (err) {
-    if (err.response?.status !== 404) {
-      return {
-        synced: false,
-        error: err.response?.data?.message || err.message
-      };
+      sha = existing.data.sha;
+    } catch (err) {
+      if (err.response?.status !== 404) throw err;
     }
-  }
 
-  const payload = {
-    message: `Update Impotech catalog ${catalogData.version || Date.now()}`,
-    content: Buffer.from(
-      JSON.stringify(catalogData, null, 2),
-      'utf8'
-    ).toString('base64'),
-    branch
-  };
+    const payload = {
+      message: `Update Impotech catalog ${catalogData.version || Date.now()}`,
+      content: Buffer.from(
+        JSON.stringify(catalogData, null, 2),
+        'utf8'
+      ).toString('base64'),
+      branch
+    };
 
-  if (sha) payload.sha = sha;
+    if (sha) payload.sha = sha;
 
-  try {
     const result = await axios.put(url, payload, {
       headers,
       timeout: 20000
     });
 
-    replaceCatalogAtomically(catalogData, 'github');
-
     return {
       synced: true,
-      commit: result.data?.commit?.sha || 'synced',
-      totalProducts: products.length,
-      totalFaqs: faqs.length
+      sha: result.data.content?.sha || null,
+      path: filePath,
+      branch
     };
   } catch (err) {
     return {
@@ -2101,7 +1982,7 @@ async function pushCatalogToGitHub(
 }
 
 // =============================================================================
-// 17. AI SYSTEM PROMPT
+// 18. AI SYSTEM PROMPT
 // =============================================================================
 
 function buildSystemPrompt(
@@ -2111,24 +1992,26 @@ function buildSystemPrompt(
   memoryContext
 ) {
   const productContext = relevantProducts.length
-    ? relevantProducts.map((p, i) => [
-        `[পণ্য ${i + 1}]`,
+    ? relevantProducts.map((p, index) => [
+        `[পণ্য ${index + 1}]`,
         `ID: ${p.id || 'N/A'}`,
         `নাম: ${p.name || 'N/A'}`,
         `ব্র্যান্ড: ${p.brand || 'N/A'}`,
         `মডেল: ${p.model || 'N/A'}`,
         `মূল্য: ${p.price ?? 'ক্যাটালগে নেই'} টাকা`,
-        `স্টক: ${p.stockStatus || (p.inStock === true ? 'IN_STOCK' : 'তথ্য নেই')}`,
+        `স্টক: ${p.stockStatus || 'তথ্য নেই'}`,
         `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
-        `বৈশিষ্ট্য: ${Array.isArray(p.features) ? p.features.join(', ') : 'N/A'}`,
+        `বৈশিষ্ট্য: ${
+          Array.isArray(p.features) ? p.features.join(', ') : 'N/A'
+        }`,
         `ছবি: ${getProductMediaUrls(p, 'images').join(' | ') || 'নেই'}`,
         `ভিডিও: ${getProductMediaUrls(p, 'videos').join(' | ') || 'নেই'}`
       ].join('\n')).join('\n\n')
     : 'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
 
   const faqContext = relevantFaqs.length
-    ? relevantFaqs.map((f, i) =>
-        `[FAQ ${i + 1}] ${f.question || ''}\n${f.answer || ''}`
+    ? relevantFaqs.map((faq, index) =>
+        `[FAQ ${index + 1}] ${faq.question || ''}\n${faq.answer || ''}`
       ).join('\n\n')
     : 'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
 
@@ -2139,7 +2022,7 @@ function buildSystemPrompt(
     : 'পূর্ববর্তী কথোপকথন নেই।';
 
   return `
-আপনি ImpoTech BD ফেসবুক পেজের বিক্রয় সহকারী ও কাস্টমার সাপোর্ট অ্যাসিস্ট্যান্ট।
+আপনি ImpoTech BD ফেসবুক পেজের বিক্রয় সহকারী।
 
 হেল্পলাইন: ${HELPLINE}
 WhatsApp: ${WHATSAPP_NUMBER}
@@ -2150,25 +2033,23 @@ WhatsApp: ${WHATSAPP_NUMBER}
 - গাজীপুরের বাইরে ১০০ টাকা।
 
 কঠোর নিয়ম:
-১. সহজ, স্বাভাবিক ও ভদ্র বাংলায় উত্তর দিন। গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে উত্তর দিতে পারেন।
-২. প্রতিটি উত্তর সর্বোচ্চ ৫টি লাইনে রাখুন। অপ্রয়োজনীয় ব্যাখ্যা দেবেন না।
-৩. ক্যাটালগের বাইরে দাম, স্টক, ওয়ারেন্টি বা বৈশিষ্ট্য বানিয়ে বলবেন না।
-৪. পণ্যের দাম কেবল ক্যাটালগ থেকে বলবেন। সঠিক পণ্য শনাক্ত না হলে অনুমান করবেন না।
-৫. প্রশ্ন অস্পষ্ট হলে একটি সংক্ষিপ্ত প্রশ্ন করুন।
-৬. শেষ ২০টি বার্তার পাশাপাশি নিচের সংরক্ষিত গ্রাহক মেমোরিও ব্যবহার করুন।
-৭. পণ্যের নাম, ID, দাম বা মিডিয়া URL পরিবর্তন করবেন না।
-৮. বিক্রয়ের ক্ষেত্রে কাস্টমারকে চাপ দেবেন না।
-৯. অর্ডারের অনুরোধ শনাক্ত হলে ব্যাকএন্ড অর্ডার সংরক্ষণ করে Human Takeover চালু করবে।
-১০. সাধারণ প্রশ্নের জন্য Human Takeover চাইবেন না।
-১১. ImpoTech শুধু LED হেডলাইট বিক্রি করে। H4 এবং HS1 — দুটো সকেটই ৩-পিন (P43t/PX43t), তাই দুটোতেই আমাদের LED হেডলাইট সরাসরি plug-and-play হিসেবে ফিট হবে।
-১২. কাস্টমার বাইকের মডেল বললে (যেমন: Pulsar 150, Yamaha FZ, Apache RTR 160, Splendor, CB Shine) — সেই মডেলের স্টক হেডলাইট H4 বা HS1 যেটাই হোক, LED plug-and-play হবে বলে নিশ্চিতভাবে উত্তর দিন।
-১২ক. H6M, H7, H11, H13 — এই মডেলগুলো H4 সকেটে সরাসরি বসে না, অ্যাডাপ্টার লাগবে বলে জানান।
-১৩. কাস্টমার নিজে H4/HS1 Socket নিশ্চিত করলে একই প্রশ্ন আবার করবেন না।
-১৪. গুরুতর অভিযোগ, নিরাপত্তা বা পেমেন্ট সমস্যা সত্যিই মানব সহায়তা চাইলে উত্তরের শুরুতে ${HANDOVER_MARKER} লিখুন।
-১৫. মার্কারটি কাস্টমারের কাছে পাঠানো হবে না; ব্যাকএন্ড এটি শনাক্ত করবে।
-১৬. Takeover চালু থাকলে AI-এর উত্তর পাঠানো হবে না।
-১৭. গ্রাহকের ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।
-১৮. সংরক্ষিত মেমোরিতে তথ্য না থাকলে সেটি আছে বলে দাবি করবেন না।
+১. সহজ, স্বাভাবিক ও ভদ্র বাংলায় উত্তর দিন।
+২. সর্বোচ্চ ৫টি ছোট লাইন ব্যবহার করুন।
+৩. ক্যাটালগের বাইরে দাম, স্টক, ওয়ারেন্টি বা বৈশিষ্ট্য বানাবেন না।
+৪. সঠিক পণ্য শনাক্ত না হলে দাম অনুমান করবেন না।
+৫. প্রশ্ন অস্পষ্ট হলে একটি ছোট প্রশ্ন করুন।
+৬. সর্বশেষ ২০টি মেসেজ ও সংরক্ষিত মেমোরি ব্যবহার করুন।
+৭. পণ্যের নাম, ID, দাম বা URL পরিবর্তন করবেন না।
+৮. কাস্টমারকে চাপ না দিয়ে প্রাসঙ্গিকভাবে বিক্রয়ে সাহায্য করুন।
+৯. অর্ডারের ইচ্ছা থাকলে ব্যাকএন্ড অর্ডার তৈরি ও মানব প্রতিনিধির কাছে হস্তান্তর করবে।
+১০. বাইকের ফিটমেন্ট যাচাই ছাড়া নিশ্চিত দাবি করবেন না।
+১১. গুরুতর অভিযোগ বা পেমেন্ট সমস্যায় উত্তরের শুরুতে ${HANDOVER_MARKER} লিখুন।
+১২. মার্কারটি গ্রাহকের কাছে পাঠানো যাবে না।
+১৩. Human Takeover চালু থাকলে AI-এর উত্তর পাঠানো যাবে না।
+১৪. মেমোরিতে নেই এমন তথ্য মনে আছে বলে দাবি করবেন না।
+১৫. একই পণ্য নিয়ে আগের আলোচনা থাকলে সেটি বিবেচনা করুন।
+১৬. ছবি থেকে পণ্য নিশ্চিতভাবে শনাক্ত না হলে সংক্ষেপে পণ্যের নাম জিজ্ঞেস করুন।
+১৭. ক্যাটালগে তথ্য না থাকলে স্পষ্টভাবে বলুন যে তথ্যটি যাচাই করতে হবে।
 
 সংরক্ষিত গ্রাহক মেমোরি:
 ${memoryContext || 'কোনো মেমোরি নেই।'}
@@ -2181,11 +2062,11 @@ ${faqContext}
 
 পূর্ববর্তী কথোপকথন:
 ${historyContext}
-  `.trim();
+`.trim();
 }
 
 // =============================================================================
-// 18. OPENROUTER AI
+// 19. OPENROUTER AI: TEXT, VOICE AND VISION
 // =============================================================================
 
 async function callOpenRouter(messages, model = TEXT_MODEL) {
@@ -2208,13 +2089,14 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
         'HTTP-Referer': 'https://github.com/impotechaibot/Impotech-bot',
         'X-Title': 'ImpoTech Messenger AI Bot'
       },
-      timeout: 30000,
+      timeout: 45000,
       maxContentLength: MAX_ATTACHMENT_BYTES,
       maxBodyLength: MAX_ATTACHMENT_BYTES
     }
   );
 
   const choice = response.data?.choices?.[0];
+
   if (!choice) throw new Error('OpenRouter returned no response');
 
   let reply = choice.message?.content;
@@ -2234,12 +2116,49 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
   return reply;
 }
 
+async function fetchAttachmentAsBase64(
+  url,
+  maxBytes = MAX_ATTACHMENT_BYTES
+) {
+  const parsed = new URL(url);
+
+  if (!['https:', 'http:'].includes(parsed.protocol)) {
+    throw new Error('Unsupported attachment URL');
+  }
+
+  const response = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 20000,
+    maxContentLength: maxBytes,
+    maxBodyLength: maxBytes
+  });
+
+  if (Buffer.byteLength(response.data) > maxBytes) {
+    throw new Error('Attachment exceeds allowed size');
+  }
+
+  return {
+    base64: Buffer.from(response.data).toString('base64'),
+    contentType: response.headers['content-type'] ||
+      'application/octet-stream'
+  };
+}
+
+function isImageContentType(type = '') {
+  return /^image\/(jpeg|png|webp|gif)$/i.test(type);
+}
+
+function isAudioContentType(type = '') {
+  return /^audio\/(mpeg|mp3|wav|ogg|webm|mp4|aac|m4a|x-wav)/i.test(type);
+}
+
 async function generateAIResponse(
   customerText,
   attachments = [],
   senderId
 ) {
-  const query = customerText || 'ছবিটি বা পাঠানো ফাইলটি দেখে সাহায্য করুন';
+  const query = customerText ||
+    'পাঠানো ফাইলটি দেখে সাহায্য করুন।';
 
   const history = getHistory(senderId).slice();
 
@@ -2266,111 +2185,85 @@ async function generateAIResponse(
     content: item.text
   }));
 
-  const audioAttachment = attachments.find(
-    item => item.type === 'audio' && item.payload?.url
+  const audio = attachments.find(item =>
+    item.type === 'audio' && item.payload?.url
   );
 
-  if (audioAttachment) {
-    try {
-      const audioResponse = await axios.get(
-        audioAttachment.payload.url,
-        {
-          responseType: 'arraybuffer',
-          timeout: 15000,
-          maxContentLength: MAX_ATTACHMENT_BYTES
-        }
-      );
+  const imageAttachment = attachments.find(item =>
+    item.type === 'image' && item.payload?.url
+  );
 
-      const audioBase64 =
-        Buffer.from(audioResponse.data).toString('base64');
+  if (audio) {
+    const { base64, contentType } =
+      await fetchAttachmentAsBase64(audio.payload.url);
 
-      const reply = await callOpenRouter([
-        { role: 'system', content: systemPrompt },
-        ...priorMessages,
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
-            },
-            {
-              type: 'input_audio',
-              input_audio: {
-                data: audioBase64,
-                format: 'mp4'
-              }
-            }
-          ]
-        }
-      ], VOICE_MODEL);
-
-      return limitToFiveLines(reply);
-    } catch (err) {
-      console.error('[VOICE] Processing failed:', err.message);
+    if (!isAudioContentType(contentType)) {
+      return 'দুঃখিত, পাঠানো অডিও ফাইলটি সমর্থিত ফরম্যাটে নেই। অন্যভাবে পাঠাতে পারবেন?';
     }
+
+    const reply = await callOpenRouter([
+      { role: 'system', content: systemPrompt },
+      ...priorMessages,
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: query },
+          {
+            type: 'input_audio',
+            input_audio: {
+              data: base64,
+              format: contentType.includes('wav') ? 'wav' : 'mp3'
+            }
+          }
+        ]
+      }
+    ], VOICE_MODEL);
+
+    return limitToFiveLines(reply);
   }
 
-  const imageAttachment = attachments.find(
-    item => item.type === 'image' && item.payload?.url
-  );
-
   if (imageAttachment) {
-    try {
-      const imageResponse = await axios.get(
-        imageAttachment.payload.url,
-        {
-          responseType: 'arraybuffer',
-          timeout: 15000,
-          maxContentLength: MAX_ATTACHMENT_BYTES
-        }
-      );
+    const { base64, contentType } =
+      await fetchAttachmentAsBase64(imageAttachment.payload.url);
 
-      const imageBase64 =
-        Buffer.from(imageResponse.data).toString('base64');
-
-      const contentType =
-        imageResponse.headers['content-type'] || 'image/jpeg';
-
-      const reply = await callOpenRouter([
-        { role: 'system', content: systemPrompt },
-        ...priorMessages,
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text:
-                `${query}\nছবিটি দেখে সাহায্য করুন। ` +
-                'যা নিশ্চিতভাবে বোঝা যায় না তা অনুমান করবেন না। সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
-            },
-            {
-              type: 'image_url',
-              image_url: {
-                url: `data:${contentType};base64,${imageBase64}`
-              }
-            }
-          ]
-        }
-      ], TEXT_MODEL);
-
-      return limitToFiveLines(reply);
-    } catch (err) {
-      console.error('[VISION] Processing failed:', err.message);
+    if (!isImageContentType(contentType)) {
+      return 'দুঃখিত, পাঠানো ছবির ফরম্যাটটি সমর্থিত নয়। JPG, PNG বা WebP ছবি পাঠান।';
     }
+
+    const reply = await callOpenRouter([
+      { role: 'system', content: systemPrompt },
+      ...priorMessages,
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: query || 'ছবিতে থাকা পণ্যটি শনাক্ত করে সাহায্য করুন।'
+          },
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:${contentType};base64,${base64}`
+            }
+          }
+        ]
+      }
+    ], VISION_MODEL);
+
+    return limitToFiveLines(reply);
   }
 
   const reply = await callOpenRouter([
     { role: 'system', content: systemPrompt },
     ...priorMessages,
     { role: 'user', content: query }
-  ]);
+  ], TEXT_MODEL);
 
   return limitToFiveLines(reply);
 }
 
 // =============================================================================
-// 19. CRITICAL HANDOVER
+// 20. CRITICAL HANDOVER
 // =============================================================================
 
 function isCriticalHandoverQuestion(text = '') {
@@ -2382,7 +2275,39 @@ function isCriticalHandoverQuestion(text = '') {
 }
 
 // =============================================================================
-// 20. CUSTOMER MESSAGE PROCESSING
+// 21. FACEBOOK CALL EVENTS
+// =============================================================================
+
+async function handleCallEvent(event) {
+  const senderId = String(event.sender?.id || '').trim();
+
+  if (!senderId) return;
+
+  const callData = event.call || {};
+
+  db.callEvents.push({
+    id: newId('call'),
+    senderId,
+    callId: callData.call_id || null,
+    event: callData.event || 'unknown',
+    timestamp: new Date().toISOString()
+  });
+
+  if (db.callEvents.length > 2000) {
+    db.callEvents.splice(0, db.callEvents.length - 2000);
+  }
+
+  await setTakeoverState(
+    senderId,
+    true,
+    `Automatic takeover: call event (${callData.event || 'unknown'})`
+  );
+
+  saveStorage();
+}
+
+// =============================================================================
+// 22. CUSTOMER MESSAGE PROCESSING
 // =============================================================================
 
 async function processCustomerMessage(
@@ -2391,243 +2316,240 @@ async function processCustomerMessage(
   attachments = [],
   messageId = null
 ) {
-  if (getTakeoverState(senderId)) {
-    console.log(`[Takeover] ${senderId} paused; AI skipped`);
+  const id = String(senderId || '').trim();
+
+  if (!id) return;
+
+  if (getTakeoverState(id)) {
+    console.log(`[Takeover] ${id} paused; AI skipped`);
     return;
+  }
+
+  if (messageId && processedMessageIds.has(messageId)) {
+    return;
+  }
+
+  if (messageId) {
+    processedMessageIds.set(messageId, Date.now());
   }
 
   const customerText = String(text || '').trim();
 
+  if (!db.customers[id]) {
+    db.customers[id] = {
+      id,
+      name: customerDisplayName(id),
+      messageCount: 0,
+      lastActive: new Date().toISOString()
+    };
+  }
+
+  const customer = db.customers[id];
+
+  customer.lastActive = new Date().toISOString();
+  customer.lastCustomerMessageAt = Date.now();
+  customer.lastMessageId = messageId || null;
+
+  storeConversationMessage(
+    id,
+    'user',
+    customerText || '[Attachment]',
+    messageId
+  );
+
+  updateCustomerMemory(id, customerText);
+
+  // An existing pending order prevents sales follow-up scheduling.
+  if (!getPendingOrder(id)) {
+    scheduleFollowup(id, customer.lastCustomerMessageAt);
+  } else {
+    cancelFollowup(id);
+  }
+
   try {
-    // 1. ORDER INTENT
+    if (isCriticalHandoverQuestion(customerText)) {
+      await transferToHuman(
+        id,
+        'Critical customer issue',
+        'আপনার বিষয়টি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। প্রতিনিধি আপনাকে সহায়তা করবেন।'
+      );
+
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // MULTI-MESSAGE ORDER FLOW
+    //
+    // A customer must express order intent before an order can be started.
+    // Once started, product, phone and address may arrive in separate messages.
+    // -------------------------------------------------------------------------
+
+    let pendingOrder = getPendingOrder(id);
+
     if (isExplicitOrderIntent(customerText)) {
+      pendingOrder = startPendingOrder(
+        id,
+        customerText,
+        messageId
+      );
+    } else if (pendingOrder?.orderIntentConfirmed) {
+      pendingOrder = updatePendingOrderFromMessage(
+        id,
+        customerText
+      );
+    }
+
+    if (pendingOrder?.orderIntentConfirmed) {
+      const missing = getMissingOrderFields(pendingOrder);
+
+      if (missing.length > 0) {
+        const request = getOrderInformationRequest(pendingOrder);
+
+        if (request) {
+          await sendFacebookMessage(id, request);
+        }
+
+        return;
+      }
+
+      // All required order details are available.
       const result = createMessengerOrder(
-        senderId,
+        id,
         customerText,
         messageId
       );
 
-      if (!result.created) {
+      if (result.created || result.duplicate) {
+        // Send acknowledgement before activating takeover.
+        const acknowledgementSent = await sendFacebookMessage(
+          id,
+          ORDER_CONFIRMATION
+        );
+
+        // Even if Messenger delivery fails, the persisted order remains
+        // available to the representative and AI must not continue selling.
         await setTakeoverState(
-          senderId,
+          id,
           true,
-          `Order already exists: ${result.order.id}`
-        );
-        return;
-      }
-
-      const order = result.order;
-
-      await setTakeoverState(
-        senderId,
-        true,
-        `Automatic takeover after order ${order.id}`
-      );
-
-      console.log(
-        `[ORDER] ${order.id} created for ${senderId}; ` +
-        `product=${order.productName || 'not identified'}`
-      );
-
-      const sent = await sendFacebookMessage(
-        senderId,
-        ORDER_CONFIRMATION
-      );
-
-      if (!sent) {
-        console.error(
-          `[ORDER] ${order.id} saved, but confirmation could not be sent`
-        );
-      }
-
-      return;
-    }
-
-    // 2. CRITICAL ISSUES
-    if (isCriticalHandoverQuestion(customerText)) {
-      await transferToHuman(
-        senderId,
-        'Critical customer issue',
-        `আপনার বিষয়টি গুরুত্ব দিয়ে দেখা প্রয়োজন। আমি কথোপকথনটি আমাদের প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
-      );
-      return;
-    }
-
-    // 3. MOTORCYCLE / H4 / HS1 / 3-PIN LED
-    if (isBikeCompatibilityQuestion(customerText)) {
-      const context = getRecentConversationText(senderId, customerText);
-      const match = identifyBikeModel(context);
-      const verifiedReply = getH4CompatibilityReply(match, context);
-
-      if (verifiedReply) {
-        await sendFacebookMessage(senderId, limitToFiveLines(verifiedReply));
-        return;
-      }
-
-      if (customerConfirmedH4(senderId, customerText)) {
-        const reply = await generateAIResponse(
-          customerText,
-          attachments,
-          senderId
+          result.duplicate
+            ? 'Existing order detected; human confirmation required'
+            : 'Customer order completed; human confirmation required'
         );
 
-        if (reply.includes(HANDOVER_MARKER)) {
-          await sendFacebookMessage(
-            senderId,
-            'আপনি জানিয়েছেন যে আপনার বাইকে H4 বা HS1 সকেট আছে। ' +
-            'আমাদের LED হেডলাইট ৩-পিন plug-and-play হিসেবে সরাসরি ফিট হবে। ' +
-            'পণ্যের মডেল জানালে আরও নিশ্চিতভাবে মিলিয়ে বলতে পারব।'
+        if (!acknowledgementSent) {
+          console.error(
+            `[ORDER] Order saved for ${id}, but confirmation message failed`
           );
-          return;
-        }
-
-        if (!getTakeoverState(senderId)) {
-          await sendFacebookMessage(senderId, limitToFiveLines(reply));
         }
 
         return;
       }
-
-      const clarification = getBikeClarificationReply(
-        senderId,
-        customerText
-      );
-
-      if (clarification) {
-        await sendFacebookMessage(senderId, limitToFiveLines(clarification));
-        return;
-      }
-
-      const bikeReply = await generateAIResponse(
-        customerText,
-        attachments,
-        senderId
-      );
-
-      if (bikeReply.includes(HANDOVER_MARKER)) {
-        await sendFacebookMessage(
-          senderId,
-          'বাইকের মডেল ও সাল বুঝতে পেরেছি। নিশ্চিতভাবে Socket মিলিয়ে বলতে Original Headlight Socket-এর ছবি বা Socket-এর লেখা পাঠাতে পারবেন?'
-        );
-        return;
-      }
-
-      if (!getTakeoverState(senderId)) {
-        await sendFacebookMessage(senderId, limitToFiveLines(bikeReply));
-      }
-
-      return;
     }
 
-    // 4. PRICE QUESTIONS
     if (isPriceQuestion(customerText)) {
       let product = findExactProductForPrice(customerText);
 
       if (!product && isGenericPriceQuestion(customerText)) {
-        product = findProductFromRecentContext(senderId);
+        product = findProductFromRecentContext(id);
       }
 
-      if (!product) {
+      if (product) {
+        const reply = getPriceReply(product);
+
+        if (reply) {
+          recordProductDiscussion(id, product, customerText, reply);
+          await sendFacebookMessage(id, reply);
+          return;
+        }
+      }
+
+      if (isGenericPriceQuestion(customerText)) {
         await sendFacebookMessage(
-          senderId,
+          id,
           getPriceClarificationReply()
         );
+
         return;
       }
+    }
 
-      const priceReply = getPriceReply(product);
+    if (isBikeCompatibilityQuestion(customerText)) {
+      const reply = getH4CompatibilityReply(customerText);
 
-      if (!priceReply) {
-        await sendFacebookMessage(
-          senderId,
-          `দুঃখিত, ${product.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই।`
-        );
-        return;
-      }
-
-      await sendFacebookMessage(senderId, limitToFiveLines(priceReply));
+      await sendFacebookMessage(id, reply);
       return;
     }
 
-    // 5. PRODUCT MEDIA
     if (isMediaRequest(customerText)) {
-      const mediaReply = getProductMediaReply(customerText, senderId);
+      const reply = getProductMediaReply(customerText, id);
 
-      if (mediaReply) {
-        await sendFacebookMessage(senderId, limitToFiveLines(mediaReply));
+      if (reply) {
+        await sendFacebookMessage(id, reply);
         return;
       }
     }
 
-    // 6. NORMAL AI RESPONSE
-    let aiReply = await generateAIResponse(
+    const reply = await generateAIResponse(
       customerText,
       attachments,
-      senderId
+      id
     );
 
-    if (!aiReply) throw new Error('AI returned an empty response');
-
-    if (aiReply.includes(HANDOVER_MARKER)) {
-      const explanation = aiReply
+    if (reply.includes(HANDOVER_MARKER)) {
+      const cleanReply = reply
         .replaceAll(HANDOVER_MARKER, '')
         .trim();
 
-      if (isCriticalHandoverQuestion(customerText)) {
-        await transferToHuman(
-          senderId,
-          'AI identified a critical support issue',
-          explanation
-            ? `${limitToFiveLines(explanation)}\nআমি বিষয়টি প্রতিনিধির কাছে হস্তান্তর করছি। হেল্পলাইন: ${HELPLINE}। WhatsApp: ${WHATSAPP_NUMBER}।`
-            : undefined
-        );
-        return;
-      }
-
-      await sendFacebookMessage(
-        senderId,
-        limitToFiveLines(
-          explanation ||
-          'আপনার প্রশ্নটি আরও ভালোভাবে বুঝতে একটি তথ্য জানতে চাই। আপনি কোন পণ্য বা মডেলটির কথা বলছেন?'
-        )
+      await transferToHuman(
+        id,
+        'AI requested human support',
+        cleanReply || undefined
       );
+
       return;
     }
 
-    const previousReply = getPreviousAssistantReply(
-      senderId,
-      customerText
-    );
-
-    if (
-      previousReply &&
-      normalizeText(previousReply) === normalizeText(aiReply)
-    ) {
-      aiReply =
-        'আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
+    // Re-check takeover after the asynchronous AI call.
+    if (getTakeoverState(id)) {
+      console.log(`[Takeover] ${id} became paused during AI generation`);
+      return;
     }
 
-    if (getTakeoverState(senderId)) return;
+    const finalReply = limitToFiveLines(reply);
 
-    await sendFacebookMessage(senderId, limitToFiveLines(aiReply));
+    if (finalReply.length > MAX_MESSENGER_TEXT_LENGTH) {
+      console.warn('[AI] Reply too long; not sent');
+      return;
+    }
+
+    const matched = findRelevantProducts(customerText);
+
+    if (matched.length === 1) {
+      recordProductDiscussion(
+        id,
+        matched[0],
+        customerText,
+        finalReply
+      );
+    }
+
+    await sendFacebookMessage(id, finalReply);
+
+    saveStorage();
   } catch (err) {
     console.error('[AI] Response error:', err.message);
 
-    if (getTakeoverState(senderId)) return;
-
-    await sendFacebookMessage(
-      senderId,
-      'দুঃখিত, এই মুহূর্তে উত্তর তৈরি করতে সমস্যা হচ্ছে। একটু পরে আবার লিখবেন? জরুরি প্রয়োজনে হেল্পলাইন: ' +
-      HELPLINE +
-      '। WhatsApp: ' +
-      WHATSAPP_NUMBER +
-      '।'
-    );
+    if (!getTakeoverState(id)) {
+      await sendFacebookMessage(
+        id,
+        'দুঃখিত, এই মুহূর্তে উত্তর দিতে সমস্যা হচ্ছে। অনুগ্রহ করে কিছুক্ষণ পরে আবার চেষ্টা করুন।'
+      );
+    }
   }
 }
 
 // =============================================================================
-// 21. FACEBOOK WEBHOOK
+// 23. FACEBOOK WEBHOOK
 // =============================================================================
 
 app.get('/webhook', (req, res) => {
@@ -2646,167 +2568,97 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', (req, res) => {
+  // Acknowledge Meta quickly; process events asynchronously.
   res.status(200).send('EVENT_RECEIVED');
 
-  try {
-    const body = req.body;
-    if (body.object !== 'page') return;
+  const body = req.body;
 
-    for (const entry of body.entry || []) {
-      for (const event of entry.messaging || []) {
-        const senderId = event.sender?.id;
-        const message = event.message;
-        const messageId = message?.mid;
+  if (!body || body.object !== 'page') return;
 
-        if (!message || message.is_echo || !senderId) continue;
+  for (const entry of body.entry || []) {
+    for (const event of entry.messaging || []) {
+      const senderId = String(event.sender?.id || '');
 
-        if (messageId && processedMessageIds.has(messageId)) {
-          continue;
-        }
-
-        if (messageId) {
-          processedMessageIds.set(messageId, Date.now());
-        }
-
-        const text = String(message.text || '').trim();
-        const attachments = message.attachments || [];
-
-        const previousTask =
-          customerQueues.get(senderId) || Promise.resolve();
-
-        const currentTask = previousTask
-          .catch(() => {})
-          .then(async () => {
-            if (
-              messageId &&
-              db.messages.some(item => item.messageId === messageId)
-            ) {
-              return;
-            }
-
-            const nowIso = new Date().toISOString();
-            const isPaused = getTakeoverState(senderId);
-
-            appendHistory(
-              senderId,
-              'user',
-              text || '[Media File]'
-            );
-
-            addStoredMessage({
-              id: 'msg_' + crypto.randomUUID(),
-              senderId,
-              sender: 'customer',
-              text: text || `[Media: ${attachments[0]?.type || 'file'}]`,
-              timestamp: nowIso,
-              messageId: messageId || null
-            });
-
-            if (!db.customers[senderId]) {
-              db.customers[senderId] = {
-                id: senderId,
-                name: `Customer ${senderId.slice(-4)}`,
-                messageCount: 1,
-                lastActive: nowIso,
-                lastCustomerMessageAt: nowIso,
-                lastMessageId: messageId || null,
-                isPaused,
-                takeover: isPaused,
-                lastMessageText: text || '[Media]'
-              };
-            } else {
-              const customer = db.customers[senderId];
-
-              customer.messageCount =
-                (customer.messageCount || 0) + 1;
-
-              customer.lastActive = nowIso;
-              customer.lastCustomerMessageAt = nowIso;
-              customer.lastMessageId = messageId || null;
-              customer.lastMessageText = text || '[Media]';
-            }
-
-            if (text) updateCustomerMemory(senderId, text);
-
-            if (!isPaused && !customerHasOrder(senderId)) {
-              scheduleFollowup(senderId, Date.now());
-            } else {
-              cancelFollowup(senderId);
-            }
-
-            if (!saveStorage()) {
-              console.error('[Webhook] Failed to persist incoming message');
-            }
-
-            if (isPaused) {
-              console.log(
-                `[Takeover] ${senderId} paused; AI response skipped`
-              );
-              return;
-            }
-
-            await processCustomerMessage(
-              senderId,
-              text,
-              attachments,
-              messageId || null
-            );
-          });
-
-        customerQueues.set(senderId, currentTask);
-
-        currentTask.finally(() => {
-          if (customerQueues.get(senderId) === currentTask) {
-            customerQueues.delete(senderId);
-          }
-        }).catch(err => {
-          console.error('[Webhook] Customer task failed:', err.message);
-        });
+      if (!senderId || event.sender?.id === event.recipient?.id) {
+        continue;
       }
+
+      if (event.call) {
+        handleCallEvent(event).catch(err =>
+          console.error('[CALL] Event error:', err.message)
+        );
+
+        continue;
+      }
+
+      const message = event.message;
+
+      if (!message || message.is_echo) continue;
+
+      const attachments = Array.isArray(message.attachments)
+        ? message.attachments
+        : [];
+
+      const normalizedAttachments = attachments.map(item => ({
+        type: item.type,
+        payload: item.payload || {}
+      }));
+
+      const text = message.text || '';
+
+      const task = () => processCustomerMessage(
+        senderId,
+        text,
+        normalizedAttachments,
+        message.mid || null
+      );
+
+      // Process messages from one customer sequentially.
+      const previous = customerQueues.get(senderId) ||
+        Promise.resolve();
+
+      const current = previous
+        .catch(() => {})
+        .then(task)
+        .catch(err =>
+          console.error('[QUEUE] Processing error:', err.message)
+        );
+
+      customerQueues.set(senderId, current);
     }
-  } catch (err) {
-    console.error('[Webhook] Processing error:', err.message);
   }
 });
 
 // =============================================================================
-// 22. CATALOG ADMIN API
+// 24. CATALOG ADMIN API
 // =============================================================================
 
 app.get('/api/catalog', (req, res) => {
-  const catalog = loadLocalCatalog();
-
   res.json({
     success: true,
-    catalog,
-    products: catalog.products || [],
-    faqs: catalog.faqs || [],
+    catalog: {
+      version: catalogMeta.version,
+      updatedAt: catalogMeta.updatedAt,
+      products,
+      faqs
+    },
+    products,
+    faqs,
     meta: catalogMeta
   });
 });
 
-app.post('/api/catalog/sync', async (req, res) => {
+app.post('/api/catalog/sync', (req, res) => {
   try {
-    const catalogData = req.body;
+    const catalogData = req.body.catalog || req.body;
 
-    validateCatalogShape(catalogData);
     replaceCatalogAtomically(catalogData, 'admin');
-
-    let githubResult = { synced: false };
-
-    if (GITHUB_TOKEN) {
-      githubResult = await pushCatalogToGitHub(catalogData);
-    }
 
     res.json({
       success: true,
-      message:
-        `Catalog processed: ${products.length} products, ${faqs.length} FAQs`,
       totalProducts: products.length,
       totalFaqs: faqs.length,
-      githubSynced: githubResult.synced,
-      githubError: githubResult.error || null,
       meta: catalogMeta
     });
   } catch (err) {
@@ -2825,33 +2677,37 @@ app.post('/api/github/upload', async (req, res) => {
       githubBranch,
       githubToken,
       githubFilePath
-    } = req.body;
+    } = req.body || {};
 
-    const targetCatalog = catalogPayload || loadLocalCatalog();
-
-    const result = await pushCatalogToGitHub(
-      targetCatalog,
-      githubToken || GITHUB_TOKEN,
-      githubRepo || GITHUB_REPO,
-      githubBranch || GITHUB_BRANCH,
-      githubFilePath || CATALOG_FILE
-    );
-
-    if (!result.synced) {
+    if (!catalogPayload) {
       return res.status(400).json({
         success: false,
-        message: result.error || result.message
+        message: 'catalog is required'
       });
     }
 
+    const result = await pushCatalogToGitHub(
+      catalogPayload,
+      githubToken,
+      githubRepo,
+      githubBranch,
+      githubFilePath
+    );
+
+    if (!result.synced) {
+      return res.status(502).json({
+        success: false,
+        ...result
+      });
+    }
+
+    replaceCatalogAtomically(catalogPayload, 'admin-github-upload');
+
     res.json({
       success: true,
-      message:
-        `Catalog uploaded to ${githubRepo || GITHUB_REPO}@` +
-        `${githubBranch || GITHUB_BRANCH}`,
-      totalProducts: result.totalProducts,
-      totalFaqs: result.totalFaqs,
-      commit: result.commit
+      ...result,
+      totalProducts: products.length,
+      totalFaqs: faqs.length
     });
   } catch (err) {
     res.status(400).json({
@@ -2873,7 +2729,7 @@ app.post('/api/catalog/refresh', async (req, res) => {
 });
 
 // =============================================================================
-// 23. BOT STATUS AND TAKEOVER APIs
+// 25. BOT STATUS AND TAKEOVER APIs
 // =============================================================================
 
 app.get('/api/bot-status', (req, res) => {
@@ -2895,6 +2751,8 @@ app.post('/api/toggle-bot', (req, res) => {
     for (const senderId of Object.keys(db.scheduledFollowups)) {
       cancelFollowup(senderId);
     }
+  } else {
+    restoreFollowupTasks();
   }
 
   const saved = saveStorage();
@@ -2923,8 +2781,8 @@ app.post('/api/customers/:senderId/takeover', async (req, res) => {
     isPaused,
     takeover: isPaused,
     message: isPaused
-      ? 'Human takeover enabled. AI remains paused until an admin resumes it.'
-      : 'AI resumed for this customer.'
+      ? 'Human takeover enabled until admin disables it'
+      : 'AI resumed for this customer'
   });
 });
 
@@ -2948,7 +2806,7 @@ app.post('/api/customers/:senderId/takeover/enable', async (req, res) => {
   await setTakeoverState(
     senderId,
     true,
-    req.body?.reason || 'Enabled from admin chat'
+    req.body?.reason || 'Enabled from admin'
   );
 
   res.json({
@@ -2965,7 +2823,7 @@ app.post('/api/customers/:senderId/takeover/disable', async (req, res) => {
   await setTakeoverState(
     senderId,
     false,
-    req.body?.reason || 'Disabled from admin chat'
+    req.body?.reason || 'Disabled from admin'
   );
 
   res.json({
@@ -2977,26 +2835,20 @@ app.post('/api/customers/:senderId/takeover/disable', async (req, res) => {
 });
 
 // =============================================================================
-// 24. CUSTOMERS, MESSAGES, MEMORY AND ORDERS APIs
+// 26. CUSTOMERS AND MEMORY APIs
 // =============================================================================
 
 app.get('/api/customers', (req, res) => {
-  const list = Object.values(db.customers).map(customer => ({
-    senderId: customer.id,
-    displayName:
-      customer.name || `Customer ${String(customer.id).slice(-4)}`,
-    phone: customer.phone || null,
-    lastMessageText: customer.lastMessageText || null,
-    lastMessageAt: customer.lastActive || null,
-    messageCount: customer.messageCount || 0,
-    lastOrderId: customer.lastOrderId || null,
-    lastOrderAt: customer.lastOrderAt || null,
-    takeover: getTakeoverState(customer.id),
-    isPaused: getTakeoverState(customer.id),
-    takeoverReason: db.takeovers[customer.id]?.reason || null,
-    takeoverUpdatedAt: db.takeovers[customer.id]?.timestamp || null,
-    memoryUpdatedAt: customer.lastMemoryUpdatedAt || null
-  }));
+  const list = Object.values(db.customers).map(customer => {
+    const takeover = db.takeovers[customer.id] || {};
+
+    return {
+      ...customer,
+      isPaused: getTakeoverState(customer.id),
+      takeoverReason: takeover.reason || null,
+      hasPendingOrder: !!getPendingOrder(customer.id)
+    };
+  });
 
   res.json({
     success: true,
@@ -3007,12 +2859,11 @@ app.get('/api/customers', (req, res) => {
 
 app.get('/api/customers/:senderId/memory', (req, res) => {
   const senderId = String(req.params.senderId);
-  const memory = db.customerMemory[senderId] || null;
 
   res.json({
     success: true,
     senderId,
-    memory
+    memory: db.customerMemory[senderId] || null
   });
 });
 
@@ -3037,6 +2888,10 @@ app.put('/api/customers/:senderId/memory', (req, res) => {
       .slice(-20);
   }
 
+  if (Array.isArray(body.productDiscussions)) {
+    memory.productDiscussions = body.productDiscussions.slice(-60);
+  }
+
   if (typeof body.summary === 'string') {
     memory.summary = body.summary.slice(0, 3000);
   }
@@ -3056,6 +2911,10 @@ app.put('/api/customers/:senderId/memory', (req, res) => {
     memory
   });
 });
+
+// =============================================================================
+// 27. MESSAGE APIs
+// =============================================================================
 
 app.get('/api/messages', (req, res) => {
   const senderId = req.query.senderId
@@ -3081,6 +2940,36 @@ app.get('/api/messages', (req, res) => {
     data: messages.slice(-limit)
   });
 });
+
+app.post('/api/customers/:senderId/send', async (req, res) => {
+  const { senderId } = req.params;
+  const { text } = req.body || {};
+
+  if (!text || !String(text).trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Text required'
+    });
+  }
+
+  const sent = await sendFacebookMessage(senderId, text);
+
+  if (!sent) {
+    return res.status(500).json({
+      success: false,
+      message: 'Message sending failed'
+    });
+  }
+
+  res.json({
+    success: true,
+    message: 'Message sent'
+  });
+});
+
+// =============================================================================
+// 28. ORDER APIs
+// =============================================================================
 
 app.get('/api/orders', (req, res) => {
   const status = req.query.status
@@ -3112,7 +3001,7 @@ app.get('/api/orders', (req, res) => {
   });
 });
 
-app.post('/api/orders', (req, res) => {
+app.post('/api/orders', async (req, res) => {
   const order = req.body || {};
 
   const senderId = String(
@@ -3132,11 +3021,11 @@ app.post('/api/orders', (req, res) => {
       item.sourceMessageId === order.sourceMessageId
     )
   ) {
-    return res.status(200).json({
+    return res.json({
       success: true,
       duplicate: true,
-      order: db.orders.find(item =>
-        item.sourceMessageId === order.sourceMessageId
+      order: db.orders.find(
+        item => item.sourceMessageId === order.sourceMessageId
       )
     });
   }
@@ -3145,7 +3034,7 @@ app.post('/api/orders', (req, res) => {
     ...order,
     senderId,
     customerId: senderId,
-    id: order.id || 'order_' + crypto.randomUUID(),
+    id: order.id || newId('order'),
     status: order.status || 'PENDING',
     createdAt: order.createdAt || new Date().toISOString()
   };
@@ -3157,11 +3046,17 @@ app.post('/api/orders', (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: 'Could not save order'
+      message: 'Could not persist order'
     });
   }
 
   cancelFollowup(senderId);
+
+  await setTakeoverState(
+    senderId,
+    true,
+    'Order created through admin API'
+  );
 
   res.status(201).json({
     success: true,
@@ -3218,7 +3113,10 @@ app.put('/api/orders/:orderId', (req, res) => {
     cancelFollowup(oldOrder.senderId || oldOrder.customerId);
   }
 
-  res.json({ success: true, order: db.orders[index] });
+  res.json({
+    success: true,
+    order: db.orders[index]
+  });
 });
 
 app.delete('/api/orders/:orderId', (req, res) => {
@@ -3250,34 +3148,8 @@ app.delete('/api/orders/:orderId', (req, res) => {
   });
 });
 
-app.post('/api/customers/:senderId/send', async (req, res) => {
-  const { senderId } = req.params;
-  const { text } = req.body || {};
-
-  if (!text || !String(text).trim()) {
-    return res.status(400).json({
-      success: false,
-      message: 'Text required'
-    });
-  }
-
-  const sent = await sendFacebookMessage(senderId, text);
-
-  if (!sent) {
-    return res.status(500).json({
-      success: false,
-      message: 'Message sending failed'
-    });
-  }
-
-  res.json({
-    success: true,
-    message: 'Message sent'
-  });
-});
-
 // =============================================================================
-// 25. HEALTH, STATUS AND MEDIA DIAGNOSTICS
+// 29. HEALTH, STATUS AND MEDIA DIAGNOSTICS
 // =============================================================================
 
 app.get('/health', (req, res) => {
@@ -3299,6 +3171,11 @@ app.get('/api/status', (req, res) => {
   res.json({
     success: true,
     status: 'LIVE_PRODUCTION',
+    models: {
+      text: TEXT_MODEL,
+      voice: VOICE_MODEL,
+      vision: VISION_MODEL
+    },
     catalogProducts: products.length,
     catalogFaqs: faqs.length,
     catalogFile: CATALOG_FILE,
@@ -3312,9 +3189,14 @@ app.get('/api/status', (req, res) => {
     customers: Object.keys(db.customers).length,
     messages: db.messages.length,
     orders: db.orders.length,
+    pendingOrders: Object.keys(db.pendingOrders).length,
     customerMemories: Object.keys(db.customerMemory).length,
     pendingFollowups: Object.values(db.scheduledFollowups)
       .filter(task => task && task.status === 'PENDING').length,
+    totalTakeovers: Object.keys(db.takeovers).length,
+    activeTakeovers: Object.values(db.takeovers)
+      .filter(item => item && item.isPaused).length,
+    callEvents: db.callEvents.length,
     timestamp: new Date().toISOString()
   });
 });
@@ -3332,36 +3214,92 @@ app.get('/api/catalog/media-status', (req, res) => {
 });
 
 // =============================================================================
-// 26. START SERVER
+// 30. RETENTION CLEANUP
+// =============================================================================
+
+function cleanupOldData() {
+  const cutoff = Date.now() -
+    CUSTOMER_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+  const oldCustomerIds = new Set();
+
+  for (const [id, customer] of Object.entries(db.customers)) {
+    const lastActive = new Date(
+      customer.lastActive || customer.createdAt || 0
+    ).getTime();
+
+    if (lastActive > 0 && lastActive < cutoff) {
+      oldCustomerIds.add(id);
+    }
+  }
+
+  for (const id of oldCustomerIds) {
+    if (getTakeoverState(id)) continue;
+
+    delete db.customers[id];
+    delete db.customerMemory[id];
+    delete db.takeovers[id];
+    delete db.scheduledFollowups[id];
+    delete db.pendingOrders[id];
+
+    customerHistory.delete(id);
+
+    db.messages = db.messages.filter(
+      message => String(message.senderId) !== id
+    );
+
+    db.orders = db.orders.filter(
+      order => String(order.senderId || order.customerId) !== id
+    );
+  }
+
+  // Remove expired pending order drafts, even if the customer is still active.
+  for (const [id, pending] of Object.entries(db.pendingOrders)) {
+    const updatedAt = Number(
+      pending?.updatedAt || pending?.createdAt || 0
+    );
+
+    if (
+      updatedAt &&
+      Date.now() - updatedAt > PENDING_ORDER_RETENTION_MS
+    ) {
+      delete db.pendingOrders[id];
+    }
+  }
+
+  if (oldCustomerIds.size || Object.keys(db.pendingOrders).length) {
+    saveStorage();
+  }
+
+  if (oldCustomerIds.size) {
+    console.log(
+      `[CLEANUP] Removed ${oldCustomerIds.size} inactive customers`
+    );
+  }
+}
+
+// =============================================================================
+// 31. START SERVER
 // =============================================================================
 
 async function startServer() {
-  await pullCatalogFromGitHub();
+  try {
+    await pullCatalogFromGitHub();
+  } catch (err) {
+    console.error('[GITHUB] Startup sync error:', err.message);
+  }
 
   restoreFollowupTasks();
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] ImpoTech Master Bot running on port ${PORT}`);
-
     console.log(
-      `[CATALOG] ${products.length} products, ` +
-      `${faqs.length} FAQs; source=${catalogMeta.source}`
+      `[SERVER] ImpoTech Master Bot running on port ${PORT}`
     );
 
-    console.log(`[CONTACT] Helpline: ${HELPLINE}`);
-    console.log(`[CONTACT] WhatsApp: ${WHATSAPP_NUMBER}`);
-    console.log(`[MEMORY] Last ${HISTORY_LIMIT} messages + persistent customer memory`);
-    console.log('[FOLLOWUP] Scheduled follow-up enabled');
-
-    if (catalogMeta.lastSyncError) {
-      console.warn('[CATALOG] GitHub warning: ' + catalogMeta.lastSyncError);
-    }
-
-    if (!ADMIN_SECRET && REQUIRE_ADMIN_SECRET) {
-      console.error(
-        '[SECURITY] ADMIN_SECRET is missing. Admin API requests will be rejected.'
-      );
-    }
+    console.log(`[AI] Text model: ${TEXT_MODEL}`);
+    console.log(`[AI] Voice model: ${VOICE_MODEL}`);
+    console.log(`[AI] Vision model: ${VISION_MODEL}`);
+    console.log(`[CATALOG] Products loaded: ${products.length}`);
   });
 }
 
@@ -3371,28 +3309,58 @@ startServer().catch(err => {
 });
 
 // =============================================================================
-// 27. CLEANUP AND PERIODIC FOLLOW-UP VALIDATION
+// 32. PERIODIC TASKS
 // =============================================================================
 
 setInterval(() => {
   const cutoff = Date.now() - DUPLICATE_WINDOW_MS;
 
   for (const [id, timestamp] of processedMessageIds) {
-    if (timestamp < cutoff) processedMessageIds.delete(id);
+    if (timestamp < cutoff) {
+      processedMessageIds.delete(id);
+    }
   }
 }, 60 * 1000).unref();
 
 setInterval(() => {
   for (const [senderId, task] of Object.entries(db.scheduledFollowups)) {
-    if (!task || task.status !== 'PENDING') continue;
-
-    if (getTakeoverState(senderId) || customerHasOrder(senderId)) {
-      cancelFollowup(senderId);
-      continue;
-    }
-
-    if (!followupTimers.has(senderId)) {
+    if (task && task.status === 'PENDING') {
       armFollowupTimer(senderId);
     }
   }
 }, FOLLOWUP_CHECK_INTERVAL_MS).unref();
+
+setInterval(() => {
+  saveStorage();
+}, 5 * 60 * 1000).unref();
+
+setInterval(() => {
+  cleanupOldData();
+}, 6 * 60 * 60 * 1000).unref();
+
+// =============================================================================
+// 33. REQUIRED ENVIRONMENT VARIABLES
+// =============================================================================
+
+/*
+PORT=10000
+
+PAGE_ACCESS_TOKEN=your_facebook_page_access_token
+VERIFY_TOKEN=your_webhook_verify_token
+
+OPENROUTER_API_KEY=your_openrouter_api_key
+
+TEXT_MODEL=google/gemini-2.5-flash-lite
+VOICE_MODEL=google/gemini-2.5-flash-lite
+VISION_MODEL=google/gemini-2.5-flash-lite
+
+GITHUB_TOKEN=your_github_token
+GITHUB_REPO=impotechaibot/Impotech-bot
+GITHUB_BRANCH=main
+CATALOG_FILE=data/catalog.json
+
+ADMIN_SECRET=your_strong_random_admin_secret
+REQUIRE_ADMIN_SECRET=true
+
+GRAPH_API_VERSION=v18.0
+*/
