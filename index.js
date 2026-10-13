@@ -4,8 +4,8 @@
  * =============================================================================
  * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND  (FINAL — MULTI-MODEL BUILD)
  * =============================================================================
- * AI TEXT   : OpenRouter Qwen3.8 Omni Flash
- * AI VOICE  : OpenRouter Qwen3.8 Omni Flash
+ * AI TEXT   : OpenRouter DeepSeek V4.1 Flash
+ * AI VOICE  : OpenRouter DeepSeek V4.1 Flash
  * AI VISION : OpenRouter Gemini 3.1 Flash Lite  (image understanding only)
  * CATALOG   : GitHub catalog.json + Local cache
  * STORAGE   : storage_data.json  (persistent, takeover never auto-expires)
@@ -74,13 +74,13 @@ const OPENROUTER_URL =
   'https://openrouter.ai/api/v1/chat/completions';
 
 // ---- MODELS ----
-// Text + Voice → Qwen3.8 Omni Flash
+// Text + Voice → DeepSeek V4.1 Flash
 // Vision (image understanding) → Gemini 3.1 Flash Lite
 const TEXT_MODEL =
-  process.env.TEXT_MODEL || 'qwen/qwen3.8-omni-flash';
+  process.env.TEXT_MODEL || 'deepseek/deepseek-v4.1-flash';
 
 const VOICE_MODEL =
-  process.env.VOICE_MODEL || 'qwen/qwen3.8-omni-flash';
+  process.env.VOICE_MODEL || 'deepseek/deepseek-v4.1-flash';
 
 const VISION_MODEL =
   process.env.VISION_MODEL || 'google/gemini-3.1-flash-lite';
