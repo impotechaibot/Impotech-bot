@@ -389,32 +389,75 @@ function getProductMediaReply(text, senderId) {
 // Motorcycle compatibility: do not infer unverified model/year fitment.
 // -----------------------------------------------------------------------------
 const BUILTIN_BIKE_DATABASE = [
-  {brand:'Yamaha',model:'FZ',aliases:['fz','fz-s','fzs','fz v2','fz v3']},
-  {brand:'Yamaha',model:'FZ25',aliases:['fz25','fz 25']},
-  {brand:'Yamaha',model:'R15',aliases:['r15','r15 v2','r15 v3','r15 v4','r15m']},
-  {brand:'Bajaj',model:'Pulsar 150',aliases:['pulsar 150','pulsar150','p150']},
-  {brand:'Bajaj',model:'Pulsar 220',aliases:['pulsar 220','pulsar220','p220']},
-  {brand:'Bajaj',model:'Pulsar NS200',aliases:['pulsar ns200','ns200','ns 200']},
-  {brand:'TVS',model:'Apache RTR 160',aliases:['apache rtr 160','rtr160','apache 160']},
-  {brand:'TVS',model:'Apache RTR 200',aliases:['apache rtr 200','rtr200','apache 200']},
-  {brand:'Hero',model:'Splendor',aliases:['splendor','splendor plus','splendor+']},
-  {brand:'Honda',model:'CB Shine',aliases:['cb shine','cbshine','shine']},
-  {brand:'Suzuki',model:'Gixxer',aliases:['gixxer','gixxer 150','gixxer sf']}
+  // Motorcycle model index: names are searchable; socket fitment remains variant/year-specific unless sourced.
+  {brand:'Yamaha',model:'FZ',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['fz','fz-s','fzs','fz v2','fz v3','yamaha fz']},
+  {brand:'Yamaha',model:'FZ25',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['fz25','fz 25']},
+  {brand:'Yamaha',model:'R15',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['r15','r15 v2','r15 v3','r15 v4','r15m']},
+  {brand:'Yamaha',model:'Fazer',vehicleType:'motorcycle',fitment:'some year variants listed with H4; verify exact variant',aliases:['fazer','yamaha fazer','fazer fz']},
+  {brand:'Yamaha',model:'MT-07',vehicleType:'motorcycle',fitment:'H4 listed for certain model years; verify exact variant',aliases:['mt07','mt 07','yamaha mt-07']},
+  {brand:'Yamaha',model:'XT600',vehicleType:'motorcycle',fitment:'H4 listed for certain model years; verify exact variant',aliases:['xt600','xt 600','yamaha xt600']},
+  {brand:'Bajaj',model:'Discover 125',vehicleType:'motorcycle',fitment:'variant-dependent; HS1 used on some variants, do not assume direct H4',aliases:['discover 125','discover125','bajaj discover 125','ডিসকভার ১২৫','ডিসকভার 125']},
+  {brand:'Bajaj',model:'Discover 100',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['discover 100','discover100','bajaj discover 100']},
+  {brand:'Bajaj',model:'Pulsar 125',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 125','pulsar125','p125']},
+  {brand:'Bajaj',model:'Pulsar 150',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 150','pulsar150','p150']},
+  {brand:'Bajaj',model:'Pulsar 220',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 220','pulsar220','p220']},
+  {brand:'Bajaj',model:'Pulsar NS200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar ns200','ns200','ns 200']},
+  {brand:'Bajaj',model:'Platina',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['platina','platina 100','platina 110']},
+  {brand:'Bajaj',model:'CT 100',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['ct100','ct 100','bajaj ct 100']},
+  {brand:'TVS',model:'Apache RTR 160',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['apache rtr 160','rtr160','apache 160']},
+  {brand:'TVS',model:'Apache RTR 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['apache rtr 200','rtr200','apache 200']},
+  {brand:'TVS',model:'Metro',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['tvs metro','metro plus']},
+  {brand:'TVS',model:'Sport',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['tvs sport','sport 100']},
+  {brand:'Hero',model:'Splendor',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['splendor','splendor plus','splendor+']},
+  {brand:'Hero',model:'HF Deluxe',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hf deluxe','hfdeluxe','hero hf deluxe']},
+  {brand:'Hero',model:'Glamour',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hero glamour','glamour 125']},
+  {brand:'Honda',model:'CB Shine',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['cb shine','cbshine','shine']},
+  {brand:'Honda',model:'Dream 110',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['dream 110','dream neo','honda dream']},
+  {brand:'Honda',model:'Unicorn',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['honda unicorn','unicorn 150','unicorn 160']},
+  {brand:'Honda',model:'Grom',vehicleType:'motorcycle',fitment:'H4/HS1-base options exist in some market variants; verify exact model',aliases:['honda grom','grom 125','msx125','msx 125']},
+  {brand:'Suzuki',model:'Gixxer',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['gixxer','gixxer 150','gixxer sf']},
+  {brand:'Yamaha',model:'Saluto',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['saluto','yamaha saluto']},
+  {brand:'Yamaha',model:'Fascino',vehicleType:'scooter',fitment:'variant-dependent',aliases:['fascino','yamaha fascino']},
+  {brand:'Yamaha',model:'Ray ZR',vehicleType:'scooter',fitment:'variant-dependent',aliases:['ray zr','rayzr','yamaha ray zr']},
+  {brand:'KTM',model:'Duke 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['duke 200','ktm duke 200']},
+  {brand:'KTM',model:'RC 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['rc 200','ktm rc 200']},
+  // Cars and utility vehicles: indexed for fast lookup, but model/year/trim must be checked.
+  {brand:'Toyota',model:'Corolla',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota corolla','corolla gli','corolla xli','corolla axio','axio']},
+  {brand:'Toyota',model:'Allion',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota allion','allion']},
+  {brand:'Toyota',model:'Premio',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota premio','premio']},
+  {brand:'Toyota',model:'Probox',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota probox','probox']},
+  {brand:'Toyota',model:'Hiace',vehicleType:'van',fitment:'variant-dependent',aliases:['toyota hiace','hiace','হাইএস']},
+  {brand:'Honda',model:'Civic',vehicleType:'car',fitment:'variant-dependent',aliases:['honda civic','civic']},
+  {brand:'Honda',model:'Fit/Jazz',vehicleType:'car',fitment:'variant-dependent',aliases:['honda fit','fit','honda jazz','jazz']},
+  {brand:'Honda',model:'City',vehicleType:'car',fitment:'variant-dependent',aliases:['honda city','city']},
+  {brand:'Nissan',model:'Sunny',vehicleType:'car',fitment:'variant-dependent',aliases:['nissan sunny','sunny']},
+  {brand:'Nissan',model:'AD Van',vehicleType:'van',fitment:'variant-dependent',aliases:['nissan ad','ad van','nissan ad van']},
+  {brand:'Suzuki',model:'Alto',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki alto','alto']},
+  {brand:'Suzuki',model:'Wagon R',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki wagon r','wagon r','wagonr']},
+  {brand:'Suzuki',model:'Swift',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki swift','swift']},
+  {brand:'Mitsubishi',model:'Lancer',vehicleType:'car',fitment:'variant-dependent',aliases:['mitsubishi lancer','lancer']},
+  {brand:'Tata',model:'Ace',vehicleType:'truck',fitment:'variant-dependent',aliases:['tata ace','ace mini truck','টাটা এস']},
+  {brand:'Tata',model:'407',vehicleType:'truck',fitment:'variant-dependent',aliases:['tata 407','407 truck']},
+  {brand:'Mahindra',model:'Bolero Pickup',vehicleType:'pickup',fitment:'variant-dependent',aliases:['mahindra bolero pickup','bolero pickup','bolero pikup']},
+  {brand:'Ashok Leyland',model:'Dost',vehicleType:'truck',fitment:'variant-dependent',aliases:['ashok leyland dost','leyland dost','dost mini truck']},
+  {brand:'CNG',model:'Auto-rickshaw',vehicleType:'cng',fitment:'brand/model and lamp housing vary; verify socket',aliases:['cng','সিএনজি','auto rickshaw','autorickshaw','অটোরিকশা','অটো রিকশা','three wheeler','three-wheeler','থ্রি হুইলার']}
 ];
-function isBikeCompatibilityQuestion(text='') { return /h\s*-?\s*[0-9]+|9003|hb2|hs\s*-?\s*1|headlight|head\s*lamp|হেডলাইট|হেড\s*লাইট|plug\s*and\s*play|socket|সকেট|বাল্ব|bulb|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন/i.test(text) && /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট|পিন|pin|লাগবে|হেডলাইট/i.test(text); }
+function isBikeCompatibilityQuestion(text='') { return /h\s*-?\s*[0-9]+|9003|hb2|hs\s*-?\s*1|headlight|head\s*lamp|হেডলাইট|হেড\s*লাইট|plug\s*and\s*play|socket|সকেট|বাল্ব|bulb|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|প্রজেকশন|projector/i.test(text) && /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|ভ্যান|van|পিকআপ|pickup|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট|পিন|pin|লাগবে|হেডলাইট|টয়োটা|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata|mitsubishi/i.test(text); }
 function identifyBikeModel(text='') {
   const v=normalizeText(text);
   for (const entry of BUILTIN_BIKE_DATABASE) for (const name of [entry.model,...entry.aliases]) if (name.length>=3 && (` ${v} `).includes(` ${normalizeText(name)} `)) return entry;
   return null;
 }
 function isH4Confirmed(text='') { return /\bh\s*-?\s*4\b|\bhs\s*-?\s*1\b|\b9003\b|\bhb2\b|৩\s*পিন|তিন\s*পিন|3\s*-?\s*pin/i.test(text); }
-function bikeClarification() { return 'এই হেডলাইটটি H4/3-pin প্লাগের সঙ্গে মিলে গেলে ব্যবহার করা যায়। আপনার বাইক/গাড়ি/CNG/বাস/ট্রাকের পুরোনো হেডলাইটের প্লাগ H4 বা 3-pin কি না যাচাই করুন, অথবা প্লাগের পরিষ্কার ছবি/গায়ের লেখা পাঠান। মডেলভিত্তিক নির্ভরযোগ্য তথ্য না পেলে ফিট হবে বলে অনুমান করব না।'; }
+function bikeClarification() { return 'হ্যাঁ—আপনার 60W LED প্রজেকশন হেডলাইটটি H4/3-pin সকেট, নির্ধারিত ভোল্টেজ এবং যানবাহনের বৈদ্যুতিক সিস্টেমের সঙ্গে মিলে গেলে ব্যবহার করা যেতে পারে। মডেল/বছর বা পুরোনো সকেটের ছবি দিলে বাইক, কার, CNG, ভ্যান বা ট্রাক—যে যানই হোক—ফিটমেন্ট মিলিয়ে বলব। শুধু H4-এর মতো দেখতে হলেই সব সকেটে সরাসরি লাগবে ধরে নেওয়া যাবে না।'; }
 function bikeReply(text, senderId) {
   const allText=getRecentConversationText(senderId,text);
-  if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(allText) && !isH4Confirmed(allText)) return 'H1/H3/H7/H11/H13/H6M লেখা থাকলে সেটি H4/3-pin প্লাগের সঙ্গে সরাসরি মেলে—এমন ধরে নেওয়া যাবে না। অ্যাডাপ্টার ও কানেক্টর যাচাই করতে প্লাগের ছবি পাঠান।';
-  if (isH4Confirmed(allText)) return 'আপনার গাড়ি/বাইক/CNG/বাস/ট্রাকের আসল সকেট যদি H4 বা এই হেডলাইটের সঙ্গে মিলে যাওয়া 3-pin প্লাগ হয়, তাহলে প্লাগের দিক থেকে ব্যবহার করা যাবে। তবে শুধু মডেলের নাম বা “৩-পিন” কথাটি দিয়ে ভোল্টেজ, বেস ও ফিটমেন্ট শতভাগ নিশ্চিত করা যায় না—পুরোনো প্লাগের ছবি দিলে মিলিয়ে দেখব।';
-  const vehicle=allText.match(/(?:আমার|my)?\s*(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মোটরসাইকেল|motorcycle)[^।.!?\n]{0,100}/i);
-  if(vehicle) return `আপনি ${vehicle[0].trim()} বলেছেন, কিন্তু নির্ভরযোগ্য ডাটাবেজে এই মডেলের প্লাগ নিশ্চিত করতে পারছি না। আপনার গাড়ি/যানের পুরোনো হেডলাইটের প্লাগ H4/3-pin কি না যাচাই করুন বা প্লাগের পরিষ্কার ছবি পাঠান। H4/3-pin-এর সঙ্গে মিল থাকলেই প্লাগের দিক থেকে ব্যবহারযোগ্য; অন্য প্লাগ হলে ফিট হবে বলে নিশ্চিত বলা যাবে না।`;
+  if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(allText) && !isH4Confirmed(allText)) return 'আপনার উল্লেখ করা H1/H3/H7/H11/H13/H6M সকেট H4/3-pin-এর থেকে আলাদা হতে পারে। আপনার 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে কি না, তা সকেট/অ্যাডাপ্টার, ভোল্টেজ ও ফিটমেন্ট মিলিয়ে নিশ্চিত করতে হবে। প্লাগের পরিষ্কার ছবি পাঠান।';
+  if (isH4Confirmed(allText)) return 'হ্যাঁ—H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও কানেক্টর মিলে গেলে আপনার 60W LED প্রজেকশন হেডলাইট ব্যবহার করা যাবে। LED-র প্রকৃত বিদ্যুৎ খরচ মডেলভেদে আলাদা হতে পারে; তাই শুধু “60W” লেখা দেখে কম পাওয়ার নেয় ধরে নিচ্ছি না। HS1 বা অন্য কাছাকাছি সকেট সরাসরি মেলে কি না, তা কানেক্টর/অ্যাডাপ্টার দেখে নিশ্চিত করতে হবে।';
+  const knownBike=identifyBikeModel(allText);
+  if (knownBike) return `আপনি ${knownBike.brand} ${knownBike.model} (${knownBike.vehicleType}) বলেছেন। এই মডেলটি আমার যানবাহন ইনডেক্সে আছে। ফিটমেন্ট নোট: ${knownBike.fitment}. সকেটটি H4/3-pin হলে এবং নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আপনার 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে এই মডেলের সব বছর/ভ্যারিয়েন্টে H4 আছে বলে নিশ্চিত করছি না; মডেল ইয়ার/ভ্যারিয়েন্ট বা পুরোনো সকেটের ছবি দিলে মিলিয়ে বলব।`;
+  const vehicle=allText.match(/(?:আমার|my)?\s*(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মোটরসাইকেল|motorcycle|ভ্যান|van|পিকআপ|pickup)[^।.!?\n]{0,100}/i);
+  if(vehicle) return `আপনি ${vehicle[0].trim()} বলেছেন। আপনার 60W LED প্রজেকশন লাইটটি H4/3-pin সকেট, ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে ব্যবহার করা যাবে। এই নির্দিষ্ট মডেলের সকেট এখনো নিশ্চিত নয়—ব্র্যান্ড, মডেল, সাল/ভ্যারিয়েন্ট অথবা পুরোনো হেডলাইট প্লাগের ছবি পাঠান।`;
   return bikeClarification();
 }
 
@@ -579,7 +622,7 @@ function buildSystemPrompt(relevantProducts,relevantFaqs,history,memoryContext,w
   const faqContext=relevantFaqs.length?relevantFaqs.map((f,i)=>`[FAQ ${i+1}] ${f.question||''}\n${f.answer||''}`).join('\n\n'):'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
   const historyContext=history.length?history.map(x=>`${x.role==='assistant'?'বট/প্রতিনিধি':'গ্রাহক'}: ${x.text}`).join('\n'):'পূর্ববর্তী কথোপকথন নেই।';
   const webContext=webResults.length?webResults.map((x,i)=>`[বাহ্যিক সার্চ ${i+1}] ${x.name}\n${x.content}\nURL: ${x.url}`).join('\n\n'):'কোনো বাহ্যিক সার্চ ফল নেই।';
-  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); সর্বোচ্চ ৫ লাইন। Smart Answer হিসেবে আগে কথোপকথন, গ্রাহক মেমোরি, প্রাসঙ্গিক ক্যাটালগ ও FAQ মিলিয়ে সরাসরি উত্তর দিন; একই প্রশ্ন বারবার করবেন না। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ২০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বাইকের মডেল দেখে সকেট নিশ্চিত বলে দাবি করবেন না; বছর/ভ্যারিয়েন্ট ও কানেক্টর যাচাই করুন। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক বা নিশ্চিত ফিটমেন্টের প্রমাণ ধরবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (শুধু সাধারণ প্রাসঙ্গিকতা):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
+  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); সর্বোচ্চ ৫ লাইন। Smart Answer হিসেবে আগে কথোপকথন, গ্রাহক মেমোরি, প্রাসঙ্গিক ক্যাটালগ ও FAQ মিলিয়ে সরাসরি উত্তর দিন; একই প্রশ্ন বারবার করবেন না। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ২০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বাইক, কার, CNG, ভ্যান, পিকআপ ও ট্রাকসহ সব যানবাহনের মডেল/ব্র্যান্ড/সালকে BUILTIN_BIKE_DATABASE ইনডেক্সে খুঁজুন। গ্রাহক পরিচিত যানবাহনের নাম বললে সরাসরি উত্তর দিন: H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আমাদের 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে মডেল/বছরভেদে সকেট আলাদা হতে পারে, তাই অজানা fitment-কে নিশ্চিত বলবেন না; প্রয়োজনে একটি ছোট প্রশ্নে বছর/ভ্যারিয়েন্ট বা সকেটের ছবি চান। 35W/35/35W উল্লেখ করবেন না। H4/3-pin ও HS1-কে একই ধরে নেবেন না; দরকার হলে অ্যাডাপ্টার যাচাই করুন। পণ্যের প্রকৃত বিদ্যুৎ খরচ প্রমাণ ছাড়া কম বলে দাবি করবেন না। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক বা নিশ্চিত ফিটমেন্টের প্রমাণ ধরবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (শুধু সাধারণ প্রাসঙ্গিকতা):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
 }
 async function callOpenRouter(messages,model=TEXT_MODEL) {
   if(!OPENROUTER_API_KEY)throw new Error('OPENROUTER_API_KEY is not configured');
@@ -593,7 +636,7 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const relevantProducts=findRelevantProducts(context), relevantFaqs=findRelevantFaqs(context);
   let webResults=[];
   // Search only when catalog/FAQ context is weak and the question is plausibly factual/compatibility-related.
-  if (LINKUP_API_KEY && ((relevantProducts.length===0 && relevantFaqs.length===0 && /বাইক|মডেল|সকেট|হেডলাইট|compatible|compatibility|fit|ফিট|কানেক্টর|connector|স্পেসিফিকেশন|specification/i.test(query)) || isBikeCompatibilityQuestion(query))) webResults=await linkupSearch(query);
+  if (LINKUP_API_KEY && ((relevantProducts.length===0 && relevantFaqs.length===0 && /বাইক|মডেল|সকেট|হেডলাইট|compatible|compatibility|fit|ফিট|কানেক্টর|connector|স্পেসিফিকেশন|specification|car|truck|cng|toyota|honda|nissan|suzuki|mitsubishi|tata|mahindra|ট্রাক|গাড়ি|গাড়ি|সিএনজি/i.test(query)) || isBikeCompatibilityQuestion(query))) webResults=await linkupSearch(query);
   const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,webResults);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
   const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
