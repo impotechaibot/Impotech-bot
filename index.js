@@ -1631,65 +1631,143 @@ app.put('/api/catalog', (req, res) => {
 });
 
 
-// ============================================================
-// 14. ADMIN TAKEOVER / BOT CONTROL
-// ============================================================
 
-app.get('/api/takeover', (req, res) => {
-  res.json({
-    success: true,
-    globalPaused: db.isGlobalPaused,
-    takeovers: db.takeovers,
-    customers: Object.values(db.customers).map(c => ({
-      id: c.id,
-      name: c.name,
-      phone: c.phone,
-      address: c.address,
-      takeover: Boolean(c.takeover),
-      takeoverReason: c.takeoverReason || ''
-    }))
-  });
-});
+ // ============================================================
+ // 14. ADMIN TAKEOVER / BOT CONTROL
+ // Backward-compatible routes for old and new Admin Apps
+ // ============================================================
 
-app.post('/api/takeover', (req, res) => {
-  const { senderId, enabled, reason } = req.body || {};
+ // Shared status response
+ function getTakeoverStatus(senderId = '') {
+   if (senderId) {
+     const customer = db.customers[senderId] || {};
+     return {
+       success: true,
+       senderId,
+       customerId: senderId,
+       enabled: isTakeover(senderId),
+       takeover: isTakeover(senderId),
+       globalPaused: db.isGlobalPaused,
+       reason: customer.takeoverReason || ''
+     };
+   }
 
-  if (!senderId || typeof enabled !== 'boolean') {
-    return res.status(400).json({
-      success: false,
-      error: 'senderId and boolean enabled are required.'
-    });
-  }
+   return {
+     success: true,
+     globalPaused: db.isGlobalPaused,
+     takeovers: db.takeovers,
+     customers: Object.values(db.customers).map(c => ({
+       id: c.id,
+       senderId: c.id,
+       customerId: c.id,
+       name: c.name || '',
+       phone: c.phone || '',
+       address: c.address || '',
+       takeover: isTakeover(c.id),
+       enabled: isTakeover(c.id),
+       takeoverReason: c.takeoverReason || ''
+     }))
+   };
+ }
 
-  setTakeover(senderId, enabled, reason || 'Admin toggle');
+ // Current API: GET /api/takeover
+ app.get('/api/takeover', (req, res) => {
+   res.json(getTakeoverStatus());
+ });
 
-  res.json({
-    success: true,
-    senderId,
-    enabled
-  });
-});
+ // Legacy API: GET /api/takeover/status?customerId=...
+ app.get('/api/takeover/status', (req, res) => {
+   const senderId = String(
+     req.query.customerId ||
+     req.query.senderId ||
+     req.query.sender_id ||
+     ''
+   );
 
-app.post('/api/bot/pause', (req, res) => {
-  db.isGlobalPaused = true;
-  saveDB();
+   res.json(getTakeoverStatus(senderId));
+ });
 
-  res.json({
-    success: true,
-    globalPaused: true
-  });
-});
+ // Current + legacy API: POST /api/takeover
+ app.post('/api/takeover', (req, res) => {
+   const body = req.body || {};
 
-app.post('/api/bot/resume', (req, res) => {
-  db.isGlobalPaused = false;
-  saveDB();
+   const senderId = String(
+     body.senderId ||
+     body.customerId ||
+     body.customer_id ||
+     body.sender_id ||
+     ''
+   );
 
-  res.json({
-    success: true,
-    globalPaused: false
-  });
-});
+   const enabled = body.enabled;
 
+   if (!senderId || typeof enabled !== 'boolean') {
+     return res.status(400).json({
+       success: false,
+       error: 'senderId/customerId and boolean enabled are required.'
+     });
+   }
+
+   setTakeover(
+     senderId,
+     enabled,
+     body.reason || 'Admin toggle'
+   );
+
+   return res.json({
+     success: true,
+     senderId,
+     customerId: senderId,
+     enabled,
+     takeover: enabled,
+     globalPaused: db.isGlobalPaused
+   });
+ });
+
+ // Legacy alias: POST /api/customers/:senderId/takeover
+ app.post('/api/customers/:senderId/takeover', (req, res) => {
+   const senderId = req.params.senderId;
+   const enabled = req.body?.enabled;
+
+   if (typeof enabled !== 'boolean') {
+     return res.status(400).json({
+       success: false,
+       error: 'Boolean enabled is required.'
+     });
+   }
+
+   setTakeover(senderId, enabled, 'Admin toggle');
+
+   return res.json({
+     success: true,
+     senderId,
+     customerId: senderId,
+     enabled,
+     takeover: enabled
+   });
+ });
+
+ // Global bot pause
+ app.post('/api/bot/pause', (req, res) => {
+   db.isGlobalPaused = true;
+   saveDB();
+
+   return res.json({
+     success: true,
+     globalPaused: true
+   });
+ });
+
+ // Global bot resume
+ app.post('/api/bot/resume', (req, res) => {
+   db.isGlobalPaused = false;
+   saveDB();
+
+   return res.json({
+     success: true,
+     globalPaused: false
+   });
+ });
 
 // ============================================================
 // 15. ADMIN CUSTOMERS / MESSAGES / MEMORY / ORDERS
