@@ -2,14 +2,16 @@
 
 /**
  * =============================================================================
- * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND
+ * IMPOTECH AI MESSENGER BOT & ADMIN BACKEND  (FINAL FIXED BUILD)
  * =============================================================================
- * AI          : OpenRouter Gemini
+ * AI          : OpenRouter Qwen3.8 Omni Flash (Text + Voice + Image)
  * CATALOG     : GitHub catalog.json + Local cache
- * STORAGE     : storage_data.json
+ * STORAGE     : storage_data.json  (persistent, no auto-expire takeover)
  * MEMORY      : Persistent customer memory + last 20 messages
- * FOLLOW-UP   : Scheduled around 23 hours after customer interaction
+ * FOLLOW-UP   : Scheduled ~23 hours after customer interaction
  * HUMAN       : Persistent per-customer + global takeover
+ * CALL        : Auto Human Takeover on Facebook call events
+ * ORDER       : Auto Human Takeover + stored order on order intent
  * ADMIN       : Catalog, customers, messages, orders, bot status
  * =============================================================================
  */
@@ -69,10 +71,12 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const OPENROUTER_URL =
   'https://openrouter.ai/api/v1/chat/completions';
 
+// Qwen3.8 Omni Flash handles text + voice + image
 const TEXT_MODEL =
-  process.env.TEXT_MODEL || 'google/gemini-3.1-flash-lite';
+  process.env.TEXT_MODEL || 'qwen/qwen3.8-omni-flash';
 
 const VOICE_MODEL = process.env.VOICE_MODEL || TEXT_MODEL;
+const VISION_MODEL = process.env.VISION_MODEL || TEXT_MODEL;
 
 const HELPLINE = '+8809611042598';
 const WHATSAPP_NUMBER = '01884332067';
@@ -88,10 +92,12 @@ const HISTORY_LIMIT = 20;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
 
-// Follow-up is scheduled at 23 hours, leaving a safety margin
-// before the standard 24-hour Messenger messaging window closes.
+// Follow-up: 23 hours after last customer message
 const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
 const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
+
+// Human Takeover NEVER auto-expires (only admin can disable)
+const TAKEOVER_AUTO_EXPIRE_MS = 0; // 0 = disabled forever until manual off
 
 const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
 const DATA_FILE = path.join(__dirname, 'storage_data.json');
@@ -130,7 +136,8 @@ let db = {
   messages: [],
   orders: [],
   customerMemory: {},
-  scheduledFollowups: {}
+  scheduledFollowups: {},
+  callEvents: []
 };
 
 const customerHistory = new Map();
@@ -155,6 +162,7 @@ function ensureStorageShape() {
 
   if (!Array.isArray(db.messages)) db.messages = [];
   if (!Array.isArray(db.orders)) db.orders = [];
+  if (!Array.isArray(db.callEvents)) db.callEvents = [];
 
   if (!db.customerMemory || typeof db.customerMemory !== 'object') {
     db.customerMemory = {};
@@ -186,10 +194,39 @@ function loadStorage() {
       orders: [],
       customerMemory: {},
       scheduledFollowups: {},
+      callEvents: [],
       ...saved
     };
 
     ensureStorageShape();
+
+    // Normalize takeovers & customers so nothing is lost
+    for (const id of Object.keys(db.takeovers)) {
+      const entry = db.takeovers[id];
+      if (!entry || typeof entry !== 'object') {
+        delete db.takeovers[id];
+        continue;
+      }
+      if (typeof entry.isPaused !== 'boolean') {
+        entry.isPaused = Boolean(entry.takeover);
+      }
+      if (!entry.timestamp) entry.timestamp = new Date().toISOString();
+    }
+
+    for (const id of Object.keys(db.customers)) {
+      const c = db.customers[id];
+      if (!c || typeof c !== 'object') {
+        delete db.customers[id];
+        continue;
+      }
+      c.id = c.id || id;
+      c.takeover = Boolean(
+        c.takeover || db.takeovers[id]?.isPaused
+      );
+      c.isPaused = c.takeover;
+    }
+
+    // Rebuild in-memory history
     customerHistory.clear();
 
     for (const message of db.messages) {
@@ -227,7 +264,9 @@ function loadStorage() {
 
     console.log(
       `[STORAGE] Restored ${db.messages.length} messages, ` +
-      `${db.orders.length} orders and ` +
+      `${db.orders.length} orders, ` +
+      `${Object.keys(db.customers).length} customers, ` +
+      `${Object.keys(db.takeovers).length} takeovers, ` +
       `${Object.keys(db.customerMemory).length} customer memories`
     );
   } catch (err) {
@@ -361,6 +400,27 @@ function updateCustomerMemory(senderId, customerText) {
 
   if (phoneMatch) {
     customer.phone = phoneMatch[0].replace(/[\s-]/g, '');
+  }
+
+  const addressMatch = text.match(
+    /(?:ঠিকানা|address|গ্রাম|বাসা|বাজার|রোড|road|village|house|জেলা|জিলা|district)[^\n।.!?]{2,120}/i
+  );
+
+  if (addressMatch) {
+    customer.address = addressMatch[0].trim();
+    addUniqueMemoryItem(
+      memory.facts,
+      `ঠিকানা: ${customer.address}`
+    );
+  }
+
+  const nameMatch = text.match(
+    /(?:আমার নাম|my name is|name)[:\s]+([\p{L}\s.]{2,40})/iu
+  );
+
+  if (nameMatch) {
+    customer.name = nameMatch[1].trim();
+    addUniqueMemoryItem(memory.facts, `নাম: ${customer.name}`);
   }
 
   const preferencePatterns = [
@@ -804,402 +864,61 @@ function getPriceClarificationReply() {
 // 10. MOTORCYCLE H4 / HS1 / 3-PIN LED HEADLIGHT COMPATIBILITY
 // =============================================================================
 
-// -----------------------------------------------------------------------------
-// 10.1 BUILT-IN BIKE DATABASE
-// -----------------------------------------------------------------------------
-// H4 এবং HS1 — দুটোই P43t/PX43t সকেট ব্যবহার করে, তাই দুটোতেই ৩-পিন LED
-// হেডলাইট সরাসরি plug-and-play হিসেবে বসে। ImpoTech শুধু LED হেডলাইট বিক্রি
-// করে, তাই স্টক বাল্ব H4 হোক বা HS1 — উভয় ক্ষেত্রেই আমাদের LED fit হবে।
-
 const BUILTIN_BIKE_DATABASE = [
-  // -------- YAMAHA --------
-  {
-    brand: 'Yamaha',
-    model: 'FZ',
-    aliases: ['fz', 'fz-s', 'fz s', 'fz16', 'fz 16', 'fz v2', 'fz v3', 'fz-s v2', 'fz-s v3', 'fzs'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'FZ25',
-    aliases: ['fz25', 'fz 25', 'fz-25'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'Fazer',
-    aliases: ['fazer', 'fz-s fazer', 'fazer 150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'R15',
-    aliases: ['r15', 'r 15', 'r15 v2', 'r15 v3', 'r15 v4', 'r15m'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'MT-15',
-    aliases: ['mt 15', 'mt-15', 'mt15'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'Saluto',
-    aliases: ['saluto', 'saluto 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Yamaha',
-    model: 'SZ-RR',
-    aliases: ['sz-rr', 'sz rr', 'szrr', 'sz-r'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
+  { brand: 'Yamaha', model: 'FZ', aliases: ['fz', 'fz-s', 'fz s', 'fz16', 'fz 16', 'fz v2', 'fz v3', 'fzs'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Yamaha', model: 'FZ25', aliases: ['fz25', 'fz 25', 'fz-25'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Yamaha', model: 'Fazer', aliases: ['fazer', 'fz-s fazer', 'fazer 150'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Yamaha', model: 'R15', aliases: ['r15', 'r 15', 'r15 v2', 'r15 v3', 'r15 v4', 'r15m'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Yamaha', model: 'MT-15', aliases: ['mt 15', 'mt-15', 'mt15'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Yamaha', model: 'Saluto', aliases: ['saluto', 'saluto 125'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Yamaha', model: 'SZ-RR', aliases: ['sz-rr', 'sz rr', 'szrr', 'sz-r'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
 
-  // -------- BAJAJ --------
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar 150',
-    aliases: ['pulsar 150', 'pulsar150', 'p150', 'pulsar 150 twin disc', 'pulsar 150 neon'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar 180',
-    aliases: ['pulsar 180', 'pulsar180', 'p180'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar 220',
-    aliases: ['pulsar 220', 'pulsar220', 'p220', 'pulsar 220f'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar NS200',
-    aliases: ['pulsar ns200', 'ns 200', 'ns200', 'pulsar 200ns', 'pulsar ns 200'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Pulsar RS200',
-    aliases: ['pulsar rs200', 'rs200', 'rs 200'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Avenger',
-    aliases: ['avenger', 'avenger 150', 'avenger 220', 'avenger street 150', 'avenger street 220', 'avenger cruise'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Discover',
-    aliases: ['discover', 'discover 125', 'discover 135', 'discover 150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Bajaj',
-    model: 'Platina',
-    aliases: ['platina', 'platina 100', 'platina 110'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
+  { brand: 'Bajaj', model: 'Pulsar 150', aliases: ['pulsar 150', 'pulsar150', 'p150', 'pulsar 150 twin disc', 'pulsar 150 neon'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Bajaj', model: 'Pulsar 180', aliases: ['pulsar 180', 'pulsar180', 'p180'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Bajaj', model: 'Pulsar 220', aliases: ['pulsar 220', 'pulsar220', 'p220', 'pulsar 220f'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Bajaj', model: 'Pulsar NS200', aliases: ['pulsar ns200', 'ns 200', 'ns200', 'pulsar 200ns', 'pulsar ns 200'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Bajaj', model: 'Pulsar RS200', aliases: ['pulsar rs200', 'rs200', 'rs 200'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Bajaj', model: 'Avenger', aliases: ['avenger', 'avenger 150', 'avenger 220', 'avenger street 150', 'avenger street 220', 'avenger cruise'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Bajaj', model: 'Discover', aliases: ['discover', 'discover 125', 'discover 135', 'discover 150'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Bajaj', model: 'Platina', aliases: ['platina', 'platina 100', 'platina 110'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
 
-  // -------- TVS --------
-  {
-    brand: 'TVS',
-    model: 'Apache RTR 160',
-    aliases: ['apache rtr 160', 'apache 160', 'rtr 160', 'rtr160', 'apache rtr160', 'apache rtr 160 2v', 'apache rtr 160 4v'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Apache RTR 180',
-    aliases: ['apache rtr 180', 'apache 180', 'rtr 180', 'rtr180'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Apache RTR 200',
-    aliases: ['apache rtr 200', 'apache 200', 'rtr 200', 'rtr200', 'apache rtr 200 4v'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Apache RR 310',
-    aliases: ['apache rr 310', 'rr 310', 'rr310'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Raider',
-    aliases: ['raider', 'raider 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'TVS',
-    model: 'Metro',
-    aliases: ['metro', 'tvs metro'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
+  { brand: 'TVS', model: 'Apache RTR 160', aliases: ['apache rtr 160', 'apache 160', 'rtr 160', 'rtr160', 'apache rtr160', 'apache rtr 160 2v', 'apache rtr 160 4v'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'TVS', model: 'Apache RTR 180', aliases: ['apache rtr 180', 'apache 180', 'rtr 180', 'rtr180'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'TVS', model: 'Apache RTR 200', aliases: ['apache rtr 200', 'apache 200', 'rtr 200', 'rtr200', 'apache rtr 200 4v'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'TVS', model: 'Apache RR 310', aliases: ['apache rr 310', 'rr 310', 'rr310'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'TVS', model: 'Raider', aliases: ['raider', 'raider 125'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'TVS', model: 'Metro', aliases: ['metro', 'tvs metro'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
 
-  // -------- HERO --------
-  {
-    brand: 'Hero',
-    model: 'Splendor',
-    aliases: ['splendor', 'splendor plus', 'splendor pro', 'splendor ismart', 'splendor+', 'splendor +'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Passion',
-    aliases: ['passion', 'passion pro', 'passion xpro', 'passion plus'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'HF Deluxe',
-    aliases: ['hf deluxe', 'hf-deluxe', 'hf'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Hunk',
-    aliases: ['hunk', 'hunk 150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Xtreme',
-    aliases: ['xtreme', 'xtreme 150', 'xtreme 160r', 'xtreme 200r', 'xtreme 200s'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Glamour',
-    aliases: ['glamour', 'glamour 125', 'glamour fi'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Hero',
-    model: 'Karizma',
-    aliases: ['karizma', 'karizma r', 'karizma zmar', 'karizma zmr'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
+  { brand: 'Hero', model: 'Splendor', aliases: ['splendor', 'splendor plus', 'splendor pro', 'splendor ismart', 'splendor+', 'splendor +'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Hero', model: 'Passion', aliases: ['passion', 'passion pro', 'passion xpro', 'passion plus'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Hero', model: 'HF Deluxe', aliases: ['hf deluxe', 'hf-deluxe', 'hf'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Hero', model: 'Hunk', aliases: ['hunk', 'hunk 150'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Hero', model: 'Xtreme', aliases: ['xtreme', 'xtreme 150', 'xtreme 160r', 'xtreme 200r', 'xtreme 200s'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Hero', model: 'Glamour', aliases: ['glamour', 'glamour 125', 'glamour fi'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Hero', model: 'Karizma', aliases: ['karizma', 'karizma r', 'karizma zmar', 'karizma zmr'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
 
-  // -------- HONDA --------
-  {
-    brand: 'Honda',
-    model: 'CB Shine',
-    aliases: ['cb shine', 'cbshine', 'shine', 'cb shine sp', 'shine sp'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'CB Unicorn',
-    aliases: ['cb unicorn', 'unicorn', 'unicorn 160', 'cb unicorn 160'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'Hornet',
-    aliases: ['hornet', 'hornet 160r', 'cb hornet', 'cb hornet 160r'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'CBR',
-    aliases: ['cbr', 'cbr 150', 'cbr 250', 'cbr150r', 'cbr250r'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'Livo',
-    aliases: ['livo', 'livo 110'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'Dream Yuga',
-    aliases: ['dream yuga', 'yuga'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Honda',
-    model: 'SP 125',
-    aliases: ['sp 125', 'sp125'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
+  { brand: 'Honda', model: 'CB Shine', aliases: ['cb shine', 'cbshine', 'shine', 'cb shine sp', 'shine sp'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Honda', model: 'CB Unicorn', aliases: ['cb unicorn', 'unicorn', 'unicorn 160', 'cb unicorn 160'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Honda', model: 'Hornet', aliases: ['hornet', 'hornet 160r', 'cb hornet', 'cb hornet 160r'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Honda', model: 'CBR', aliases: ['cbr', 'cbr 150', 'cbr 250', 'cbr150r', 'cbr250r'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Honda', model: 'Livo', aliases: ['livo', 'livo 110'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Honda', model: 'Dream Yuga', aliases: ['dream yuga', 'yuga'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Honda', model: 'SP 125', aliases: ['sp 125', 'sp125'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
 
-  // -------- SUZUKI --------
-  {
-    brand: 'Suzuki',
-    model: 'Gixxer',
-    aliases: ['gixxer', 'gixxer 150', 'gixxer 155', 'gixxer sf', 'gixxer sf 150', 'gixxer sf 250'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Suzuki',
-    model: 'GS150R',
-    aliases: ['gs150r', 'gs 150r', 'gs150'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Suzuki',
-    model: 'Access',
-    aliases: ['access', 'access 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Suzuki',
-    model: 'Burgman',
-    aliases: ['burgman', 'burgman street', 'burgman 125'],
-    stockBulbType: 'HS1',
-    socketType: 'PX43t',
-    ledPlugAndPlay: true
-  },
+  { brand: 'Suzuki', model: 'Gixxer', aliases: ['gixxer', 'gixxer 150', 'gixxer 155', 'gixxer sf', 'gixxer sf 150', 'gixxer sf 250'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Suzuki', model: 'GS150R', aliases: ['gs150r', 'gs 150r', 'gs150'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Suzuki', model: 'Access', aliases: ['access', 'access 125'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
+  { brand: 'Suzuki', model: 'Burgman', aliases: ['burgman', 'burgman street', 'burgman 125'], stockBulbType: 'HS1', socketType: 'PX43t', ledPlugAndPlay: true },
 
-  // -------- KTM --------
-  {
-    brand: 'KTM',
-    model: 'Duke 125',
-    aliases: ['duke 125', 'duke125'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'KTM',
-    model: 'Duke 200',
-    aliases: ['duke 200', 'duke200', 'duke 200 ng'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'KTM',
-    model: 'Duke 390',
-    aliases: ['duke 390', 'duke390'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'KTM',
-    model: 'RC 200',
-    aliases: ['rc 200', 'rc200'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
+  { brand: 'KTM', model: 'Duke 125', aliases: ['duke 125', 'duke125'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'KTM', model: 'Duke 200', aliases: ['duke 200', 'duke200', 'duke 200 ng'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'KTM', model: 'Duke 390', aliases: ['duke 390', 'duke390'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'KTM', model: 'RC 200', aliases: ['rc 200', 'rc200'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
 
-  // -------- ROYAL ENFIELD --------
-  {
-    brand: 'Royal Enfield',
-    model: 'Classic 350',
-    aliases: ['classic 350', 'classic350', 're classic'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Royal Enfield',
-    model: 'Bullet 350',
-    aliases: ['bullet 350', 'bullet350', 're bullet'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  },
-  {
-    brand: 'Royal Enfield',
-    model: 'Hunter 350',
-    aliases: ['hunter 350', 'hunter350'],
-    stockBulbType: 'H4',
-    socketType: 'P43t',
-    ledPlugAndPlay: true
-  }
+  { brand: 'Royal Enfield', model: 'Classic 350', aliases: ['classic 350', 'classic350', 're classic'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Royal Enfield', model: 'Bullet 350', aliases: ['bullet 350', 'bullet350', 're bullet'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true },
+  { brand: 'Royal Enfield', model: 'Hunter 350', aliases: ['hunter 350', 'hunter350'], stockBulbType: 'H4', socketType: 'P43t', ledPlugAndPlay: true }
 ];
-
-// -----------------------------------------------------------------------------
-// 10.2 H4-সামঞ্জস্যপূর্ণ ৩-পিন বাল্ব মডেল (কাস্টমার সরাসরি নাম বললে)
-// -----------------------------------------------------------------------------
 
 const H4_COMPATIBLE_THREE_PIN_MODELS = [
   { keys: ['h4', 'h 4', 'h-4'], name: 'H4', label: 'H4 (স্ট্যান্ডার্ড, ৬০/৫৫W)' },
@@ -1207,7 +926,6 @@ const H4_COMPATIBLE_THREE_PIN_MODELS = [
   { keys: ['hs1', 'hs 1', 'hs-1'], name: 'HS1', label: 'HS1 (মোটরসাইকেলের ৩৫/৩৫W সংস্করণ)' }
 ];
 
-// H4 সকেটে সরাসরি বসে না — আলাদা অ্যাডাপ্টার দরকার
 const NON_COMPATIBLE_BULB_MODELS = [
   { keys: ['h6m', 'h 6m', 'h6'], name: 'H6M' },
   { keys: ['h7', 'h 7', 'h-7'], name: 'H7' },
@@ -1216,10 +934,6 @@ const NON_COMPATIBLE_BULB_MODELS = [
   { keys: ['h1', 'h-1'], name: 'H1' },
   { keys: ['h3', 'h-3'], name: 'H3' }
 ];
-
-// -----------------------------------------------------------------------------
-// 10.3 DETECTION HELPERS
-// -----------------------------------------------------------------------------
 
 function isBikeCompatibilityQuestion(text = '') {
   const value = normalizeText(text);
@@ -1554,7 +1268,7 @@ function getProductMediaReply(query, senderId) {
 }
 
 // =============================================================================
-// 12. ORDER INTENT AND ORDER STORAGE
+// 12. ORDER INTENT, ADDRESS / PHONE DETECTION AND ORDER STORAGE
 // =============================================================================
 
 function isExplicitOrderIntent(text = '') {
@@ -1568,6 +1282,37 @@ function isExplicitOrderIntent(text = '') {
   ];
 
   return patterns.some(pattern => pattern.test(value));
+}
+
+function extractPhoneNumber(text = '') {
+  const match = String(text).match(
+    /(?:\+?8801|01)[0-9\s-]{8,14}/
+  );
+
+  if (!match) return null;
+
+  return match[0].replace(/[\s-]/g, '');
+}
+
+function extractAddressText(text = '') {
+  const patterns = [
+    /(?:ঠিকানা|address|গ্রাম|বাসা|বাজার|রোড|road|village|house|জেলা|জিলা|district)[^\n।.!?]{2,160}/i,
+    /(?:গাজীপুর|ঢাকা|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা|বরিশাল|রংপুর|ময়মনসিংহ)[^\n।.!?]{2,160}/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = String(text).match(pattern);
+    if (match) return match[0].trim();
+  }
+
+  return null;
+}
+
+function looksLikeOrderDetails(text = '') {
+  const hasPhone = Boolean(extractPhoneNumber(text));
+  const hasAddress = Boolean(extractAddressText(text));
+
+  return hasPhone || (hasPhone && hasAddress);
 }
 
 function identifyOrderedProduct(senderId, customerText) {
@@ -1610,12 +1355,16 @@ function createMessengerOrder(senderId, customerText, messageId) {
   const customer = db.customers[id] || {};
   const product = identifyOrderedProduct(id, customerText);
 
+  const phoneFromText = extractPhoneNumber(customerText);
+  const addressFromText = extractAddressText(customerText);
+
   const order = {
     id: 'order_' + crypto.randomUUID(),
     senderId: id,
     customerId: id,
     customerName: customer.name || `Customer ${id.slice(-4)}`,
-    customerPhone: customer.phone || null,
+    customerPhone: phoneFromText || customer.phone || null,
+    customerAddress: addressFromText || customer.address || null,
     productId: product?.id || null,
     productName: product?.name || null,
     productPrice: product?.price ?? null,
@@ -1639,6 +1388,9 @@ function createMessengerOrder(senderId, customerText, messageId) {
     };
   }
 
+  if (phoneFromText) db.customers[id].phone = phoneFromText;
+  if (addressFromText) db.customers[id].address = addressFromText;
+
   db.customers[id].lastOrderId = order.id;
   db.customers[id].lastOrderAt = order.createdAt;
 
@@ -1653,7 +1405,7 @@ function createMessengerOrder(senderId, customerText, messageId) {
 }
 
 // =============================================================================
-// 13. HUMAN TAKEOVER
+// 13. HUMAN TAKEOVER (NEVER AUTO-EXPIRES)
 // =============================================================================
 
 function getTakeoverState(customerId) {
@@ -1705,6 +1457,7 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   db.customers[id].isPaused = isEnabled;
   db.customers[id].takeover = isEnabled;
   db.customers[id].takeoverUpdatedAt = timestamp;
+  db.customers[id].takeoverReason = reasonStr || null;
 
   if (isEnabled) cancelFollowup(id);
 
@@ -1713,7 +1466,7 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   }
 
   console.log(
-    `[Takeover] ${id}: ${isEnabled ? 'PAUSED' : 'ACTIVE'}`
+    `[Takeover] ${id}: ${isEnabled ? 'PAUSED' : 'ACTIVE'} (persistent, no auto-expire)`
   );
 
   return isEnabled;
@@ -2169,6 +1922,7 @@ WhatsApp: ${WHATSAPP_NUMBER}
 ১৬. Takeover চালু থাকলে AI-এর উত্তর পাঠানো হবে না।
 ১৭. গ্রাহকের ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।
 ১৮. সংরক্ষিত মেমোরিতে তথ্য না থাকলে সেটি আছে বলে দাবি করবেন না।
+১৯. গ্রাহক যদি নাম, ফোন নম্বর বা ঠিকানা দেয় — সেটি মনে রাখুন এবং নিশ্চিত করুন।
 
 সংরক্ষিত গ্রাহক মেমোরি:
 ${memoryContext || 'কোনো মেমোরি নেই।'}
@@ -2185,7 +1939,7 @@ ${historyContext}
 }
 
 // =============================================================================
-// 18. OPENROUTER AI
+// 18. OPENROUTER AI  (Qwen3.8 Omni Flash — Text + Voice + Image)
 // =============================================================================
 
 async function callOpenRouter(messages, model = TEXT_MODEL) {
@@ -2208,7 +1962,7 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
         'HTTP-Referer': 'https://github.com/impotechaibot/Impotech-bot',
         'X-Title': 'ImpoTech Messenger AI Bot'
       },
-      timeout: 30000,
+      timeout: 45000,
       maxContentLength: MAX_ATTACHMENT_BYTES,
       maxBodyLength: MAX_ATTACHMENT_BYTES
     }
@@ -2232,6 +1986,31 @@ async function callOpenRouter(messages, model = TEXT_MODEL) {
   }
 
   return reply;
+}
+
+async function fetchAttachmentAsBase64(url, maxBytes = MAX_ATTACHMENT_BYTES) {
+  const response = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 20000,
+    maxContentLength: maxBytes
+  });
+
+  return {
+    base64: Buffer.from(response.data).toString('base64'),
+    contentType: response.headers['content-type'] || 'application/octet-stream'
+  };
+}
+
+function normalizeAudioFormat(contentType = '') {
+  const ct = String(contentType).toLowerCase();
+
+  if (ct.includes('wav')) return 'wav';
+  if (ct.includes('mp3') || ct.includes('mpeg')) return 'mp3';
+  if (ct.includes('ogg')) return 'ogg';
+  if (ct.includes('webm')) return 'webm';
+  if (ct.includes('m4a') || ct.includes('mp4') || ct.includes('aac')) return 'mp4';
+
+  return 'mp4';
 }
 
 async function generateAIResponse(
@@ -2266,23 +2045,18 @@ async function generateAIResponse(
     content: item.text
   }));
 
+  // -------- Audio (Voice) --------
   const audioAttachment = attachments.find(
     item => item.type === 'audio' && item.payload?.url
   );
 
   if (audioAttachment) {
     try {
-      const audioResponse = await axios.get(
-        audioAttachment.payload.url,
-        {
-          responseType: 'arraybuffer',
-          timeout: 15000,
-          maxContentLength: MAX_ATTACHMENT_BYTES
-        }
+      const { base64, contentType } = await fetchAttachmentAsBase64(
+        audioAttachment.payload.url
       );
 
-      const audioBase64 =
-        Buffer.from(audioResponse.data).toString('base64');
+      const format = normalizeAudioFormat(contentType);
 
       const reply = await callOpenRouter([
         { role: 'system', content: systemPrompt },
@@ -2292,13 +2066,13 @@ async function generateAIResponse(
           content: [
             {
               type: 'text',
-              text: 'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
+              text: 'গ্রাহকের ভয়েস মেসেজটি মনোযোগ দিয়ে শুনে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন।'
             },
             {
               type: 'input_audio',
               input_audio: {
-                data: audioBase64,
-                format: 'mp4'
+                data: base64,
+                format
               }
             }
           ]
@@ -2311,26 +2085,16 @@ async function generateAIResponse(
     }
   }
 
+  // -------- Image --------
   const imageAttachment = attachments.find(
     item => item.type === 'image' && item.payload?.url
   );
 
   if (imageAttachment) {
     try {
-      const imageResponse = await axios.get(
-        imageAttachment.payload.url,
-        {
-          responseType: 'arraybuffer',
-          timeout: 15000,
-          maxContentLength: MAX_ATTACHMENT_BYTES
-        }
+      const { base64, contentType } = await fetchAttachmentAsBase64(
+        imageAttachment.payload.url
       );
-
-      const imageBase64 =
-        Buffer.from(imageResponse.data).toString('base64');
-
-      const contentType =
-        imageResponse.headers['content-type'] || 'image/jpeg';
 
       const reply = await callOpenRouter([
         { role: 'system', content: systemPrompt },
@@ -2347,12 +2111,12 @@ async function generateAIResponse(
             {
               type: 'image_url',
               image_url: {
-                url: `data:${contentType};base64,${imageBase64}`
+                url: `data:${contentType};base64,${base64}`
               }
             }
           ]
         }
-      ], TEXT_MODEL);
+      ], VISION_MODEL);
 
       return limitToFiveLines(reply);
     } catch (err) {
@@ -2360,6 +2124,7 @@ async function generateAIResponse(
     }
   }
 
+  // -------- Plain Text --------
   const reply = await callOpenRouter([
     { role: 'system', content: systemPrompt },
     ...priorMessages,
@@ -2382,7 +2147,53 @@ function isCriticalHandoverQuestion(text = '') {
 }
 
 // =============================================================================
-// 20. CUSTOMER MESSAGE PROCESSING
+// 20. FACEBOOK CALL EVENT HANDLER
+// =============================================================================
+
+async function handleCallEvent(event) {
+  const senderId = String(event.sender?.id || '').trim();
+  if (!senderId) return;
+
+  const callData = event.call || {};
+  const timestamp = new Date().toISOString();
+
+  db.callEvents.push({
+    id: 'call_' + crypto.randomUUID(),
+    senderId,
+    callId: callData.call_id || null,
+    event: callData.event || 'unknown',
+    timestamp
+  });
+
+  if (db.callEvents.length > 2000) {
+    db.callEvents.splice(0, db.callEvents.length - 2000);
+  }
+
+  // Auto human takeover whenever customer calls
+  if (getTakeoverState(senderId)) {
+    saveStorage();
+    console.log(`[CALL] ${senderId} already in takeover; call logged`);
+    return;
+  }
+
+  await setTakeoverState(
+    senderId,
+    true,
+    `Auto takeover: customer initiated a call (${callData.event || 'call'})`
+  );
+
+  cancelFollowup(senderId);
+
+  saveStorage();
+
+  console.log(
+    `[CALL] ${senderId} called (${callData.event || 'call'}). ` +
+    'Human takeover enabled automatically; AI will not reply.'
+  );
+}
+
+// =============================================================================
+// 21. CUSTOMER MESSAGE PROCESSING
 // =============================================================================
 
 async function processCustomerMessage(
@@ -2399,7 +2210,7 @@ async function processCustomerMessage(
   const customerText = String(text || '').trim();
 
   try {
-    // 1. ORDER INTENT
+    // 1. ORDER INTENT (explicit) — auto human takeover
     if (isExplicitOrderIntent(customerText)) {
       const result = createMessengerOrder(
         senderId,
@@ -2407,26 +2218,22 @@ async function processCustomerMessage(
         messageId
       );
 
-      if (!result.created) {
-        await setTakeoverState(
-          senderId,
-          true,
-          `Order already exists: ${result.order.id}`
-        );
-        return;
-      }
-
-      const order = result.order;
-
       await setTakeoverState(
         senderId,
         true,
-        `Automatic takeover after order ${order.id}`
+        result.created
+          ? `Auto takeover after order ${result.order.id}`
+          : `Order already exists: ${result.order.id}`
       );
+
+      if (!result.created) return;
+
+      const order = result.order;
 
       console.log(
         `[ORDER] ${order.id} created for ${senderId}; ` +
-        `product=${order.productName || 'not identified'}`
+        `product=${order.productName || 'not identified'}; ` +
+        `phone=${order.customerPhone || 'n/a'}`
       );
 
       const sent = await sendFacebookMessage(
@@ -2438,6 +2245,33 @@ async function processCustomerMessage(
         console.error(
           `[ORDER] ${order.id} saved, but confirmation could not be sent`
         );
+      }
+
+      return;
+    }
+
+    // 1ক. PHONE / ADDRESS দেওয়া মানেই অর্ডার — auto human takeover
+    if (looksLikeOrderDetails(customerText)) {
+      const result = createMessengerOrder(
+        senderId,
+        customerText,
+        messageId
+      );
+
+      await setTakeoverState(
+        senderId,
+        true,
+        result.created
+          ? `Auto takeover: customer shared phone/address (order ${result.order.id})`
+          : `Auto takeover: customer order details received`
+      );
+
+      if (result.created) {
+        console.log(
+          `[ORDER] ${result.order.id} created from phone/address for ${senderId}`
+        );
+
+        await sendFacebookMessage(senderId, ORDER_CONFIRMATION);
       }
 
       return;
@@ -2627,7 +2461,7 @@ async function processCustomerMessage(
 }
 
 // =============================================================================
-// 21. FACEBOOK WEBHOOK
+// 22. FACEBOOK WEBHOOK
 // =============================================================================
 
 app.get('/webhook', (req, res) => {
@@ -2654,6 +2488,19 @@ app.post('/webhook', async (req, res) => {
     if (body.object !== 'page') return;
 
     for (const entry of body.entry || []) {
+      // -------- CALL EVENTS (audio/video call from Messenger) --------
+      for (const callEvent of entry.call || []) {
+        try {
+          await handleCallEvent({
+            sender: { id: callEvent.from },
+            call: callEvent
+          });
+        } catch (err) {
+          console.error('[CALL] Handler error:', err.message);
+        }
+      }
+
+      // -------- MESSAGING EVENTS --------
       for (const event of entry.messaging || []) {
         const senderId = event.sender?.id;
         const message = event.message;
@@ -2771,7 +2618,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // =============================================================================
-// 22. CATALOG ADMIN API
+// 23. CATALOG ADMIN API
 // =============================================================================
 
 app.get('/api/catalog', (req, res) => {
@@ -2873,7 +2720,7 @@ app.post('/api/catalog/refresh', async (req, res) => {
 });
 
 // =============================================================================
-// 23. BOT STATUS AND TAKEOVER APIs
+// 24. BOT STATUS AND TAKEOVER APIs
 // =============================================================================
 
 app.get('/api/bot-status', (req, res) => {
@@ -2923,7 +2770,7 @@ app.post('/api/customers/:senderId/takeover', async (req, res) => {
     isPaused,
     takeover: isPaused,
     message: isPaused
-      ? 'Human takeover enabled. AI remains paused until an admin resumes it.'
+      ? 'Human takeover enabled. It stays until an admin disables it.'
       : 'AI resumed for this customer.'
   });
 });
@@ -2977,26 +2824,31 @@ app.post('/api/customers/:senderId/takeover/disable', async (req, res) => {
 });
 
 // =============================================================================
-// 24. CUSTOMERS, MESSAGES, MEMORY AND ORDERS APIs
+// 25. CUSTOMERS, MESSAGES, MEMORY AND ORDERS APIs
 // =============================================================================
 
 app.get('/api/customers', (req, res) => {
-  const list = Object.values(db.customers).map(customer => ({
-    senderId: customer.id,
-    displayName:
-      customer.name || `Customer ${String(customer.id).slice(-4)}`,
-    phone: customer.phone || null,
-    lastMessageText: customer.lastMessageText || null,
-    lastMessageAt: customer.lastActive || null,
-    messageCount: customer.messageCount || 0,
-    lastOrderId: customer.lastOrderId || null,
-    lastOrderAt: customer.lastOrderAt || null,
-    takeover: getTakeoverState(customer.id),
-    isPaused: getTakeoverState(customer.id),
-    takeoverReason: db.takeovers[customer.id]?.reason || null,
-    takeoverUpdatedAt: db.takeovers[customer.id]?.timestamp || null,
-    memoryUpdatedAt: customer.lastMemoryUpdatedAt || null
-  }));
+  const list = Object.values(db.customers).map(customer => {
+    const takeoverState = db.takeovers[customer.id] || {};
+
+    return {
+      senderId: customer.id,
+      displayName:
+        customer.name || `Customer ${String(customer.id).slice(-4)}`,
+      phone: customer.phone || null,
+      address: customer.address || null,
+      lastMessageText: customer.lastMessageText || null,
+      lastMessageAt: customer.lastActive || null,
+      messageCount: customer.messageCount || 0,
+      lastOrderId: customer.lastOrderId || null,
+      lastOrderAt: customer.lastOrderAt || null,
+      takeover: getTakeoverState(customer.id),
+      isPaused: getTakeoverState(customer.id),
+      takeoverReason: takeoverState.reason || null,
+      takeoverUpdatedAt: takeoverState.timestamp || null,
+      memoryUpdatedAt: customer.lastMemoryUpdatedAt || null
+    };
+  });
 
   res.json({
     success: true,
@@ -3277,7 +3129,7 @@ app.post('/api/customers/:senderId/send', async (req, res) => {
 });
 
 // =============================================================================
-// 25. HEALTH, STATUS AND MEDIA DIAGNOSTICS
+// 26. HEALTH, STATUS AND MEDIA DIAGNOSTICS
 // =============================================================================
 
 app.get('/health', (req, res) => {
@@ -3315,6 +3167,10 @@ app.get('/api/status', (req, res) => {
     customerMemories: Object.keys(db.customerMemory).length,
     pendingFollowups: Object.values(db.scheduledFollowups)
       .filter(task => task && task.status === 'PENDING').length,
+    totalTakeovers: Object.keys(db.takeovers).length,
+    activeTakeovers: Object.values(db.takeovers)
+      .filter(item => item && item.isPaused).length,
+    callEvents: db.callEvents.length,
     timestamp: new Date().toISOString()
   });
 });
@@ -3332,7 +3188,7 @@ app.get('/api/catalog/media-status', (req, res) => {
 });
 
 // =============================================================================
-// 26. START SERVER
+// 27. START SERVER
 // =============================================================================
 
 async function startServer() {
@@ -3352,6 +3208,10 @@ async function startServer() {
     console.log(`[CONTACT] WhatsApp: ${WHATSAPP_NUMBER}`);
     console.log(`[MEMORY] Last ${HISTORY_LIMIT} messages + persistent customer memory`);
     console.log('[FOLLOWUP] Scheduled follow-up enabled');
+    console.log('[TAKEOVER] Persistent — no auto-expire (admin must disable)');
+    console.log('[CALL] Auto Human Takeover on customer call');
+    console.log('[ORDER] Auto Human Takeover on order/phone/address');
+    console.log('[AI] Qwen3.8 Omni Flash — text + voice + image');
 
     if (catalogMeta.lastSyncError) {
       console.warn('[CATALOG] GitHub warning: ' + catalogMeta.lastSyncError);
@@ -3371,7 +3231,7 @@ startServer().catch(err => {
 });
 
 // =============================================================================
-// 27. CLEANUP AND PERIODIC FOLLOW-UP VALIDATION
+// 28. CLEANUP AND PERIODIC FOLLOW-UP VALIDATION
 // =============================================================================
 
 setInterval(() => {
@@ -3395,4 +3255,47 @@ setInterval(() => {
       armFollowupTimer(senderId);
     }
   }
+
+  // Ensure takeover state is never silently dropped
+  for (const [id, entry] of Object.entries(db.takeovers)) {
+    if (!entry || entry.isPaused !== true) continue;
+
+    if (!db.customers[id]) {
+      db.customers[id] = {
+        id,
+        name: `Customer ${id.slice(-4)}`,
+        messageCount: 0,
+        takeover: true,
+        isPaused: true
+      };
+    } else {
+      db.customers[id].takeover = true;
+      db.customers[id].isPaused = true;
+    }
+  }
 }, FOLLOWUP_CHECK_INTERVAL_MS).unref();
+
+setInterval(() => {
+  saveStorage();
+}, 5 * 60 * 1000).unref();
+
+// =============================================================================
+// 29. ENV VARIABLES
+// =============================================================================
+
+/**
+ * PORT=10000
+ * PAGE_ACCESS_TOKEN=xxxxxxxx
+ * VERIFY_TOKEN=xxxxxxxx
+ * OPENROUTER_API_KEY=sk-or-v1-xxxxxxxx
+ * TEXT_MODEL=qwen/qwen3.8-omni-flash
+ * VOICE_MODEL=qwen/qwen3.8-omni-flash
+ * VISION_MODEL=qwen/qwen3.8-omni-flash
+ * GITHUB_TOKEN=ghp_xxxxxxxx
+ * GITHUB_REPO=impotechaibot/Impotech-bot
+ * GITHUB_BRANCH=main
+ * CATALOG_FILE=data/catalog.json
+ * ADMIN_SECRET=your-secret
+ * REQUIRE_ADMIN_SECRET=true
+ * GRAPH_API_VERSION=v18.0
+ */
