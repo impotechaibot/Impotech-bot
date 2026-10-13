@@ -1630,145 +1630,252 @@ app.put('/api/catalog', (req, res) => {
   }
 });
 
+// =============================================================================
+// SECTION 14: HUMAN TAKEOVER + GLOBAL BOT CONTROL API
+// =============================================================================
+
+// Get takeover and bot status
+app.get('/api/takeover', (req, res) => {
+  try {
+    const senderId = String(req.query.senderId || '').trim();
+
+    if (senderId) {
+      return res.json({
+        success: true,
+        senderId,
+        takeover: isTakeover(senderId),
+        customerTakeover: Boolean(
+          db.takeovers?.[senderId] ||
+          db.customers?.[senderId]?.takeover
+        ),
+        globalPaused: Boolean(db.isGlobalPaused)
+      });
+    }
+
+    return res.json({
+      success: true,
+      globalPaused: Boolean(db.isGlobalPaused),
+      takeovers: db.takeovers || {},
+      customers: Object.entries(db.customers || {}).map(
+        ([id, customer]) => ({
+          senderId: id,
+          takeover: Boolean(customer?.takeover),
+          takeoverReason: customer?.takeoverReason || '',
+          takeoverUpdatedAt: customer?.takeoverUpdatedAt || null
+        })
+      )
+    });
+  } catch (error) {
+    console.error('[API] GET /api/takeover error:', error);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to load takeover status.'
+    });
+  }
+});
 
 
- // ============================================================
- // 14. ADMIN TAKEOVER / BOT CONTROL
- // Backward-compatible routes for old and new Admin Apps
- // ============================================================
+// Enable or disable takeover for a specific customer
+app.post('/api/takeover', (req, res) => {
+  try {
+    const body = req.body || {};
 
- // Shared status response
- function getTakeoverStatus(senderId = '') {
-   if (senderId) {
-     const customer = db.customers[senderId] || {};
-     return {
-       success: true,
-       senderId,
-       customerId: senderId,
-       enabled: isTakeover(senderId),
-       takeover: isTakeover(senderId),
-       globalPaused: db.isGlobalPaused,
-       reason: customer.takeoverReason || ''
-     };
-   }
+    const senderId = String(
+      body.senderId ||
+      body.customerId ||
+      body.psid ||
+      ''
+    ).trim();
 
-   return {
-     success: true,
-     globalPaused: db.isGlobalPaused,
-     takeovers: db.takeovers,
-     customers: Object.values(db.customers).map(c => ({
-       id: c.id,
-       senderId: c.id,
-       customerId: c.id,
-       name: c.name || '',
-       phone: c.phone || '',
-       address: c.address || '',
-       takeover: isTakeover(c.id),
-       enabled: isTakeover(c.id),
-       takeoverReason: c.takeoverReason || ''
-     }))
-   };
- }
+    const enabled =
+      typeof body.enabled === 'boolean'
+        ? body.enabled
+        : typeof body.takeover === 'boolean'
+          ? body.takeover
+          : typeof body.active === 'boolean'
+            ? body.active
+            : null;
 
- // Current API: GET /api/takeover
- app.get('/api/takeover', (req, res) => {
-   res.json(getTakeoverStatus());
- });
+    const reason = String(
+      body.reason || 'Admin toggle'
+    ).trim();
 
- // Legacy API: GET /api/takeover/status?customerId=...
- app.get('/api/takeover/status', (req, res) => {
-   const senderId = String(
-     req.query.customerId ||
-     req.query.senderId ||
-     req.query.sender_id ||
-     ''
-   );
+    if (!senderId) {
+      return res.status(400).json({
+        success: false,
+        error: 'senderId is required for customer takeover.'
+      });
+    }
 
-   res.json(getTakeoverStatus(senderId));
- });
+    if (enabled === null) {
+      return res.status(400).json({
+        success: false,
+        error: 'enabled must be true or false.'
+      });
+    }
 
- // Current + legacy API: POST /api/takeover
- app.post('/api/takeover', (req, res) => {
-   const body = req.body || {};
+    setTakeover(senderId, enabled, reason);
+    saveDB();
 
-   const senderId = String(
-     body.senderId ||
-     body.customerId ||
-     body.customer_id ||
-     body.sender_id ||
-     ''
-   );
+    return res.json({
+      success: true,
+      senderId,
+      enabled,
+      takeover: enabled,
+      globalPaused: Boolean(db.isGlobalPaused),
+      message: enabled
+        ? 'Customer takeover enabled. AI replies are paused for this customer.'
+        : 'Customer takeover disabled for this customer.'
+    });
+  } catch (error) {
+    console.error('[API] POST /api/takeover error:', error);
 
-   const enabled = body.enabled;
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to update customer takeover.'
+    });
+  }
+});
 
-   if (!senderId || typeof enabled !== 'boolean') {
-     return res.status(400).json({
-       success: false,
-       error: 'senderId/customerId and boolean enabled are required.'
-     });
-   }
 
-   setTakeover(
-     senderId,
-     enabled,
-     body.reason || 'Admin toggle'
-   );
+// Pause AI globally
+app.post('/api/bot/pause', (req, res) => {
+  try {
+    db.isGlobalPaused = true;
+    saveDB();
 
-   return res.json({
-     success: true,
-     senderId,
-     customerId: senderId,
-     enabled,
-     takeover: enabled,
-     globalPaused: db.isGlobalPaused
-   });
- });
+    return res.json({
+      success: true,
+      globalPaused: true,
+      enabled: false,
+      paused: true,
+      message: 'Bot paused successfully.'
+    });
+  } catch (error) {
+    console.error('[API] POST /api/bot/pause error:', error);
 
- // Legacy alias: POST /api/customers/:senderId/takeover
- app.post('/api/customers/:senderId/takeover', (req, res) => {
-   const senderId = req.params.senderId;
-   const enabled = req.body?.enabled;
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to pause bot.'
+    });
+  }
+});
 
-   if (typeof enabled !== 'boolean') {
-     return res.status(400).json({
-       success: false,
-       error: 'Boolean enabled is required.'
-     });
-   }
 
-   setTakeover(senderId, enabled, 'Admin toggle');
+// Resume AI globally
+app.post('/api/bot/resume', (req, res) => {
+  try {
+    db.isGlobalPaused = false;
+    saveDB();
 
-   return res.json({
-     success: true,
-     senderId,
-     customerId: senderId,
-     enabled,
-     takeover: enabled
-   });
- });
+    return res.json({
+      success: true,
+      globalPaused: false,
+      enabled: true,
+      paused: false,
+      message: 'Bot resumed successfully.'
+    });
+  } catch (error) {
+    console.error('[API] POST /api/bot/resume error:', error);
 
- // Global bot pause
- app.post('/api/bot/pause', (req, res) => {
-   db.isGlobalPaused = true;
-   saveDB();
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to resume bot.'
+    });
+  }
+});
 
-   return res.json({
-     success: true,
-     globalPaused: true
-   });
- });
 
- // Global bot resume
- app.post('/api/bot/resume', (req, res) => {
-   db.isGlobalPaused = false;
-   saveDB();
+// Android Admin App compatibility route
+// Supports POST /api/toggle-bot
+//
+// Supported examples:
+// { "enabled": true }
+// { "enabled": false }
+// { "paused": true }
+// { "paused": false }
+// { "isEnabled": true }
+// { "isPaused": true }
+// { "action": "pause" }
+// { "action": "resume" }
+app.post('/api/toggle-bot', (req, res) => {
+  try {
+    const body = req.body || {};
 
-   return res.json({
-     success: true,
-     globalPaused: false
-   });
- });
+    let paused = null;
 
+    if (typeof body.paused === 'boolean') {
+      paused = body.paused;
+    } else if (typeof body.isPaused === 'boolean') {
+      paused = body.isPaused;
+    } else if (typeof body.enabled === 'boolean') {
+      paused = !body.enabled;
+    } else if (typeof body.isEnabled === 'boolean') {
+      paused = !body.isEnabled;
+    } else {
+      const action = String(body.action || '')
+        .trim()
+        .toLowerCase();
+
+      if (['pause', 'stop', 'off', 'disable'].includes(action)) {
+        paused = true;
+      } else if (
+        ['resume', 'start', 'on', 'enable'].includes(action)
+      ) {
+        paused = false;
+      }
+    }
+
+    if (paused === null) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported toggle request. Send enabled, paused, isEnabled, isPaused, or action.',
+        receivedFields: Object.keys(body)
+      });
+    }
+
+    db.isGlobalPaused = paused;
+    saveDB();
+
+    return res.json({
+      success: true,
+      globalPaused: Boolean(db.isGlobalPaused),
+      paused: Boolean(db.isGlobalPaused),
+      enabled: !db.isGlobalPaused,
+      message: db.isGlobalPaused
+        ? 'Bot paused successfully.'
+        : 'Bot resumed successfully.'
+    });
+  } catch (error) {
+    console.error('[API] POST /api/toggle-bot error:', error);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to toggle bot.'
+    });
+  }
+});
+
+
+// Read current global bot status
+app.get('/api/bot/status', (req, res) => {
+  try {
+    return res.json({
+      success: true,
+      globalPaused: Boolean(db.isGlobalPaused),
+      enabled: !db.isGlobalPaused,
+      paused: Boolean(db.isGlobalPaused)
+    });
+  } catch (error) {
+    console.error('[API] GET /api/bot/status error:', error);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to read bot status.'
+    });
+  }
+});
 // ============================================================
 // 15. ADMIN CUSTOMERS / MESSAGES / MEMORY / ORDERS
 // ============================================================
