@@ -2,11 +2,11 @@
 
 /**
  * ImpoTech AI Messenger Bot & Admin Backend
- * AI: OpenRouter Gemini 3.1 Flash-Lite
+ * AI: OpenRouter Gemini 2.5 Flash-Lite (text, vision, and audio; voice notes normalized to WAV/MP3-compatible input)
  * Storage: PostgreSQL (DATABASE_URL / POSTGRES_URL)
  * Catalog: GitHub catalog.json + local cache
  * Search: Linkup Search API (LINKUP_API_KEY)
- * Memory: last 20 messages + customer facts/preferences (20-day retention)
+ * Memory: last 60 messages + durable customer/product context (20-day memory retention)
  * Human handover: automatic for completed contact details, orders, and call events; consent for unclear-question handover
  */
 
@@ -15,6 +15,10 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 const { Pool } = require('pg');
 
 const app = express();
@@ -47,8 +51,10 @@ const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
 const REQUIRE_ADMIN_SECRET = process.env.REQUIRE_ADMIN_SECRET !== 'false';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const LINKUP_URL = 'https://api.linkup.so/v1/search';
-const TEXT_MODEL = process.env.TEXT_MODEL || 'google/gemini-3.1-flash-lite';
+const TEXT_MODEL = process.env.TEXT_MODEL || 'google/gemini-2.5-flash-lite';
+// Keep text, image vision, and audio understanding on one multimodal model by default.
 const VOICE_MODEL = process.env.VOICE_MODEL || TEXT_MODEL;
+const AUDIO_CONVERT_TIMEOUT_MS = Number(process.env.AUDIO_CONVERT_TIMEOUT_MS) || 20000;
 const HELPLINE = process.env.HELPLINE || '+8809611042598';
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '01884332067';
 const MAX_PRODUCTS_TO_AI = 5;
@@ -57,7 +63,7 @@ const MAX_OUTPUT_TOKENS = 500;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
 const MAX_AI_LINES = 5;
-const HISTORY_LIMIT = 20;
+const HISTORY_LIMIT = 60;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const MEMORY_RETENTION_DAYS = 20;
 const MEMORY_RETENTION_MS = MEMORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -69,6 +75,7 @@ const LEGACY_DATA_FILE = path.join(__dirname, 'storage_data.json');
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 const ORDER_CONFIRMATION = 'আপনার অর্ডারের তথ্য সংরক্ষণ করা হয়েছে। আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করে অর্ডারটি নিশ্চিত করবেন।';
 const FOLLOWUP_MESSAGE = 'আপনি কি পণ্যটি সম্পর্কে আরও কিছু জানতে চান? কোনো প্রশ্ন থাকলে জানাবেন, আমরা সাহায্য করতে প্রস্তুত।';
+const FIRST_CONTACT_INTRO = 'আসসালামু আলাইকুম! 👋 ImpoTech-এ স্বাগতম।\n\nআমি ImpoTech-এর AI চ্যাটবট। আপনার প্রশ্নের উত্তর ও প্রয়োজনীয় সহায়তা দিতে প্রস্তুত।\n\nআরও সহায়তার জন্য আমাদের প্রতিনিধির সঙ্গে যোগাযোগ করুন:\n\n📞 হেল্পলাইন: '+HELPLINE+'\n📱 WhatsApp: '+WHATSAPP_NUMBER+'\n\nআপনাকে সাহায্য করতে পেরে আমরা আনন্দিত! 💙';
 
 if (!DATABASE_URL) {
   console.warn('[DB] DATABASE_URL/POSTGRES_URL is missing. PostgreSQL persistence is unavailable; server will use in-memory state only. Configure DATABASE_URL for durable storage.');
@@ -254,7 +261,12 @@ function updateCustomerMemory(senderId, customerText) {
   if (!senderId || !text || text.length > 1000) return;
   const id = String(senderId), memory = getCustomerMemory(id), customer = db.customers[id] || {};
   const matches = products.map(product => ({ product, score: productScore(text, product) })).filter(x => x.score > 0).sort((a,b) => b.score-a.score);
-  if (matches.length && (matches.length === 1 || matches[0].score > matches[1].score)) addUniqueMemoryItem(memory.facts, `আলোচিত পণ্য: ${matches[0].product.name} (ID: ${matches[0].product.id})`);
+  if (matches.length && (matches.length === 1 || matches[0].score > matches[1].score)) {
+    const chosen = matches[0].product;
+    memory.activeProductId = String(chosen.id);
+    memory.activeProductName = String(chosen.name || '');
+    addUniqueMemoryItem(memory.facts, `আলোচিত পণ্য: ${chosen.name} (ID: ${chosen.id})`);
+  }
   const phone = text.match(/(?:\+?8801|01)[0-9\s-]{8,14}/);
   if (phone) customer.phone = phone[0].replace(/[\s-]/g, '');
   const vehicle = text.match(/(?:আমার|my)\s*(?:বাইক|মোটরসাইকেল|গাড়ি|bike|motorcycle|car)[^।.!?\n]{0,120}/i);
@@ -270,7 +282,8 @@ function updateCustomerMemory(senderId, customerText) {
 function buildCustomerMemoryContext(senderId) {
   const m = getCustomerMemory(senderId);
   if (!m) return 'কোনো সংরক্ষিত মেমোরি নেই।';
-  return [m.facts.length ? `তথ্য:\n- ${m.facts.slice(-15).join('\n- ')}` : '', m.preferences.length ? `পছন্দ/প্রসঙ্গ:\n- ${m.preferences.slice(-10).join('\n- ')}` : '', m.summary ? `সারাংশ:\n${m.summary}` : ''].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত মেমোরি নেই।';
+  const active = m.activeProductId ? `বর্তমান আলোচ্য পণ্য: ${m.activeProductName || 'নাম নেই'} (Product ID: ${m.activeProductId}) — গ্রাহক নিজে অন্য পণ্য না বললে এই পণ্যেই থাকুন।` : '';
+  return [active, m.facts.length ? `তথ্য:\n- ${m.facts.slice(-20).join('\n- ')}` : '', m.preferences.length ? `পছন্দ/প্রসঙ্গ:\n- ${m.preferences.slice(-15).join('\n- ')}` : '', m.summary ? `সারাংশ:\n${m.summary}` : ''].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত মেমোরি নেই।';
 }
 function pruneOldMemory() {
   const cutoff = Date.now() - MEMORY_RETENTION_MS;
@@ -343,8 +356,12 @@ function findExactProduct(query) {
   return matches.length === 1 ? matches[0] : null;
 }
 function findProductFromRecentContext(senderId) {
+  // Keep the last explicitly discussed product as the active product until the customer names another.
   const history = getHistory(senderId);
-  for (let i = history.length - 1; i >= 0; i--) { if (history[i].role !== 'user') continue; const p = findExactProduct(history[i].text); if (p) return p; }
+  for (let i = history.length - 1; i >= 0; i--) {
+    const p = findExactProduct(history[i].text);
+    if (p) return p;
+  }
   const memory = getCustomerMemory(senderId);
   for (const fact of [...(memory?.facts || [])].reverse()) { const p = findExactProduct(fact); if (p) return p; }
   return null;
@@ -379,10 +396,13 @@ function getProductMediaUrls(p, type) { const media = p?.media; return media && 
 function getMediaType(text='') { const v=normalizeText(text); if (/ভিডিও|video|রিল|reel|clip/.test(v)) return 'videos'; if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture/.test(v)) return 'images'; return null; }
 function getProductMediaReply(text, senderId) {
   const type = getMediaType(text); if (!type) return null;
-  const p = findExactProduct(text) || findRelevantProducts(text)[0] || findProductFromRecentContext(senderId);
-  if (!p) return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যের নাম বা মডেলটি বলুন।';
-  const urls = getProductMediaUrls(p, type); if (!urls.length) return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`;
-  return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক:\n${urls.map((u,i)=>`${i+1}. ${u}`).join('\n')}`;
+  // Never use fuzzy first-match for media: that can send another product's image/video.
+  const explicitlyNamed = findExactProduct(text);
+  const p = explicitlyNamed || findProductFromRecentContext(senderId);
+  if (!p) return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যের সঠিক নাম বা প্রোডাক্ট ID বলুন।';
+  const urls = getProductMediaUrls(p, type);
+  if (!urls.length) return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} এই প্রোডাক্ট ID-এর ক্যাটালগে পাওয়া যাচ্ছে না।`;
+  return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'}:\n${urls.map((u,i)=>`${i+1}. ${u}`).join('\n')}`;
 }
 
 // -----------------------------------------------------------------------------
@@ -412,7 +432,7 @@ const BUILTIN_BIKE_DATABASE = [
   {brand:'Hero',model:'HF Deluxe',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hf deluxe','hfdeluxe','hero hf deluxe']},
   {brand:'Hero',model:'Glamour',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hero glamour','glamour 125']},
   {brand:'Honda',model:'CB Shine',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['cb shine','cbshine','shine']},
-  {brand:'Honda',model:'Dream 110',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['dream 110','dream neo','honda dream']},
+  {brand:'Honda',model:'Dream Neo',vehicleType:'motorcycle',fitment:'H4/3-pin fitment reported for this model; treat as compatible with the H4/3-pin LED',aliases:['dream neo','honda dream neo','dream 110','honda dream']},
   {brand:'Honda',model:'Unicorn',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['honda unicorn','unicorn 150','unicorn 160']},
   {brand:'Honda',model:'Grom',vehicleType:'motorcycle',fitment:'H4/HS1-base options exist in some market variants; verify exact model',aliases:['honda grom','grom 125','msx125','msx 125']},
   {brand:'Suzuki',model:'Gixxer',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['gixxer','gixxer 150','gixxer sf']},
@@ -449,15 +469,17 @@ function identifyBikeModel(text='') {
   return null;
 }
 function isH4Confirmed(text='') { return /\bh\s*-?\s*4\b|\bhs\s*-?\s*1\b|\b9003\b|\bhb2\b|৩\s*পিন|তিন\s*পিন|3\s*-?\s*pin/i.test(text); }
-function bikeClarification() { return 'হ্যাঁ—আপনার 60W LED প্রজেকশন হেডলাইটটি H4/3-pin সকেট, নির্ধারিত ভোল্টেজ এবং যানবাহনের বৈদ্যুতিক সিস্টেমের সঙ্গে মিলে গেলে ব্যবহার করা যেতে পারে। মডেল/বছর বা পুরোনো সকেটের ছবি দিলে বাইক, কার, CNG, ভ্যান বা ট্রাক—যে যানই হোক—ফিটমেন্ট মিলিয়ে বলব। শুধু H4-এর মতো দেখতে হলেই সব সকেটে সরাসরি লাগবে ধরে নেওয়া যাবে না।'; }
+function isAcDcQuestion(text='') { return /\b(?:ac|dc)\b|এসি|ডিসি|এসি না ডিসি|ac নাকি dc|কনভার্ট|conversion|convert/i.test(text); }
+function hasConfirmedModelFitment(text='') { const bike=identifyBikeModel(text); return !!(bike && /H4\/3-pin fitment reported/i.test(bike.fitment)); }
+function bikeClarification() { return 'আপনার বাইকের সঠিক মডেল বা হেডলাইট সকেটের ছবি দিন।'; }
 function bikeReply(text, senderId) {
   const allText=getRecentConversationText(senderId,text);
-  if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(allText) && !isH4Confirmed(allText)) return 'আপনার উল্লেখ করা H1/H3/H7/H11/H13/H6M সকেট H4/3-pin-এর থেকে আলাদা হতে পারে। আপনার 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে কি না, তা সকেট/অ্যাডাপ্টার, ভোল্টেজ ও ফিটমেন্ট মিলিয়ে নিশ্চিত করতে হবে। প্লাগের পরিষ্কার ছবি পাঠান।';
-  if (isH4Confirmed(allText)) return 'হ্যাঁ—H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও কানেক্টর মিলে গেলে আপনার 60W LED প্রজেকশন হেডলাইট ব্যবহার করা যাবে। LED-র প্রকৃত বিদ্যুৎ খরচ মডেলভেদে আলাদা হতে পারে; তাই শুধু “60W” লেখা দেখে কম পাওয়ার নেয় ধরে নিচ্ছি না। HS1 বা অন্য কাছাকাছি সকেট সরাসরি মেলে কি না, তা কানেক্টর/অ্যাডাপ্টার দেখে নিশ্চিত করতে হবে।';
+  if (isAcDcQuestion(text)) return 'আপনার বাইকের হেডলাইট AC পাওয়ারে চললে DC-তে কনভার্সন করতে হবে।';
+  if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(allText) && !isH4Confirmed(allText)) return 'না, H4/3-pin LED সরাসরি ওই সকেটে ফিটিং হবে না।';
+  if (isH4Confirmed(allText)) return 'হ্যাঁ, আপনার বাইকে H4/3-pin LED ফিটিং হবে।';
   const knownBike=identifyBikeModel(allText);
-  if (knownBike) return `আপনি ${knownBike.brand} ${knownBike.model} (${knownBike.vehicleType}) বলেছেন। এই মডেলটি আমার যানবাহন ইনডেক্সে আছে। ফিটমেন্ট নোট: ${knownBike.fitment}. সকেটটি H4/3-pin হলে এবং নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আপনার 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে এই মডেলের সব বছর/ভ্যারিয়েন্টে H4 আছে বলে নিশ্চিত করছি না; মডেল ইয়ার/ভ্যারিয়েন্ট বা পুরোনো সকেটের ছবি দিলে মিলিয়ে বলব।`;
-  const vehicle=allText.match(/(?:আমার|my)?\s*(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মোটরসাইকেল|motorcycle|ভ্যান|van|পিকআপ|pickup)[^।.!?\n]{0,100}/i);
-  if(vehicle) return `আপনি ${vehicle[0].trim()} বলেছেন। আপনার 60W LED প্রজেকশন লাইটটি H4/3-pin সকেট, ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে ব্যবহার করা যাবে। এই নির্দিষ্ট মডেলের সকেট এখনো নিশ্চিত নয়—ব্র্যান্ড, মডেল, সাল/ভ্যারিয়েন্ট অথবা পুরোনো হেডলাইট প্লাগের ছবি পাঠান।`;
+  if (knownBike && /H4\/3-pin fitment reported/i.test(knownBike.fitment)) return `হ্যাঁ, ${knownBike.brand} ${knownBike.model}-এ আপনার H4/3-pin LED ফিটিং হবে।`;
+  if (knownBike) return `${knownBike.brand} ${knownBike.model}-এর ফিটিং নিশ্চিত করতে হেডলাইট সকেটের ছবি দিন।`;
   return bikeClarification();
 }
 
@@ -622,27 +644,69 @@ function buildSystemPrompt(relevantProducts,relevantFaqs,history,memoryContext,w
   const faqContext=relevantFaqs.length?relevantFaqs.map((f,i)=>`[FAQ ${i+1}] ${f.question||''}\n${f.answer||''}`).join('\n\n'):'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
   const historyContext=history.length?history.map(x=>`${x.role==='assistant'?'বট/প্রতিনিধি':'গ্রাহক'}: ${x.text}`).join('\n'):'পূর্ববর্তী কথোপকথন নেই।';
   const webContext=webResults.length?webResults.map((x,i)=>`[বাহ্যিক সার্চ ${i+1}] ${x.name}\n${x.content}\nURL: ${x.url}`).join('\n\n'):'কোনো বাহ্যিক সার্চ ফল নেই।';
-  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); সর্বোচ্চ ৫ লাইন। Smart Answer হিসেবে আগে কথোপকথন, গ্রাহক মেমোরি, প্রাসঙ্গিক ক্যাটালগ ও FAQ মিলিয়ে সরাসরি উত্তর দিন; একই প্রশ্ন বারবার করবেন না। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ২০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বাইক, কার, CNG, ভ্যান, পিকআপ ও ট্রাকসহ সব যানবাহনের মডেল/ব্র্যান্ড/সালকে BUILTIN_BIKE_DATABASE ইনডেক্সে খুঁজুন। গ্রাহক পরিচিত যানবাহনের নাম বললে সরাসরি উত্তর দিন: H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আমাদের 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে মডেল/বছরভেদে সকেট আলাদা হতে পারে, তাই অজানা fitment-কে নিশ্চিত বলবেন না; প্রয়োজনে একটি ছোট প্রশ্নে বছর/ভ্যারিয়েন্ট বা সকেটের ছবি চান। 35W/35/35W উল্লেখ করবেন না। H4/3-pin ও HS1-কে একই ধরে নেবেন না; দরকার হলে অ্যাডাপ্টার যাচাই করুন। পণ্যের প্রকৃত বিদ্যুৎ খরচ প্রমাণ ছাড়া কম বলে দাবি করবেন না। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক বা নিশ্চিত ফিটমেন্টের প্রমাণ ধরবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (শুধু সাধারণ প্রাসঙ্গিকতা):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
+  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); সাধারণ উত্তর সংক্ষিপ্ত রাখুন। কথোপকথনের শেষ ৬০টি বার্তা, আগের AI উত্তর এবং গ্রাহক মেমোরি মিলিয়ে প্রসঙ্গ বুঝুন। হেডলাইট ফিটমেন্ট প্রশ্নে শুধু ‘হ্যাঁ, ফিটিং হবে’ বা ‘না, ফিটিং হবে না’ বলুন; নিশ্চিত তথ্য না থাকলে শুধু বাইকের মডেল/সাল বা সকেটের ছবি চান। ওয়াট, পাওয়ার কনসাম্পশন বা অন্য অপ্রয়োজনীয় ব্যাখ্যা দেবেন না। গ্রাহক আলাদাভাবে AC/DC সম্পর্কে জিজ্ঞেস করলেই শুধু উত্তর দিন: বাইক AC পাওয়ারে চললে DC কনভার্সন লাগবে; মডেলটির AC/DC নিশ্চিত না হলে সেটি অনুমান না করে সংক্ষিপ্তভাবে নিশ্চিত তথ্য/ছবি চান। প্রথমে বুঝুন গ্রাহক কোন পণ্য নিতে চাচ্ছেন। একবার হেডলাইট/ফগ লাইট/অন্য পণ্যের নাম নির্ধারিত হলে সেই পণ্যই সক্রিয় পণ্য; গ্রাহক নিজে অন্য পণ্য চাইলে তবেই বদলাবেন। বর্তমান পণ্যটির নাম, Product ID, বৈশিষ্ট্য, দাম, স্টক, ছবি ও ভিডিও ছাড়া অন্য পণ্যের তথ্য মেশাবেন না। গ্রাহকের প্রশ্ন এবং পূর্বের AI উত্তর দুটোই মনে রেখে ধারাবাহিক উত্তর দিন; একই প্রশ্ন বারবার করবেন না। ছবি/ভিডিও শুধু নির্দিষ্ট Product ID-এর ক্যাটালগ media.images/media.videos থেকে পাঠাবেন; অন্য পণ্যের মিডিয়া কখনো ব্যবহার করবেন না। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ৬০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বাইক, কার, CNG, ভ্যান, পিকআপ ও ট্রাকসহ সব যানবাহনের মডেল/ব্র্যান্ড/সালকে BUILTIN_BIKE_DATABASE ইনডেক্সে খুঁজুন। গ্রাহক পরিচিত যানবাহনের নাম বললে BUILTIN_BIKE_DATABASE এবং বাহ্যিক সার্চ ফল দেখে H4/3-pin ফিটমেন্ট নির্ধারণ করুন। Honda Dream Neo-র জন্য এই বটের ইনডেক্সে H4/3-pin ফিটমেন্ট রিপোর্টেড—গ্রাহক শুধু মডেল বললেও সরাসরি “হ্যাঁ, Honda Dream Neo-তে H4/3-pin LED ফিটিং হবে” বলুন। অন্য মডেলে নির্ভরযোগ্য মিল না পেলে শুধু মডেল ইয়ার/সকেটের ছবি চান। গ্রাহক AC/DC না জিজ্ঞেস করলে AC/DC, ওয়াট, পাওয়ার কনসাম্পশন বা অন্য ব্যাখ্যা যোগ করবেন না। 35W/35/35W উল্লেখ করবেন না। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক প্রমাণ হিসেবে ব্যবহার করবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (গাড়ি/বাইকের ফিটমেন্ট যাচাইয়ের জন্যও ব্যবহার করুন):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
 }
 async function callOpenRouter(messages,model=TEXT_MODEL) {
   if(!OPENROUTER_API_KEY)throw new Error('OPENROUTER_API_KEY is not configured');
-  const r=await axios.post(OPENROUTER_URL,{model,messages,max_tokens:MAX_OUTPUT_TOKENS,temperature:0.2},{headers:{Authorization:`Bearer ${OPENROUTER_API_KEY}`,'Content-Type':'application/json','HTTP-Referer':'https://github.com/impotechaibot/Impotech-bot','X-Title':'ImpoTech Messenger AI Bot'},timeout:30000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
+  const r=await axios.post(OPENROUTER_URL,{model,messages,max_tokens:MAX_OUTPUT_TOKENS,temperature:0.2},{headers:{Authorization:`Bearer ${OPENROUTER_API_KEY}`,'Content-Type':'application/json','HTTP-Referer':'https://github.com/impotechaibot/Impotech-bot','X-Title':'ImpoTech Messenger AI Bot'},timeout:45000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
   const choice=r.data?.choices?.[0];if(!choice)throw new Error('OpenRouter returned no response');let reply=choice.message?.content;if(Array.isArray(reply))reply=reply.map(x=>x?.text||'').join('');reply=String(reply||'').trim();if(!reply||choice.finish_reason==='length')throw new Error('AI response empty or truncated');return reply;
+}
+function detectAudioFormat(buffer,contentType='',url='') {
+  const b=Buffer.from(buffer||[]),ct=String(contentType).toLowerCase().split(';')[0],u=String(url).toLowerCase().split('?')[0];
+  if(b.length>=12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WAVE')return 'wav';
+  if((b.length>=3&&b.toString('ascii',0,3)==='ID3')||(b.length>=2&&b[0]===0xff&&(b[1]&0xe0)===0xe0))return 'mp3';
+  if(ct==='audio/wav'||ct==='audio/wave'||ct==='audio/x-wav'||u.endsWith('.wav'))return 'wav';
+  if(ct==='audio/mpeg'||ct==='audio/mp3'||u.endsWith('.mp3'))return 'mp3';
+  return 'convert';
+}
+async function prepareAudioForModel(buffer,contentType='',url='') {
+  const format=detectAudioFormat(buffer,contentType,url);
+  if(format==='wav'||format==='mp3')return {data:Buffer.from(buffer).toString('base64'),format};
+  const stamp=`impotech-audio-${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
+  const inputPath=path.join(os.tmpdir(),`${stamp}.input`),outputPath=path.join(os.tmpdir(),`${stamp}.mp3`);
+  try {
+    await fs.promises.writeFile(inputPath,buffer);
+    // Messenger voice notes may arrive as MP4/M4A, AAC, OGG/Opus, or another format.
+    // OpenRouter's input_audio format is kept to its broadly supported WAV/MP3 values.
+    await execFileAsync('ffmpeg',['-nostdin','-hide_banner','-loglevel','error','-y','-i',inputPath,'-vn','-ac','1','-ar','16000','-b:a','64k',outputPath],{timeout:AUDIO_CONVERT_TIMEOUT_MS,maxBuffer:1024*1024});
+    const converted=await fs.promises.readFile(outputPath);
+    if(!converted.length)throw new Error('ffmpeg produced an empty audio file');
+    return {data:converted.toString('base64'),format:'mp3'};
+  } catch(e) {
+    throw new Error(`Audio format conversion failed (${contentType||'unknown MIME type'}): ${e.message}`);
+  } finally {
+    await Promise.all([inputPath,outputPath].map(f=>fs.promises.unlink(f).catch(()=>{})));
+  }
 }
 async function generateAIResponse(customerText,attachments=[],senderId) {
   const query=customerText||'ছবিটি বা পাঠানো ফাইলটি দেখে সাহায্য করুন';let history=getHistory(senderId).slice();
   if(history.length&&history[history.length-1].role==='user'&&history[history.length-1].text===query)history.pop();
   const context=getRecentConversationText(senderId,query), memory=buildCustomerMemoryContext(senderId);
-  const relevantProducts=findRelevantProducts(context), relevantFaqs=findRelevantFaqs(context);
+  const activeProduct=findProductFromRecentContext(senderId);
+  const explicitlySwitchingProduct = /(?:অন্য পণ্য|অন্য আইটেম|ফগ লাইট|fog light|অন্য মডেল|another product|different item|fog lamp)/i.test(query);
+  const relevantProducts=(activeProduct && !explicitlySwitchingProduct) ? [activeProduct] : findRelevantProducts(context);
+  const relevantFaqs=findRelevantFaqs(context);
   let webResults=[];
   // Search only when catalog/FAQ context is weak and the question is plausibly factual/compatibility-related.
-  if (LINKUP_API_KEY && ((relevantProducts.length===0 && relevantFaqs.length===0 && /বাইক|মডেল|সকেট|হেডলাইট|compatible|compatibility|fit|ফিট|কানেক্টর|connector|স্পেসিফিকেশন|specification|car|truck|cng|toyota|honda|nissan|suzuki|mitsubishi|tata|mahindra|ট্রাক|গাড়ি|গাড়ি|সিএনজি/i.test(query)) || isBikeCompatibilityQuestion(query))) webResults=await linkupSearch(query);
+  if (LINKUP_API_KEY && ((relevantProducts.length===0 && relevantFaqs.length===0 && /বাইক|মডেল|সকেট|হেডলাইট|compatible|compatibility|fit|ফিট|কানেক্টর|connector|স্পেসিফিকেশন|specification|car|truck|cng|toyota|honda|nissan|suzuki|mitsubishi|tata|mahindra|ট্রাক|গাড়ি|গাড়ি|সিএনজি/i.test(query)) || isBikeCompatibilityQuestion(context))) webResults=await linkupSearch(context);
   const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,webResults);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
-  const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
-  if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন। অনিশ্চিত হলে তা জানান।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL));}catch(e){console.error('[VOICE] Failed:',e.message);}}
+  const audio=attachments.find(x=>(x.type==='audio'||String(x.mime_type||x.mimeType||'').toLowerCase().startsWith('audio/'))&&x.payload?.url);
+  if(audio){
+    try {
+      const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:20000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
+      const audioBuffer=Buffer.from(r.data);
+      if(!audioBuffer.length)throw new Error('Downloaded audio is empty');
+      const prepared=await prepareAudioForModel(audioBuffer,r.headers['content-type']||audio.mime_type||audio.mimeType||'',audio.payload.url);
+      const audioPrompt='এটি গ্রাহকের পাঠানো ভয়েস মেসেজ। অডিওটি মনোযোগ দিয়ে শুনে, কথাটি যে ভাষায় বলা হয়েছে তা বুঝে নিন; এরপর গ্রাহককে স্বাভাবিক বাংলায় সংক্ষিপ্ত উত্তর দিন। অডিও অস্পষ্ট বা অসম্পূর্ণ হলে কোনো কথা বানিয়ে না বলে কোন অংশটি পরিষ্কার নয় তা জানিয়ে আবার ভয়েস বা লিখে পাঠাতে বলুন।';
+      return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:audioPrompt},{type:'input_audio',input_audio:{data:prepared.data,format:prepared.format}}]}],VOICE_MODEL));
+    } catch(e) {
+      console.error('[VOICE] Failed:',e.response?.data?.error?.message||e.message);
+      return 'আপনার ভয়েস মেসেজটি পরিষ্কারভাবে বুঝতে পারিনি। অনুগ্রহ করে আরেকবার ভয়েস পাঠান অথবা কথাটি লিখে দিন—আমি সাহায্য করছি।';
+    }
+  }
   const image=attachments.find(x=>x.type==='image'&&x.payload?.url);
-  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি দেখে সাহায্য করুন; নিশ্চিত না হলে অনুমান করবেন না।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]));}catch(e){console.error('[VISION] Failed:',e.message);}}
+  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:20000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');const mime=String(r.headers['content-type']||image.mime_type||image.mimeType||'image/jpeg').split(';')[0];return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি দেখে সাহায্য করুন; পণ্যের পরিচয় নিশ্চিত না হলে অনুমান করবেন না।`},{type:'image_url',image_url:{url:`data:${mime};base64,${base64}`}}]}],TEXT_MODEL));}catch(e){console.error('[VISION] Failed:',e.response?.data?.error?.message||e.message);return 'ছবিটি এখন খুলে দেখতে সমস্যা হচ্ছে। অনুগ্রহ করে ছবিটি আবার পাঠান অথবা পণ্যটির নাম লিখুন।';}}
   return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:query}]));
 }
 function isCriticalHandoverQuestion(text='') { return /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/i.test(text); }
@@ -684,9 +748,9 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     if(isExplicitOrderIntent(customerText)){await handleOrderFlow(id,customerText,messageId);return;}
     if(isCriticalHandoverQuestion(customerText)){await askHandoverConsent(id,'Critical customer issue');return;}
     const priorVehicleFitmentContext=getRecentConversationText(id,customerText);
-    const contextualVehicleFitment = /(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit)/i.test(customerText) && /(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মডেল|model|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata)/i.test(priorVehicleFitmentContext) && /(?:হেডলাইট|headlight|h4|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|সকেট|plug|প্লাগ)/i.test(priorVehicleFitmentContext);
+    const contextualVehicleFitment = ((/(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit)/i.test(customerText) || !!identifyBikeModel(customerText) || isAcDcQuestion(customerText)) && /(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মডেল|model|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata|dream neo)/i.test(priorVehicleFitmentContext) && /(?:হেডলাইট|headlight|h4|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|সকেট|plug|প্লাগ|ac|dc|এসি|ডিসি)/i.test(priorVehicleFitmentContext));
     if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment) {
-      if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(customerText) || isH4Confirmed(getRecentConversationText(id,customerText))) { await sendFacebookMessage(id,limitToFiveLines(bikeReply(customerText,id))); return; }
+      if (!isAcDcQuestion(customerText) && (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(getRecentConversationText(id,customerText)) || isH4Confirmed(getRecentConversationText(id,customerText)) || hasConfirmedModelFitment(getRecentConversationText(id,customerText)))) { await sendFacebookMessage(id,limitToFiveLines(bikeReply(customerText,id))); return; }
       const researchedReply=await generateAIResponse(customerText,attachments,id);
       if (researchedReply && !researchedReply.includes(HANDOVER_MARKER) && !/আমার প্রশ্নটা বুঝতে সমস্যা|বুঝতে সমস্যা হচ্ছে|প্রশ্নটি বুঝতে পারিনি/i.test(researchedReply)) { await sendFacebookMessage(id,limitToFiveLines(researchedReply)); return; }
       await sendFacebookMessage(id,bikeClarification()); return;
@@ -732,6 +796,29 @@ app.post('/webhook',async(req,res)=>{
     if(req.body?.object!=='page')return;
     for(const entry of req.body.entry||[])for(const event of entry.messaging||[]) {
       const senderId=event.sender?.id,message=event.message,messageId=message?.mid;
+      // Admin control commands sent from the Facebook Page Inbox arrive as message echoes.
+      // For echo events, the recipient is the customer whose AI/takeover state should change.
+      if(message?.is_echo && typeof message.text === 'string') {
+        const command=String(message.text).trim().toLowerCase().replace(/\s+/g,'');
+        const targetCustomerId=String(event.recipient?.id || '').trim();
+        const commandMap={'.human':'human','.stop':'human','.ai':'ai'};
+        const action=commandMap[command];
+        if(action && targetCustomerId) {
+          if(action==='human') {
+            await setTakeoverState(targetCustomerId,true,`Admin Inbox command ${command}`);
+            delete db.pendingHandover[targetCustomerId];
+            saveStorage();
+            console.log(`[Admin Inbox] Human takeover enabled for ${targetCustomerId} via ${command}`);
+          } else {
+            await setTakeoverState(targetCustomerId,false,'Admin Inbox command .ai');
+            delete db.pendingHandover[targetCustomerId];
+            saveStorage();
+            console.log(`[Admin Inbox] AI resumed for ${targetCustomerId} via .ai`);
+          }
+        }
+        // Never feed Page Inbox echoes or admin commands back into the AI reply pipeline.
+        continue;
+      }
       if(event.call && senderId) {
         await setTakeoverState(senderId,true,'Incoming Messenger call event');
         await sendFacebookMessage(senderId,`আপনার কলের অনুরোধের জন্য Human takeover চালু করা হয়েছে। দ্রুত সহায়তার জন্য সরাসরি কল করুন: ${HELPLINE}`);
@@ -753,8 +840,14 @@ app.post('/webhook',async(req,res)=>{
         const now=new Date().toISOString(),paused=getTakeoverState(senderId);
         appendHistory(senderId,'user',text||'[Media File]');
         addStoredMessage({id:'msg_'+crypto.randomUUID(),senderId,sender:'customer',text:text||`[Media: ${attachments[0]?.type||'file'}]`,timestamp:now,messageId:messageId||null});
-        if(!db.customers[senderId])db.customers[senderId]={id:senderId,name:`Customer ${senderId.slice(-4)}`,messageCount:1,lastActive:now,lastCustomerMessageAt:now,lastMessageId:messageId||null,isPaused:paused,takeover:paused,lastMessageText:text||'[Media]'};
+        if(!db.customers[senderId])db.customers[senderId]={id:senderId,name:`Customer ${senderId.slice(-4)}`,messageCount:1,lastActive:now,lastCustomerMessageAt:now,lastMessageId:messageId||null,isPaused:paused,takeover:paused,lastMessageText:text||'[Media]',firstContactIntroSent:false};
         else {const c=db.customers[senderId];c.messageCount=(c.messageCount||0)+1;c.lastActive=now;c.lastCustomerMessageAt=now;c.lastMessageId=messageId||null;c.lastMessageText=text||'[Media]';}
+        // Send a one-time introduction before handling the customer's first message.
+        const customerRecord=db.customers[senderId];
+        if(!customerRecord.firstContactIntroSent) {
+          const introSent=await sendFacebookMessage(senderId,FIRST_CONTACT_INTRO);
+          if(introSent) { customerRecord.firstContactIntroSent=true; customerRecord.firstContactIntroSentAt=now; saveStorage(); }
+        }
         if(text)updateCustomerMemory(senderId,text);
         // Accumulate phone/address across messages and auto-transfer once both are present.
         const c=db.customers[senderId]||{}; const phone=extractPhone(text); const address=extractAddress(text);
@@ -790,6 +883,17 @@ app.post('/api/customers/:senderId/takeover',async(req,res)=>{const {senderId}=r
 app.get('/api/customers/:senderId/status',(req,res)=>{const id=String(req.params.senderId),on=getTakeoverState(id);res.json({success:true,senderId:id,isPaused:on,takeover:on,reason:db.takeovers[id]?.reason||null,updatedAt:db.takeovers[id]?.timestamp||null});});
 app.post('/api/customers/:senderId/takeover/enable',async(req,res)=>{await setTakeoverState(req.params.senderId,true,req.body?.reason||'Enabled from admin chat');res.json({success:true,senderId:req.params.senderId,takeover:true,isPaused:true});});
 app.post('/api/customers/:senderId/takeover/disable',async(req,res)=>{await setTakeoverState(req.params.senderId,false,req.body?.reason||'Disabled from admin chat');res.json({success:true,senderId:req.params.senderId,takeover:false,isPaused:false});});
+// Convenience endpoint for an admin chat box to toggle AI without removing existing API routes.
+app.post('/api/customers/:senderId/ai-control',async(req,res)=>{
+  const id=String(req.params.senderId||'').trim();
+  const command=String(req.body?.command||'').trim().toLowerCase();
+  if(!id)return res.status(400).json({success:false,message:'senderId required'});
+  if(!['.human','.stop','.ai','human','stop','ai'].includes(command))return res.status(400).json({success:false,message:'Supported commands: .human, .stop, .ai'});
+  const enabled=['.human','.stop','human','stop'].includes(command);
+  await setTakeoverState(id,enabled,`Admin API command ${command}`);
+  delete db.pendingHandover[id];saveStorage();
+  return res.json({success:true,senderId:id,isPaused:enabled,takeover:enabled,aiEnabled:!enabled,command});
+});
 app.get('/api/customers',(req,res)=>{const list=Object.values(db.customers).map(c=>({senderId:c.id,displayName:c.name||`Customer ${String(c.id).slice(-4)}`,phone:c.phone||null,address:c.address||null,lastMessageText:c.lastMessageText||null,lastMessageAt:c.lastActive||null,messageCount:c.messageCount||0,lastOrderId:c.lastOrderId||null,lastOrderAt:c.lastOrderAt||null,takeover:getTakeoverState(c.id),isPaused:getTakeoverState(c.id),takeoverReason:db.takeovers[c.id]?.reason||null,takeoverUpdatedAt:db.takeovers[c.id]?.timestamp||null,memoryUpdatedAt:c.lastMemoryUpdatedAt||null}));res.json({success:true,total:list.length,data:list});});
 app.get('/api/customers/:senderId/memory',(req,res)=>res.json({success:true,senderId:String(req.params.senderId),memory:db.customerMemory[String(req.params.senderId)]||null}));
 app.put('/api/customers/:senderId/memory',(req,res)=>{const id=String(req.params.senderId),body=req.body||{},m=getCustomerMemory(id);if(Array.isArray(body.facts))m.facts=body.facts.filter(x=>typeof x==='string').map(x=>x.trim()).filter(Boolean).slice(-30);if(Array.isArray(body.preferences))m.preferences=body.preferences.filter(x=>typeof x==='string').map(x=>x.trim()).filter(Boolean).slice(-20);if(typeof body.summary==='string')m.summary=body.summary.slice(0,3000);m.updatedAt=new Date().toISOString();saveStorage();res.json({success:true,senderId:id,memory:m});});
