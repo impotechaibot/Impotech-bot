@@ -2,12 +2,13 @@
 
 /**
  * ImpoTech AI Messenger Bot & Admin Backend
- * AI: OpenRouter Gemini 2.5 Flash-Lite (text, vision, and audio; voice notes normalized to WAV/MP3-compatible input)
+ * AI: OpenRouter Gemini 3.1 Flash-Lite
  * Storage: PostgreSQL (DATABASE_URL / POSTGRES_URL)
  * Catalog: GitHub catalog.json + local cache
  * Search: Linkup Search API (LINKUP_API_KEY)
- * Memory: last 60 messages + durable customer/product context (20-day memory retention)
- * Human handover: automatic for completed contact details, orders, and call events; consent for unclear-question handover
+ * Memory: last 20 messages + customer facts/preferences (20-day retention)
+ * Human handover: .human/.stop/.ai chat commands, automatic on order completion/contact details/call events, consent for unclear-question handover
+ * Topic memory: persists active product until customer clearly names another product
  */
 
 const express = require('express');
@@ -15,10 +16,6 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const os = require('os');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
-const execFileAsync = promisify(execFile);
 const { Pool } = require('pg');
 
 const app = express();
@@ -51,10 +48,8 @@ const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
 const REQUIRE_ADMIN_SECRET = process.env.REQUIRE_ADMIN_SECRET !== 'false';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const LINKUP_URL = 'https://api.linkup.so/v1/search';
-const TEXT_MODEL = process.env.TEXT_MODEL || 'google/gemini-2.5-flash-lite';
-// Keep text, image vision, and audio understanding on one multimodal model by default.
+const TEXT_MODEL = process.env.TEXT_MODEL || 'google/gemini-3.1-flash-lite';
 const VOICE_MODEL = process.env.VOICE_MODEL || TEXT_MODEL;
-const AUDIO_CONVERT_TIMEOUT_MS = Number(process.env.AUDIO_CONVERT_TIMEOUT_MS) || 20000;
 const HELPLINE = process.env.HELPLINE || '+8809611042598';
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '01884332067';
 const MAX_PRODUCTS_TO_AI = 5;
@@ -63,7 +58,7 @@ const MAX_OUTPUT_TOKENS = 500;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
 const MAX_AI_LINES = 5;
-const HISTORY_LIMIT = 60;
+const HISTORY_LIMIT = 20;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const MEMORY_RETENTION_DAYS = 20;
 const MEMORY_RETENTION_MS = MEMORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -75,7 +70,7 @@ const LEGACY_DATA_FILE = path.join(__dirname, 'storage_data.json');
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 const ORDER_CONFIRMATION = 'আপনার অর্ডারের তথ্য সংরক্ষণ করা হয়েছে। আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করে অর্ডারটি নিশ্চিত করবেন।';
 const FOLLOWUP_MESSAGE = 'আপনি কি পণ্যটি সম্পর্কে আরও কিছু জানতে চান? কোনো প্রশ্ন থাকলে জানাবেন, আমরা সাহায্য করতে প্রস্তুত।';
-const FIRST_CONTACT_INTRO = 'আসসালামু আলাইকুম! 👋 ImpoTech-এ স্বাগতম।\n\nআমি ImpoTech-এর AI চ্যাটবট। আপনার প্রশ্নের উত্তর ও প্রয়োজনীয় সহায়তা দিতে প্রস্তুত।\n\nআরও সহায়তার জন্য আমাদের প্রতিনিধির সঙ্গে যোগাযোগ করুন:\n\n📞 হেল্পলাইন: '+HELPLINE+'\n📱 WhatsApp: '+WHATSAPP_NUMBER+'\n\nআপনাকে সাহায্য করতে পেরে আমরা আনন্দিত! 💙';
+const FIRST_CONTACT_INTRO = 'আমি ইমপোটেকের AI চ্যাটবট। আমার কাজ আপনাকে সাহায্য করা এবং পণ্য ও সেবা সম্পর্কে তথ্য দেওয়া। আমার উত্তরে কোনো ভুল বা সমস্যা মনে হলে আপনি আমাদের প্রতিনিধির সঙ্গে যোগাযোগ করতে পারেন।';
 
 if (!DATABASE_URL) {
   console.warn('[DB] DATABASE_URL/POSTGRES_URL is missing. PostgreSQL persistence is unavailable; server will use in-memory state only. Configure DATABASE_URL for durable storage.');
@@ -262,10 +257,10 @@ function updateCustomerMemory(senderId, customerText) {
   const id = String(senderId), memory = getCustomerMemory(id), customer = db.customers[id] || {};
   const matches = products.map(product => ({ product, score: productScore(text, product) })).filter(x => x.score > 0).sort((a,b) => b.score-a.score);
   if (matches.length && (matches.length === 1 || matches[0].score > matches[1].score)) {
-    const chosen = matches[0].product;
-    memory.activeProductId = String(chosen.id);
-    memory.activeProductName = String(chosen.name || '');
-    addUniqueMemoryItem(memory.facts, `আলোচিত পণ্য: ${chosen.name} (ID: ${chosen.id})`);
+    addUniqueMemoryItem(memory.facts, `আলোচিত পণ্য: ${matches[0].product.name} (ID: ${matches[0].product.id})`);
+    // A clearly identified new product replaces the previous topic; generic follow-ups do not.
+    customer.activeProductId = matches[0].product.id;
+    customer.activeProductName = matches[0].product.name || null;
   }
   const phone = text.match(/(?:\+?8801|01)[0-9\s-]{8,14}/);
   if (phone) customer.phone = phone[0].replace(/[\s-]/g, '');
@@ -282,8 +277,7 @@ function updateCustomerMemory(senderId, customerText) {
 function buildCustomerMemoryContext(senderId) {
   const m = getCustomerMemory(senderId);
   if (!m) return 'কোনো সংরক্ষিত মেমোরি নেই।';
-  const active = m.activeProductId ? `বর্তমান আলোচ্য পণ্য: ${m.activeProductName || 'নাম নেই'} (Product ID: ${m.activeProductId}) — গ্রাহক নিজে অন্য পণ্য না বললে এই পণ্যেই থাকুন।` : '';
-  return [active, m.facts.length ? `তথ্য:\n- ${m.facts.slice(-20).join('\n- ')}` : '', m.preferences.length ? `পছন্দ/প্রসঙ্গ:\n- ${m.preferences.slice(-15).join('\n- ')}` : '', m.summary ? `সারাংশ:\n${m.summary}` : ''].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত মেমোরি নেই।';
+  return [m.facts.length ? `তথ্য:\n- ${m.facts.slice(-15).join('\n- ')}` : '', m.preferences.length ? `পছন্দ/প্রসঙ্গ:\n- ${m.preferences.slice(-10).join('\n- ')}` : '', m.summary ? `সারাংশ:\n${m.summary}` : ''].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত মেমোরি নেই।';
 }
 function pruneOldMemory() {
   const cutoff = Date.now() - MEMORY_RETENTION_MS;
@@ -355,13 +349,28 @@ function findExactProduct(query) {
   const matches = products.filter(p => getProductIdentifiers(p).some(name => name.length >= 3 && (` ${q} `).includes(` ${name} `)));
   return matches.length === 1 ? matches[0] : null;
 }
+function findActiveProduct(senderId) {
+  const customer = db.customers[String(senderId || '')] || {};
+  const id = customer.activeProductId;
+  return id ? (products.find(p => String(p.id) === String(id)) || null) : null;
+}
+function rememberActiveProduct(senderId, product) {
+  if (!senderId || !product) return;
+  const id = String(senderId);
+  if (!db.customers[id]) db.customers[id] = { id, name: `Customer ${id.slice(-4)}`, messageCount: 0 };
+  db.customers[id].activeProductId = product.id;
+  db.customers[id].activeProductName = product.name || null;
+  const memory = getCustomerMemory(id);
+  addUniqueMemoryItem(memory.facts, `বর্তমান আলোচ্য পণ্য: ${product.name} (ID: ${product.id})`);
+  memory.updatedAt = new Date().toISOString();
+  db.customers[id].lastMemoryUpdatedAt = memory.updatedAt;
+  saveStorage();
+}
 function findProductFromRecentContext(senderId) {
-  // Keep the last explicitly discussed product as the active product until the customer names another.
+  const active = findActiveProduct(senderId);
+  if (active) return active;
   const history = getHistory(senderId);
-  for (let i = history.length - 1; i >= 0; i--) {
-    const p = findExactProduct(history[i].text);
-    if (p) return p;
-  }
+  for (let i = history.length - 1; i >= 0; i--) { if (history[i].role !== 'user') continue; const p = findExactProduct(history[i].text); if (p) return p; }
   const memory = getCustomerMemory(senderId);
   for (const fact of [...(memory?.facts || [])].reverse()) { const p = findExactProduct(fact); if (p) return p; }
   return null;
@@ -396,90 +405,46 @@ function getProductMediaUrls(p, type) { const media = p?.media; return media && 
 function getMediaType(text='') { const v=normalizeText(text); if (/ভিডিও|video|রিল|reel|clip/.test(v)) return 'videos'; if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture/.test(v)) return 'images'; return null; }
 function getProductMediaReply(text, senderId) {
   const type = getMediaType(text); if (!type) return null;
-  // Never use fuzzy first-match for media: that can send another product's image/video.
-  const explicitlyNamed = findExactProduct(text);
-  const p = explicitlyNamed || findProductFromRecentContext(senderId);
-  if (!p) return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যের সঠিক নাম বা প্রোডাক্ট ID বলুন।';
-  const urls = getProductMediaUrls(p, type);
-  if (!urls.length) return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} এই প্রোডাক্ট ID-এর ক্যাটালগে পাওয়া যাচ্ছে না।`;
-  return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'}:\n${urls.map((u,i)=>`${i+1}. ${u}`).join('\n')}`;
+  const p = findExactProduct(text) || findRelevantProducts(text)[0] || findProductFromRecentContext(senderId);
+  if (!p) return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যের নাম বা মডেলটি বলুন।';
+  const urls = getProductMediaUrls(p, type); if (!urls.length) return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`;
+  return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক:\n${urls.map((u,i)=>`${i+1}. ${u}`).join('\n')}`;
 }
 
 // -----------------------------------------------------------------------------
 // Motorcycle compatibility: do not infer unverified model/year fitment.
 // -----------------------------------------------------------------------------
 const BUILTIN_BIKE_DATABASE = [
-  // Motorcycle model index: names are searchable; socket fitment remains variant/year-specific unless sourced.
-  {brand:'Yamaha',model:'FZ',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['fz','fz-s','fzs','fz v2','fz v3','yamaha fz']},
-  {brand:'Yamaha',model:'FZ25',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['fz25','fz 25']},
-  {brand:'Yamaha',model:'R15',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['r15','r15 v2','r15 v3','r15 v4','r15m']},
-  {brand:'Yamaha',model:'Fazer',vehicleType:'motorcycle',fitment:'some year variants listed with H4; verify exact variant',aliases:['fazer','yamaha fazer','fazer fz']},
-  {brand:'Yamaha',model:'MT-07',vehicleType:'motorcycle',fitment:'H4 listed for certain model years; verify exact variant',aliases:['mt07','mt 07','yamaha mt-07']},
-  {brand:'Yamaha',model:'XT600',vehicleType:'motorcycle',fitment:'H4 listed for certain model years; verify exact variant',aliases:['xt600','xt 600','yamaha xt600']},
-  {brand:'Bajaj',model:'Discover 125',vehicleType:'motorcycle',fitment:'variant-dependent; HS1 used on some variants, do not assume direct H4',aliases:['discover 125','discover125','bajaj discover 125','ডিসকভার ১২৫','ডিসকভার 125']},
-  {brand:'Bajaj',model:'Discover 100',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['discover 100','discover100','bajaj discover 100']},
-  {brand:'Bajaj',model:'Pulsar 125',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 125','pulsar125','p125']},
-  {brand:'Bajaj',model:'Pulsar 150',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 150','pulsar150','p150']},
-  {brand:'Bajaj',model:'Pulsar 220',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 220','pulsar220','p220']},
-  {brand:'Bajaj',model:'Pulsar NS200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar ns200','ns200','ns 200']},
-  {brand:'Bajaj',model:'Platina',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['platina','platina 100','platina 110']},
-  {brand:'Bajaj',model:'CT 100',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['ct100','ct 100','bajaj ct 100']},
-  {brand:'TVS',model:'Apache RTR 160',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['apache rtr 160','rtr160','apache 160']},
-  {brand:'TVS',model:'Apache RTR 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['apache rtr 200','rtr200','apache 200']},
-  {brand:'TVS',model:'Metro',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['tvs metro','metro plus']},
-  {brand:'TVS',model:'Sport',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['tvs sport','sport 100']},
-  {brand:'Hero',model:'Splendor',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['splendor','splendor plus','splendor+']},
-  {brand:'Hero',model:'HF Deluxe',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hf deluxe','hfdeluxe','hero hf deluxe']},
-  {brand:'Hero',model:'Glamour',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hero glamour','glamour 125']},
-  {brand:'Honda',model:'CB Shine',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['cb shine','cbshine','shine']},
-  {brand:'Honda',model:'Dream Neo',vehicleType:'motorcycle',fitment:'H4/3-pin fitment reported for this model; treat as compatible with the H4/3-pin LED',aliases:['dream neo','honda dream neo','dream 110','honda dream']},
-  {brand:'Honda',model:'Unicorn',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['honda unicorn','unicorn 150','unicorn 160']},
-  {brand:'Honda',model:'Grom',vehicleType:'motorcycle',fitment:'H4/HS1-base options exist in some market variants; verify exact model',aliases:['honda grom','grom 125','msx125','msx 125']},
-  {brand:'Suzuki',model:'Gixxer',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['gixxer','gixxer 150','gixxer sf']},
-  {brand:'Yamaha',model:'Saluto',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['saluto','yamaha saluto']},
-  {brand:'Yamaha',model:'Fascino',vehicleType:'scooter',fitment:'variant-dependent',aliases:['fascino','yamaha fascino']},
-  {brand:'Yamaha',model:'Ray ZR',vehicleType:'scooter',fitment:'variant-dependent',aliases:['ray zr','rayzr','yamaha ray zr']},
-  {brand:'KTM',model:'Duke 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['duke 200','ktm duke 200']},
-  {brand:'KTM',model:'RC 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['rc 200','ktm rc 200']},
-  // Cars and utility vehicles: indexed for fast lookup, but model/year/trim must be checked.
-  {brand:'Toyota',model:'Corolla',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota corolla','corolla gli','corolla xli','corolla axio','axio']},
-  {brand:'Toyota',model:'Allion',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota allion','allion']},
-  {brand:'Toyota',model:'Premio',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota premio','premio']},
-  {brand:'Toyota',model:'Probox',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota probox','probox']},
-  {brand:'Toyota',model:'Hiace',vehicleType:'van',fitment:'variant-dependent',aliases:['toyota hiace','hiace','হাইএস']},
-  {brand:'Honda',model:'Civic',vehicleType:'car',fitment:'variant-dependent',aliases:['honda civic','civic']},
-  {brand:'Honda',model:'Fit/Jazz',vehicleType:'car',fitment:'variant-dependent',aliases:['honda fit','fit','honda jazz','jazz']},
-  {brand:'Honda',model:'City',vehicleType:'car',fitment:'variant-dependent',aliases:['honda city','city']},
-  {brand:'Nissan',model:'Sunny',vehicleType:'car',fitment:'variant-dependent',aliases:['nissan sunny','sunny']},
-  {brand:'Nissan',model:'AD Van',vehicleType:'van',fitment:'variant-dependent',aliases:['nissan ad','ad van','nissan ad van']},
-  {brand:'Suzuki',model:'Alto',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki alto','alto']},
-  {brand:'Suzuki',model:'Wagon R',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki wagon r','wagon r','wagonr']},
-  {brand:'Suzuki',model:'Swift',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki swift','swift']},
-  {brand:'Mitsubishi',model:'Lancer',vehicleType:'car',fitment:'variant-dependent',aliases:['mitsubishi lancer','lancer']},
-  {brand:'Tata',model:'Ace',vehicleType:'truck',fitment:'variant-dependent',aliases:['tata ace','ace mini truck','টাটা এস']},
-  {brand:'Tata',model:'407',vehicleType:'truck',fitment:'variant-dependent',aliases:['tata 407','407 truck']},
-  {brand:'Mahindra',model:'Bolero Pickup',vehicleType:'pickup',fitment:'variant-dependent',aliases:['mahindra bolero pickup','bolero pickup','bolero pikup']},
-  {brand:'Ashok Leyland',model:'Dost',vehicleType:'truck',fitment:'variant-dependent',aliases:['ashok leyland dost','leyland dost','dost mini truck']},
-  {brand:'CNG',model:'Auto-rickshaw',vehicleType:'cng',fitment:'brand/model and lamp housing vary; verify socket',aliases:['cng','সিএনজি','auto rickshaw','autorickshaw','অটোরিকশা','অটো রিকশা','three wheeler','three-wheeler','থ্রি হুইলার']}
+  {brand:'Yamaha',model:'FZ',aliases:['fz','fz-s','fzs','fz v2','fz v3']},
+  {brand:'Yamaha',model:'FZ25',aliases:['fz25','fz 25']},
+  {brand:'Yamaha',model:'R15',aliases:['r15','r15 v2','r15 v3','r15 v4','r15m']},
+  {brand:'Bajaj',model:'Discover 125',aliases:['discover 125','discover125','bajaj discover 125','bajaj discover125','discover 125cc','discover125cc','discover 125 cc','discovery 125']},
+  {brand:'Bajaj',model:'Pulsar 150',aliases:['pulsar 150','pulsar150','p150']},
+  {brand:'Bajaj',model:'Pulsar 220',aliases:['pulsar 220','pulsar220','p220']},
+  {brand:'Bajaj',model:'Pulsar NS200',aliases:['pulsar ns200','ns200','ns 200']},
+  {brand:'TVS',model:'Apache RTR 160',aliases:['apache rtr 160','rtr160','apache 160']},
+  {brand:'TVS',model:'Apache RTR 200',aliases:['apache rtr 200','rtr200','apache 200']},
+  {brand:'Hero',model:'Splendor',aliases:['splendor','splendor plus','splendor+']},
+  {brand:'Honda',model:'CB Shine',aliases:['cb shine','cbshine','shine']},
+  {brand:'Suzuki',model:'Gixxer',aliases:['gixxer','gixxer 150','gixxer sf']}
 ];
-function isBikeCompatibilityQuestion(text='') { return /h\s*-?\s*[0-9]+|9003|hb2|hs\s*-?\s*1|headlight|head\s*lamp|হেডলাইট|হেড\s*লাইট|plug\s*and\s*play|socket|সকেট|বাল্ব|bulb|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|প্রজেকশন|projector/i.test(text) && /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|ভ্যান|van|পিকআপ|pickup|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট|পিন|pin|লাগবে|হেডলাইট|টয়োটা|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata|mitsubishi/i.test(text); }
+function isBikeCompatibilityQuestion(text='') { return /h\s*-?\s*[0-9]+|9003|hb2|hs\s*-?\s*1|headlight|head\s*lamp|হেডলাইট|হেড\s*লাইট|plug\s*and\s*play|socket|সকেট|বাল্ব|bulb|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন/i.test(text) && /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট|পিন|pin|লাগবে|হেডলাইট/i.test(text); }
 function identifyBikeModel(text='') {
   const v=normalizeText(text);
   for (const entry of BUILTIN_BIKE_DATABASE) for (const name of [entry.model,...entry.aliases]) if (name.length>=3 && (` ${v} `).includes(` ${normalizeText(name)} `)) return entry;
   return null;
 }
+function isVehicleModelMention(text='') {
+  return Boolean(identifyBikeModel(text)) || /\b(?:yamaha|bajaj|tvs|hero|honda|suzuki|mahindra|tata|kawasaki|ktm|royal enfield)\b.{0,35}\b\d{2,4}\b|\b(?:discover\s*125|pulsar\s*(?:ns)?\s*\d{2,3}|apache\s*(?:rtr)?\s*\d{2,3}|fz\s*\d{0,2}|r15(?:m)?|gixxer(?:\s*sf)?|cb\s*shine)\b/i.test(String(text||''));
+}
 function isH4Confirmed(text='') { return /\bh\s*-?\s*4\b|\bhs\s*-?\s*1\b|\b9003\b|\bhb2\b|৩\s*পিন|তিন\s*পিন|3\s*-?\s*pin/i.test(text); }
-function isAcDcQuestion(text='') { return /\b(?:ac|dc)\b|এসি|ডিসি|এসি না ডিসি|ac নাকি dc|কনভার্ট|conversion|convert/i.test(text); }
-function hasConfirmedModelFitment(text='') { const bike=identifyBikeModel(text); return !!(bike && /H4\/3-pin fitment reported/i.test(bike.fitment)); }
-function bikeClarification() { return 'আপনার বাইকের সঠিক মডেল বা হেডলাইট সকেটের ছবি দিন।'; }
+function bikeClarification() { return 'এই হেডলাইটটি H4/3-pin প্লাগের সঙ্গে মিলে গেলে ব্যবহার করা যায়। আপনার বাইক/গাড়ি/CNG/বাস/ট্রাকের পুরোনো হেডলাইটের প্লাগ H4 বা 3-pin কি না যাচাই করুন, অথবা প্লাগের পরিষ্কার ছবি/গায়ের লেখা পাঠান। মডেলভিত্তিক নির্ভরযোগ্য তথ্য না পেলে ফিট হবে বলে অনুমান করব না।'; }
 function bikeReply(text, senderId) {
   const allText=getRecentConversationText(senderId,text);
-  if (isAcDcQuestion(text)) return 'আপনার বাইকের হেডলাইট AC পাওয়ারে চললে DC-তে কনভার্সন করতে হবে।';
-  if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(allText) && !isH4Confirmed(allText)) return 'না, H4/3-pin LED সরাসরি ওই সকেটে ফিটিং হবে না।';
-  if (isH4Confirmed(allText)) return 'হ্যাঁ, আপনার বাইকে H4/3-pin LED ফিটিং হবে।';
-  const knownBike=identifyBikeModel(allText);
-  if (knownBike && /H4\/3-pin fitment reported/i.test(knownBike.fitment)) return `হ্যাঁ, ${knownBike.brand} ${knownBike.model}-এ আপনার H4/3-pin LED ফিটিং হবে।`;
-  if (knownBike) return `${knownBike.brand} ${knownBike.model}-এর ফিটিং নিশ্চিত করতে হেডলাইট সকেটের ছবি দিন।`;
+  if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(allText) && !isH4Confirmed(allText)) return 'H1/H3/H7/H11/H13/H6M লেখা থাকলে সেটি H4/3-pin প্লাগের সঙ্গে সরাসরি মেলে—এমন ধরে নেওয়া যাবে না। অ্যাডাপ্টার ও কানেক্টর যাচাই করতে প্লাগের ছবি পাঠান।';
+  if (isH4Confirmed(allText)) return 'আপনার গাড়ি/বাইক/CNG/বাস/ট্রাকের আসল সকেট যদি H4 বা এই হেডলাইটের সঙ্গে মিলে যাওয়া 3-pin প্লাগ হয়, তাহলে প্লাগের দিক থেকে ব্যবহার করা যাবে। তবে শুধু মডেলের নাম বা “৩-পিন” কথাটি দিয়ে ভোল্টেজ, বেস ও ফিটমেন্ট শতভাগ নিশ্চিত করা যায় না—পুরোনো প্লাগের ছবি দিলে মিলিয়ে দেখব।';
+  const vehicle=allText.match(/(?:আমার|my)?\s*(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মোটরসাইকেল|motorcycle|discover\s*125|pulsar\s*\d{2,3}|apache\s*\d{2,3}|fz\s*\d{0,2}|r15)[^।.!?\n]{0,100}/i);
+  if(vehicle) return `আপনি ${vehicle[0].trim()} বলেছেন, কিন্তু নির্ভরযোগ্য ডাটাবেজে এই মডেলের প্লাগ নিশ্চিত করতে পারছি না। আপনার গাড়ি/যানের পুরোনো হেডলাইটের প্লাগ H4/3-pin কি না যাচাই করুন বা প্লাগের পরিষ্কার ছবি পাঠান। H4/3-pin-এর সঙ্গে মিল থাকলেই প্লাগের দিক থেকে ব্যবহারযোগ্য; অন্য প্লাগ হলে ফিট হবে বলে নিশ্চিত বলা যাবে না।`;
   return bikeClarification();
 }
 
@@ -644,71 +609,57 @@ function buildSystemPrompt(relevantProducts,relevantFaqs,history,memoryContext,w
   const faqContext=relevantFaqs.length?relevantFaqs.map((f,i)=>`[FAQ ${i+1}] ${f.question||''}\n${f.answer||''}`).join('\n\n'):'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
   const historyContext=history.length?history.map(x=>`${x.role==='assistant'?'বট/প্রতিনিধি':'গ্রাহক'}: ${x.text}`).join('\n'):'পূর্ববর্তী কথোপকথন নেই।';
   const webContext=webResults.length?webResults.map((x,i)=>`[বাহ্যিক সার্চ ${i+1}] ${x.name}\n${x.content}\nURL: ${x.url}`).join('\n\n'):'কোনো বাহ্যিক সার্চ ফল নেই।';
-  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); সাধারণ উত্তর সংক্ষিপ্ত রাখুন। কথোপকথনের শেষ ৬০টি বার্তা, আগের AI উত্তর এবং গ্রাহক মেমোরি মিলিয়ে প্রসঙ্গ বুঝুন। হেডলাইট ফিটমেন্ট প্রশ্নে শুধু ‘হ্যাঁ, ফিটিং হবে’ বা ‘না, ফিটিং হবে না’ বলুন; নিশ্চিত তথ্য না থাকলে শুধু বাইকের মডেল/সাল বা সকেটের ছবি চান। ওয়াট, পাওয়ার কনসাম্পশন বা অন্য অপ্রয়োজনীয় ব্যাখ্যা দেবেন না। গ্রাহক আলাদাভাবে AC/DC সম্পর্কে জিজ্ঞেস করলেই শুধু উত্তর দিন: বাইক AC পাওয়ারে চললে DC কনভার্সন লাগবে; মডেলটির AC/DC নিশ্চিত না হলে সেটি অনুমান না করে সংক্ষিপ্তভাবে নিশ্চিত তথ্য/ছবি চান। প্রথমে বুঝুন গ্রাহক কোন পণ্য নিতে চাচ্ছেন। একবার হেডলাইট/ফগ লাইট/অন্য পণ্যের নাম নির্ধারিত হলে সেই পণ্যই সক্রিয় পণ্য; গ্রাহক নিজে অন্য পণ্য চাইলে তবেই বদলাবেন। বর্তমান পণ্যটির নাম, Product ID, বৈশিষ্ট্য, দাম, স্টক, ছবি ও ভিডিও ছাড়া অন্য পণ্যের তথ্য মেশাবেন না। গ্রাহকের প্রশ্ন এবং পূর্বের AI উত্তর দুটোই মনে রেখে ধারাবাহিক উত্তর দিন; একই প্রশ্ন বারবার করবেন না। ছবি/ভিডিও শুধু নির্দিষ্ট Product ID-এর ক্যাটালগ media.images/media.videos থেকে পাঠাবেন; অন্য পণ্যের মিডিয়া কখনো ব্যবহার করবেন না। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ৬০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বাইক, কার, CNG, ভ্যান, পিকআপ ও ট্রাকসহ সব যানবাহনের মডেল/ব্র্যান্ড/সালকে BUILTIN_BIKE_DATABASE ইনডেক্সে খুঁজুন। গ্রাহক পরিচিত যানবাহনের নাম বললে BUILTIN_BIKE_DATABASE এবং বাহ্যিক সার্চ ফল দেখে H4/3-pin ফিটমেন্ট নির্ধারণ করুন। Honda Dream Neo-র জন্য এই বটের ইনডেক্সে H4/3-pin ফিটমেন্ট রিপোর্টেড—গ্রাহক শুধু মডেল বললেও সরাসরি “হ্যাঁ, Honda Dream Neo-তে H4/3-pin LED ফিটিং হবে” বলুন। অন্য মডেলে নির্ভরযোগ্য মিল না পেলে শুধু মডেল ইয়ার/সকেটের ছবি চান। গ্রাহক AC/DC না জিজ্ঞেস করলে AC/DC, ওয়াট, পাওয়ার কনসাম্পশন বা অন্য ব্যাখ্যা যোগ করবেন না। 35W/35/35W উল্লেখ করবেন না। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক প্রমাণ হিসেবে ব্যবহার করবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (গাড়ি/বাইকের ফিটমেন্ট যাচাইয়ের জন্যও ব্যবহার করুন):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
+  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); সর্বোচ্চ ৫ লাইন। প্রথম যোগাযোগে পরিচয় দিন: ‘আমি ইমপোটেকের AI চ্যাটবট। আমার কাজ আপনাকে সাহায্য করা এবং পণ্য ও সেবা সম্পর্কে তথ্য দেওয়া। আমার উত্তরে ভুল বা সমস্যা মনে হলে আমাদের প্রতিনিধির সঙ্গে যোগাযোগ করতে পারেন।’ Smart Answer হিসেবে আগে কথোপকথন, গ্রাহক মেমোরি, প্রাসঙ্গিক ক্যাটালগ ও FAQ মিলিয়ে সরাসরি উত্তর দিন; একই প্রশ্ন বারবার করবেন না। গ্রাহক যে পণ্য নিয়ে প্রথমে প্রশ্ন করেছেন সেটি active product হিসেবে মনে রাখুন; ‘এটার দাম কত’, ‘আরও তথ্য দিন’, ‘ছবি দিন’ বা অনুরূপ follow-up-এ সেই পণ্য নিয়েই উত্তর দিন। গ্রাহক স্পষ্টভাবে অন্য পণ্যের নাম/মডেল বললেই active product বদলাবেন। এক পণ্যের তথ্য অন্য পণ্যের সঙ্গে মেশাবেন না। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ২০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বাইকের মডেল দেখে সকেট নিশ্চিত বলে দাবি করবেন না; বছর/ভ্যারিয়েন্ট ও কানেক্টর যাচাই করুন। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক বা নিশ্চিত ফিটমেন্টের প্রমাণ ধরবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (শুধু সাধারণ প্রাসঙ্গিকতা):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
 }
 async function callOpenRouter(messages,model=TEXT_MODEL) {
   if(!OPENROUTER_API_KEY)throw new Error('OPENROUTER_API_KEY is not configured');
-  const r=await axios.post(OPENROUTER_URL,{model,messages,max_tokens:MAX_OUTPUT_TOKENS,temperature:0.2},{headers:{Authorization:`Bearer ${OPENROUTER_API_KEY}`,'Content-Type':'application/json','HTTP-Referer':'https://github.com/impotechaibot/Impotech-bot','X-Title':'ImpoTech Messenger AI Bot'},timeout:45000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
+  const r=await axios.post(OPENROUTER_URL,{model,messages,max_tokens:MAX_OUTPUT_TOKENS,temperature:0.2},{headers:{Authorization:`Bearer ${OPENROUTER_API_KEY}`,'Content-Type':'application/json','HTTP-Referer':'https://github.com/impotechaibot/Impotech-bot','X-Title':'ImpoTech Messenger AI Bot'},timeout:30000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
   const choice=r.data?.choices?.[0];if(!choice)throw new Error('OpenRouter returned no response');let reply=choice.message?.content;if(Array.isArray(reply))reply=reply.map(x=>x?.text||'').join('');reply=String(reply||'').trim();if(!reply||choice.finish_reason==='length')throw new Error('AI response empty or truncated');return reply;
-}
-function detectAudioFormat(buffer,contentType='',url='') {
-  const b=Buffer.from(buffer||[]),ct=String(contentType).toLowerCase().split(';')[0],u=String(url).toLowerCase().split('?')[0];
-  if(b.length>=12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WAVE')return 'wav';
-  if((b.length>=3&&b.toString('ascii',0,3)==='ID3')||(b.length>=2&&b[0]===0xff&&(b[1]&0xe0)===0xe0))return 'mp3';
-  if(ct==='audio/wav'||ct==='audio/wave'||ct==='audio/x-wav'||u.endsWith('.wav'))return 'wav';
-  if(ct==='audio/mpeg'||ct==='audio/mp3'||u.endsWith('.mp3'))return 'mp3';
-  return 'convert';
-}
-async function prepareAudioForModel(buffer,contentType='',url='') {
-  const format=detectAudioFormat(buffer,contentType,url);
-  if(format==='wav'||format==='mp3')return {data:Buffer.from(buffer).toString('base64'),format};
-  const stamp=`impotech-audio-${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
-  const inputPath=path.join(os.tmpdir(),`${stamp}.input`),outputPath=path.join(os.tmpdir(),`${stamp}.mp3`);
-  try {
-    await fs.promises.writeFile(inputPath,buffer);
-    // Messenger voice notes may arrive as MP4/M4A, AAC, OGG/Opus, or another format.
-    // OpenRouter's input_audio format is kept to its broadly supported WAV/MP3 values.
-    await execFileAsync('ffmpeg',['-nostdin','-hide_banner','-loglevel','error','-y','-i',inputPath,'-vn','-ac','1','-ar','16000','-b:a','64k',outputPath],{timeout:AUDIO_CONVERT_TIMEOUT_MS,maxBuffer:1024*1024});
-    const converted=await fs.promises.readFile(outputPath);
-    if(!converted.length)throw new Error('ffmpeg produced an empty audio file');
-    return {data:converted.toString('base64'),format:'mp3'};
-  } catch(e) {
-    throw new Error(`Audio format conversion failed (${contentType||'unknown MIME type'}): ${e.message}`);
-  } finally {
-    await Promise.all([inputPath,outputPath].map(f=>fs.promises.unlink(f).catch(()=>{})));
-  }
 }
 async function generateAIResponse(customerText,attachments=[],senderId) {
   const query=customerText||'ছবিটি বা পাঠানো ফাইলটি দেখে সাহায্য করুন';let history=getHistory(senderId).slice();
   if(history.length&&history[history.length-1].role==='user'&&history[history.length-1].text===query)history.pop();
   const context=getRecentConversationText(senderId,query), memory=buildCustomerMemoryContext(senderId);
-  const activeProduct=findProductFromRecentContext(senderId);
-  const explicitlySwitchingProduct = /(?:অন্য পণ্য|অন্য আইটেম|ফগ লাইট|fog light|অন্য মডেল|another product|different item|fog lamp)/i.test(query);
-  const relevantProducts=(activeProduct && !explicitlySwitchingProduct) ? [activeProduct] : findRelevantProducts(context);
+  const explicitProduct = findExactProduct(query);
+  if (explicitProduct) rememberActiveProduct(senderId, explicitProduct);
+  const activeProduct = explicitProduct || findActiveProduct(senderId);
+  const relevantProducts = activeProduct ? [activeProduct] : findRelevantProducts(context);
   const relevantFaqs=findRelevantFaqs(context);
   let webResults=[];
   // Search only when catalog/FAQ context is weak and the question is plausibly factual/compatibility-related.
-  if (LINKUP_API_KEY && ((relevantProducts.length===0 && relevantFaqs.length===0 && /বাইক|মডেল|সকেট|হেডলাইট|compatible|compatibility|fit|ফিট|কানেক্টর|connector|স্পেসিফিকেশন|specification|car|truck|cng|toyota|honda|nissan|suzuki|mitsubishi|tata|mahindra|ট্রাক|গাড়ি|গাড়ি|সিএনজি/i.test(query)) || isBikeCompatibilityQuestion(context))) webResults=await linkupSearch(context);
+  if (LINKUP_API_KEY && ((relevantProducts.length===0 && relevantFaqs.length===0 && /বাইক|মডেল|সকেট|হেডলাইট|compatible|compatibility|fit|ফিট|কানেক্টর|connector|স্পেসিফিকেশন|specification/i.test(query)) || isBikeCompatibilityQuestion(query))) webResults=await linkupSearch(query);
   const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,webResults);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
-  const audio=attachments.find(x=>(x.type==='audio'||String(x.mime_type||x.mimeType||'').toLowerCase().startsWith('audio/'))&&x.payload?.url);
-  if(audio){
-    try {
-      const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:20000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
-      const audioBuffer=Buffer.from(r.data);
-      if(!audioBuffer.length)throw new Error('Downloaded audio is empty');
-      const prepared=await prepareAudioForModel(audioBuffer,r.headers['content-type']||audio.mime_type||audio.mimeType||'',audio.payload.url);
-      const audioPrompt='এটি গ্রাহকের পাঠানো ভয়েস মেসেজ। অডিওটি মনোযোগ দিয়ে শুনে, কথাটি যে ভাষায় বলা হয়েছে তা বুঝে নিন; এরপর গ্রাহককে স্বাভাবিক বাংলায় সংক্ষিপ্ত উত্তর দিন। অডিও অস্পষ্ট বা অসম্পূর্ণ হলে কোনো কথা বানিয়ে না বলে কোন অংশটি পরিষ্কার নয় তা জানিয়ে আবার ভয়েস বা লিখে পাঠাতে বলুন।';
-      return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:audioPrompt},{type:'input_audio',input_audio:{data:prepared.data,format:prepared.format}}]}],VOICE_MODEL));
-    } catch(e) {
-      console.error('[VOICE] Failed:',e.response?.data?.error?.message||e.message);
-      return 'আপনার ভয়েস মেসেজটি পরিষ্কারভাবে বুঝতে পারিনি। অনুগ্রহ করে আরেকবার ভয়েস পাঠান অথবা কথাটি লিখে দিন—আমি সাহায্য করছি।';
-    }
-  }
+  const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
+  if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন। অনিশ্চিত হলে তা জানান।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL));}catch(e){console.error('[VOICE] Failed:',e.message);}}
   const image=attachments.find(x=>x.type==='image'&&x.payload?.url);
-  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:20000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');const mime=String(r.headers['content-type']||image.mime_type||image.mimeType||'image/jpeg').split(';')[0];return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি দেখে সাহায্য করুন; পণ্যের পরিচয় নিশ্চিত না হলে অনুমান করবেন না।`},{type:'image_url',image_url:{url:`data:${mime};base64,${base64}`}}]}],TEXT_MODEL));}catch(e){console.error('[VISION] Failed:',e.response?.data?.error?.message||e.message);return 'ছবিটি এখন খুলে দেখতে সমস্যা হচ্ছে। অনুগ্রহ করে ছবিটি আবার পাঠান অথবা পণ্যটির নাম লিখুন।';}}
+  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি দেখে সাহায্য করুন; নিশ্চিত না হলে অনুমান করবেন না।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]));}catch(e){console.error('[VISION] Failed:',e.message);}}
   return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:query}]));
 }
+async function buildVerifiedFitmentReply(senderId, customerText) {
+  const allText = getRecentConversationText(senderId, customerText);
+  const exactVehicle = identifyBikeModel(allText);
+  const vehicleMatch = allText.match(/(?:yamaha|bajaj|tvs|hero|honda|suzuki|discover\s*125|pulsar\s*(?:ns)?\s*\d{2,3}|apache\s*(?:rtr)?\s*\d{2,3}|fz\s*\d{0,2}|r15)[^।.!?\n]{0,60}/i);
+  const vehicle = (exactVehicle?.brand && exactVehicle?.model) ? `${exactVehicle.brand} ${exactVehicle.model}` : (vehicleMatch?.[0] || '').trim();
+  const yearMatch = allText.match(/(?:19|20)\d{2}|(?:সাল|year|বছর)\s*[:：-]?\s*(\d{2,4})/i);
+  if (!vehicle) return 'আপনার বাইক/গাড়ির সম্পূর্ণ ব্র্যান্ড ও মডেল, সম্ভব হলে সাল/ভ্যারিয়েন্ট লিখুন। শুধু মডেল অনুমান করে H4/3-pin প্লাগ নিশ্চিত বলা ঠিক হবে না।';
+
+  const results = await linkupSearch(`${vehicle} ${yearMatch?.[0] || ''} headlight socket connector H4 3-pin P43t PX43t HS1 AC DC headlight supply`).catch(() => []);
+  const evidence = (Array.isArray(results) ? results : []).map(r => `${r.name || ''} ${r.content || ''} ${r.url || ''}`).join('\n');
+  const hasSocketEvidence = /\bH4\b|\b9003\b|\bHB2\b|\bP43t\b|\bPX43t\b|\b3[ -]?pin\b|three[- ]pin|৩\s*পিন|তিন\s*পিন/i.test(evidence);
+  const hasModelEvidence = normalizeText(evidence).includes(normalizeText(vehicle)) || (exactVehicle && normalizeText(evidence).includes(normalizeText(exactVehicle.model)));
+  const hasACHeadlightEvidence = /AC headlight|AC lighting|alternating current.*headlight|headlight.*AC supply|এসি.*হেডলাইট|এসি.*হেড লাইট|এসি কারেন্ট.*হেডলাইট/i.test(evidence);
+  const hasDCSupplyEvidence = /DC headlight|DC lighting|direct current.*headlight|headlight.*DC supply|ডিসি.*হেডলাইট|ডিসি কারেন্ট.*হেডলাইট/i.test(evidence);
+  if (hasSocketEvidence && hasModelEvidence) {
+    let reply = `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''} মডেল সম্পর্কে অনলাইন ফলাফলে H4/সমজাতীয় 3-pin কানেক্টরের তথ্য পাওয়া গেছে। কানেক্টরটি সরাসরি মিলে গেলে আমাদের H4 হেডলাইট প্লাগ-অ্যান্ড-প্লে ব্যবহার করা যাবে।`;
+    if (hasACHeadlightEvidence && !hasDCSupplyEvidence) reply += ' নোট: এই মডেলের হেডলাইট AC সাপ্লাইয়ে চলার তথ্য পাওয়া গেছে; ব্যবহার করার আগে DC-তে কনভার্ট করতে হবে।';
+    else if (!hasDCSupplyEvidence) reply += ' ভ্যারিয়েন্টভেদে সকেট/ভোল্টেজ বদলাতে পারে—পুরোনো প্লাগের ছবি মিলিয়ে নিন।';
+    return reply;
+  }
+  if (results.length) return `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''} মডেলের H4/3-pin প্লাগ এবং AC/DC সাপ্লাই নির্ভরযোগ্য সূত্রে নিশ্চিত করতে পারিনি। ভুল তথ্য না দিতে পুরোনো হেডলাইটের কানেক্টরের পরিষ্কার ছবি, গায়ের লেখা এবং বাইকের সাল/ভ্যারিয়েন্ট পাঠান; যাচাই করে জানাব।`;
+  return `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''} মডেলের H4/3-pin প্লাগের তথ্য এখন নির্ভরযোগ্যভাবে যাচাই করা যায়নি। পুরোনো হেডলাইটের কানেক্টরের পরিষ্কার ছবি এবং বাইকের সাল/ভ্যারিয়েন্ট পাঠান। প্লাগ মিললেই শুধু প্লাগের দিক থেকে plug-and-play হবে; AC সাপ্লাই থাকলে DC conversion লাগতে পারে।`;
+}
+
 function isCriticalHandoverQuestion(text='') { return /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/i.test(text); }
 function isConfusionReply(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|ঠিক আছে|yes|yeah|y|ok|okay|sure|না|no|nope|n)$/i.test(normalizeText(text)); }
 
@@ -748,12 +699,11 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     if(isExplicitOrderIntent(customerText)){await handleOrderFlow(id,customerText,messageId);return;}
     if(isCriticalHandoverQuestion(customerText)){await askHandoverConsent(id,'Critical customer issue');return;}
     const priorVehicleFitmentContext=getRecentConversationText(id,customerText);
-    const contextualVehicleFitment = ((/(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit)/i.test(customerText) || !!identifyBikeModel(customerText) || isAcDcQuestion(customerText)) && /(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মডেল|model|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata|dream neo)/i.test(priorVehicleFitmentContext) && /(?:হেডলাইট|headlight|h4|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|সকেট|plug|প্লাগ|ac|dc|এসি|ডিসি)/i.test(priorVehicleFitmentContext));
-    if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment) {
-      if (!isAcDcQuestion(customerText) && (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(getRecentConversationText(id,customerText)) || isH4Confirmed(getRecentConversationText(id,customerText)) || hasConfirmedModelFitment(getRecentConversationText(id,customerText)))) { await sendFacebookMessage(id,limitToFiveLines(bikeReply(customerText,id))); return; }
-      const researchedReply=await generateAIResponse(customerText,attachments,id);
-      if (researchedReply && !researchedReply.includes(HANDOVER_MARKER) && !/আমার প্রশ্নটা বুঝতে সমস্যা|বুঝতে সমস্যা হচ্ছে|প্রশ্নটি বুঝতে পারিনি/i.test(researchedReply)) { await sendFacebookMessage(id,limitToFiveLines(researchedReply)); return; }
-      await sendFacebookMessage(id,bikeClarification()); return;
+    const contextualVehicleFitment = /(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit)/i.test(customerText) && /(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মডেল|model|toyota|honda|nissan|suzuki|yamaha|bajaj|discover\s*125|pulsar|tvs|hero|mahindra|tata)/i.test(priorVehicleFitmentContext) && /(?:হেডলাইট|headlight|h4|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|সকেট|plug|প্লাগ)/i.test(priorVehicleFitmentContext);
+    if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment || isVehicleModelMention(customerText)) {
+      const researchedReply = await buildVerifiedFitmentReply(id, customerText);
+      await sendFacebookMessage(id, limitToFiveLines(researchedReply));
+      return;
     }
     if(isBillingQuestion(customerText)) {
       const context=getRecentConversationText(id,customerText);
@@ -796,27 +746,18 @@ app.post('/webhook',async(req,res)=>{
     if(req.body?.object!=='page')return;
     for(const entry of req.body.entry||[])for(const event of entry.messaging||[]) {
       const senderId=event.sender?.id,message=event.message,messageId=message?.mid;
-      // Admin control commands sent from the Facebook Page Inbox arrive as message echoes.
-      // For echo events, the recipient is the customer whose AI/takeover state should change.
-      if(message?.is_echo && typeof message.text === 'string') {
-        const command=String(message.text).trim().toLowerCase().replace(/\s+/g,'');
-        const targetCustomerId=String(event.recipient?.id || '').trim();
-        const commandMap={'.human':'human','.stop':'human','.ai':'ai'};
-        const action=commandMap[command];
-        if(action && targetCustomerId) {
-          if(action==='human') {
-            await setTakeoverState(targetCustomerId,true,`Admin Inbox command ${command}`);
-            delete db.pendingHandover[targetCustomerId];
-            saveStorage();
-            console.log(`[Admin Inbox] Human takeover enabled for ${targetCustomerId} via ${command}`);
-          } else {
-            await setTakeoverState(targetCustomerId,false,'Admin Inbox command .ai');
-            delete db.pendingHandover[targetCustomerId];
-            saveStorage();
-            console.log(`[Admin Inbox] AI resumed for ${targetCustomerId} via .ai`);
-          }
+      // Page/admin chat commands arrive as Messenger message echoes. Apply them to the recipient thread.
+      if (message?.is_echo && message?.text && event.recipient?.id) {
+        const echoCommand = normalizeText(message.text).replace(/\s+/g, '');
+        const targetCustomerId = String(event.recipient.id);
+        if (['.human','.stop','.pause'].includes(echoCommand)) {
+          await setTakeoverState(targetCustomerId, true, `Admin chat command ${echoCommand}`);
+          console.log(`[Takeover] Admin enabled human takeover for ${targetCustomerId} via ${echoCommand}`);
+        } else if (['.ai','.resume'].includes(echoCommand)) {
+          delete db.pendingHandover[targetCustomerId];
+          await setTakeoverState(targetCustomerId, false, `Admin chat command ${echoCommand}`);
+          console.log(`[Takeover] Admin resumed AI for ${targetCustomerId} via ${echoCommand}`);
         }
-        // Never feed Page Inbox echoes or admin commands back into the AI reply pipeline.
         continue;
       }
       if(event.call && senderId) {
@@ -840,21 +781,36 @@ app.post('/webhook',async(req,res)=>{
         const now=new Date().toISOString(),paused=getTakeoverState(senderId);
         appendHistory(senderId,'user',text||'[Media File]');
         addStoredMessage({id:'msg_'+crypto.randomUUID(),senderId,sender:'customer',text:text||`[Media: ${attachments[0]?.type||'file'}]`,timestamp:now,messageId:messageId||null});
-        if(!db.customers[senderId])db.customers[senderId]={id:senderId,name:`Customer ${senderId.slice(-4)}`,messageCount:1,lastActive:now,lastCustomerMessageAt:now,lastMessageId:messageId||null,isPaused:paused,takeover:paused,lastMessageText:text||'[Media]',firstContactIntroSent:false};
+        if(!db.customers[senderId])db.customers[senderId]={id:senderId,name:`Customer ${senderId.slice(-4)}`,messageCount:1,lastActive:now,lastCustomerMessageAt:now,lastMessageId:messageId||null,isPaused:paused,takeover:paused,lastMessageText:text||'[Media]'};
         else {const c=db.customers[senderId];c.messageCount=(c.messageCount||0)+1;c.lastActive=now;c.lastCustomerMessageAt=now;c.lastMessageId=messageId||null;c.lastMessageText=text||'[Media]';}
-        // Send a one-time introduction before handling the customer's first message.
-        const customerRecord=db.customers[senderId];
-        if(!customerRecord.firstContactIntroSent) {
-          const introSent=await sendFacebookMessage(senderId,FIRST_CONTACT_INTRO);
-          if(introSent) { customerRecord.firstContactIntroSent=true; customerRecord.firstContactIntroSentAt=now; saveStorage(); }
-        }
         if(text)updateCustomerMemory(senderId,text);
-        // Accumulate phone/address across messages and auto-transfer once both are present.
+        // One-time first-contact introduction; persisted to avoid repeating it on every message.
+        const customerRecord = db.customers[senderId] || {};
+        const command = normalizeText(text).replace(/\s+/g, '');
+        if (!customerRecord.introSent && !['.human','.stop','.pause','.ai','.resume'].includes(command)) {
+          customerRecord.introSent = true; db.customers[senderId] = customerRecord; saveStorage();
+          await sendFacebookMessage(senderId, FIRST_CONTACT_INTRO);
+        }
+        if (['.human','.stop','.pause'].includes(command)) {
+          await setTakeoverState(senderId, true, `Chat command ${command}`);
+          await sendFacebookMessage(senderId, 'Human takeover চালু হয়েছে। এখন প্রতিনিধি কথোপকথন পরিচালনা করবেন। AI আবার চালু করতে .ai লিখুন।');
+          return;
+        }
+        if (['.ai','.resume'].includes(command)) {
+          // A customer must not be able to override an admin/representative takeover.
+          if (getTakeoverState(senderId)) {
+            await sendFacebookMessage(senderId, 'এই কথোপকথনে Human takeover চালু আছে। AI আবার চালু করতে আমাদের প্রতিনিধি অ্যাডমিন চ্যাট থেকে .ai কমান্ড দেবেন।');
+          } else {
+            await sendFacebookMessage(senderId, 'AI চ্যাটবট ইতোমধ্যে চালু আছে। কীভাবে সাহায্য করতে পারি?');
+          }
+          return;
+        }
+        // Accumulate phone/address across messages and auto-transfer when contact information is shared. 
         const c=db.customers[senderId]||{}; const phone=extractPhone(text); const address=extractAddress(text);
         if(phone)c.phone=phone; if(address)c.address=address; db.customers[senderId]=c;
         const completeAddress=String(c.address||'').trim().length>=10;
         if(phone || address) { const mem=getCustomerMemory(senderId); if(phone)addUniqueMemoryItem(mem.facts,`ফোন: ${phone}`); if(address)addUniqueMemoryItem(mem.facts,`ঠিকানা: ${address}`); mem.updatedAt=new Date().toISOString(); }
-        if(c.phone && completeAddress && !db.orderDrafts[senderId] && !getTakeoverState(senderId)) { saveStorage(); await setTakeoverState(senderId,true,'Customer provided phone number and full address'); await sendFacebookMessage(senderId,`আপনার ফোন নম্বর ও ঠিকানা পেয়েছি। বিষয়টি আমাদের প্রতিনিধি টিমের কাছে পাঠানো হয়েছে। প্রয়োজনে সরাসরি কল করুন: ${HELPLINE}`); return; }
+        if((phone || address) && !db.orderDrafts[senderId] && !getTakeoverState(senderId)) { saveStorage(); await setTakeoverState(senderId,true,phone && address ? 'Customer provided phone number and full address' : phone ? 'Customer shared phone number' : 'Customer shared address'); await sendFacebookMessage(senderId, phone && address ? `আপনার ফোন নম্বর ও ঠিকানা পেয়েছি। বিষয়টি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে সরাসরি কল করুন: ${HELPLINE}` : phone ? `আপনার ফোন নম্বর পেয়েছি। আপনার অনুরোধটি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}` : `আপনার ঠিকানা পেয়েছি। আপনার অনুরোধটি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}`); return; }
         if(!paused&&!customerHasOrder(senderId))scheduleFollowup(senderId,Date.now());else cancelFollowup(senderId);
         saveStorage();if(paused)return;
         if(event.call || /(?:আমি\s*কল করছি|কল করতে চাই|আপনাদের কল করছি|call me|calling you|i want to call|call your number|ফোন করছি)/i.test(text)) { await setTakeoverState(senderId,true,'Customer initiated/asked for a call'); await sendFacebookMessage(senderId,`আপনার জন্য Human takeover চালু করা হয়েছে। দ্রুত সহায়তার জন্য সরাসরি কল করুন: ${HELPLINE}`); return; }
@@ -883,17 +839,6 @@ app.post('/api/customers/:senderId/takeover',async(req,res)=>{const {senderId}=r
 app.get('/api/customers/:senderId/status',(req,res)=>{const id=String(req.params.senderId),on=getTakeoverState(id);res.json({success:true,senderId:id,isPaused:on,takeover:on,reason:db.takeovers[id]?.reason||null,updatedAt:db.takeovers[id]?.timestamp||null});});
 app.post('/api/customers/:senderId/takeover/enable',async(req,res)=>{await setTakeoverState(req.params.senderId,true,req.body?.reason||'Enabled from admin chat');res.json({success:true,senderId:req.params.senderId,takeover:true,isPaused:true});});
 app.post('/api/customers/:senderId/takeover/disable',async(req,res)=>{await setTakeoverState(req.params.senderId,false,req.body?.reason||'Disabled from admin chat');res.json({success:true,senderId:req.params.senderId,takeover:false,isPaused:false});});
-// Convenience endpoint for an admin chat box to toggle AI without removing existing API routes.
-app.post('/api/customers/:senderId/ai-control',async(req,res)=>{
-  const id=String(req.params.senderId||'').trim();
-  const command=String(req.body?.command||'').trim().toLowerCase();
-  if(!id)return res.status(400).json({success:false,message:'senderId required'});
-  if(!['.human','.stop','.ai','human','stop','ai'].includes(command))return res.status(400).json({success:false,message:'Supported commands: .human, .stop, .ai'});
-  const enabled=['.human','.stop','human','stop'].includes(command);
-  await setTakeoverState(id,enabled,`Admin API command ${command}`);
-  delete db.pendingHandover[id];saveStorage();
-  return res.json({success:true,senderId:id,isPaused:enabled,takeover:enabled,aiEnabled:!enabled,command});
-});
 app.get('/api/customers',(req,res)=>{const list=Object.values(db.customers).map(c=>({senderId:c.id,displayName:c.name||`Customer ${String(c.id).slice(-4)}`,phone:c.phone||null,address:c.address||null,lastMessageText:c.lastMessageText||null,lastMessageAt:c.lastActive||null,messageCount:c.messageCount||0,lastOrderId:c.lastOrderId||null,lastOrderAt:c.lastOrderAt||null,takeover:getTakeoverState(c.id),isPaused:getTakeoverState(c.id),takeoverReason:db.takeovers[c.id]?.reason||null,takeoverUpdatedAt:db.takeovers[c.id]?.timestamp||null,memoryUpdatedAt:c.lastMemoryUpdatedAt||null}));res.json({success:true,total:list.length,data:list});});
 app.get('/api/customers/:senderId/memory',(req,res)=>res.json({success:true,senderId:String(req.params.senderId),memory:db.customerMemory[String(req.params.senderId)]||null}));
 app.put('/api/customers/:senderId/memory',(req,res)=>{const id=String(req.params.senderId),body=req.body||{},m=getCustomerMemory(id);if(Array.isArray(body.facts))m.facts=body.facts.filter(x=>typeof x==='string').map(x=>x.trim()).filter(Boolean).slice(-30);if(Array.isArray(body.preferences))m.preferences=body.preferences.filter(x=>typeof x==='string').map(x=>x.trim()).filter(Boolean).slice(-20);if(typeof body.summary==='string')m.summary=body.summary.slice(0,3000);m.updatedAt=new Date().toISOString();saveStorage();res.json({success:true,senderId:id,memory:m});});
