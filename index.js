@@ -648,7 +648,11 @@ async function exaSearch(query) {
       content: String(x.text || x.highlights?.join(' ') || x.summary || '').slice(0, 1200)
     })).filter(x => x.content || x.url);
   } catch (e) {
-    console.error('[EXA] Search failed:', e.response?.data?.error || e.response?.data?.message || e.message);
+    console.error('[EXA] Search failed', {
+      status: e.response?.status ?? null,
+      code: e.response?.data?.error?.code ?? e.response?.data?.code ?? e.code ?? null,
+      message: e.response?.data?.error?.message ?? e.response?.data?.message ?? e.message
+    });
     return [];
   }
 }
@@ -666,8 +670,21 @@ function buildSystemPrompt(relevantProducts,relevantFaqs,history,memoryContext,w
 }
 async function callOpenRouter(messages,model=TEXT_MODEL) {
   if(!OPENROUTER_API_KEY)throw new Error('OPENROUTER_API_KEY is not configured');
-  const r=await axios.post(OPENROUTER_URL,{model,messages,max_tokens:MAX_OUTPUT_TOKENS,temperature:0.2},{headers:{Authorization:`Bearer ${OPENROUTER_API_KEY}`,'Content-Type':'application/json','HTTP-Referer':'https://github.com/impotechaibot/Impotech-bot','X-Title':'ImpoTech Messenger AI Bot'},timeout:30000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
-  const choice=r.data?.choices?.[0];if(!choice)throw new Error('OpenRouter returned no response');let reply=choice.message?.content;if(Array.isArray(reply))reply=reply.map(x=>x?.text||'').join('');reply=String(reply||'').trim();if(!reply||choice.finish_reason==='length')throw new Error('AI response empty or truncated');return reply;
+  console.log('[OpenRouter] Request started', { model, messageCount: messages.length });
+  try {
+    const r=await axios.post(OPENROUTER_URL,{model,messages,max_tokens:MAX_OUTPUT_TOKENS,temperature:0.2},{headers:{Authorization:`Bearer ${OPENROUTER_API_KEY}`,'Content-Type':'application/json','HTTP-Referer':'https://github.com/impotechaibot/Impotech-bot','X-Title':'ImpoTech Messenger AI Bot'},timeout:30000,maxContentLength:MAX_ATTACHMENT_BYTES,maxBodyLength:MAX_ATTACHMENT_BYTES});
+    const choice=r.data?.choices?.[0];if(!choice)throw new Error('OpenRouter returned no response');let reply=choice.message?.content;if(Array.isArray(reply))reply=reply.map(x=>x?.text||'').join('');reply=String(reply||'').trim();if(!reply||choice.finish_reason==='length')throw new Error('AI response empty or truncated');
+    console.log('[OpenRouter] Response received', { model, replyLength: reply.length });
+    return reply;
+  } catch (e) {
+    console.error('[OpenRouter] Request failed', {
+      status: e.response?.status ?? null,
+      code: e.response?.data?.error?.code ?? e.response?.data?.code ?? e.code ?? null,
+      message: e.response?.data?.error?.message ?? e.response?.data?.message ?? e.message,
+      model
+    });
+    throw e;
+  }
 }
 async function generateAIResponse(customerText,attachments=[],senderId) {
   const query=customerText||'ছবিটি বা পাঠানো ফাইলটি দেখে সাহায্য করুন';let history=getHistory(senderId).slice();
@@ -692,25 +709,45 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
 async function buildVerifiedFitmentReply(senderId, customerText) {
   const allText = getRecentConversationText(senderId, customerText);
   const exactVehicle = identifyBikeModel(allText);
-  const vehicleMatch = allText.match(/(?:yamaha|bajaj|tvs|hero|honda|suzuki|discover\s*125|pulsar\s*(?:ns)?\s*\d{2,3}|apache\s*(?:rtr)?\s*\d{2,3}|fz\s*\d{0,2}|r15)[^।.!?\n]{0,60}/i);
-  const vehicle = (exactVehicle?.brand && exactVehicle?.model) ? `${exactVehicle.brand} ${exactVehicle.model}` : (vehicleMatch?.[0] || '').trim();
+  const vehicleMatch = allText.match(/(?:yamaha|bajaj|tvs|hero|honda|suzuki|toyota|nissan|mitsubishi|mahindra|tata|maruti|suzuki|discover\s*125|pulsar\s*(?:ns)?\s*\d{2,3}|apache\s*(?:rtr)?\s*\d{2,3}|fz\s*v?\s*\d{0,2}|r15|alto|wagon\s*r|swift|corolla|civic|city|vitz|premio|fielder|axio|prius)[^।.!?\n]{0,60}/i);
+  const vehicle = (exactVehicle?.brand && exactVehicle?.model)
+    ? `${exactVehicle.brand} ${exactVehicle.model}`
+    : (vehicleMatch?.[0] || '').trim();
   const yearMatch = allText.match(/(?:19|20)\d{2}|(?:সাল|year|বছর)\s*[:：-]?\s*(\d{2,4})/i);
-  if (!vehicle) return 'আপনার বাইক/গাড়ির সম্পূর্ণ ব্র্যান্ড ও মডেল, সম্ভব হলে সাল/ভ্যারিয়েন্ট লিখুন। শুধু মডেল অনুমান করে H4/3-pin প্লাগ নিশ্চিত বলা ঠিক হবে না।';
 
-  const results = await exaSearch(`${vehicle} ${yearMatch?.[0] || ''} headlight socket connector H4 3-pin P43t PX43t HS1 AC DC headlight supply`).catch(() => []);
-  const evidence = (Array.isArray(results) ? results : []).map(r => `${r.name || ''} ${r.content || ''} ${r.url || ''}`).join('\n');
-  const hasSocketEvidence = /\bH4\b|\b9003\b|\bHB2\b|\bP43t\b|\bPX43t\b|\b3[ -]?pin\b|three[- ]pin|৩\s*পিন|তিন\s*পিন/i.test(evidence);
-  const hasModelEvidence = normalizeText(evidence).includes(normalizeText(vehicle)) || (exactVehicle && normalizeText(evidence).includes(normalizeText(exactVehicle.model)));
-  const hasACHeadlightEvidence = /AC headlight|AC lighting|alternating current.*headlight|headlight.*AC supply|এসি.*হেডলাইট|এসি.*হেড লাইট|এসি কারেন্ট.*হেডলাইট/i.test(evidence);
-  const hasDCSupplyEvidence = /DC headlight|DC lighting|direct current.*headlight|headlight.*DC supply|ডিসি.*হেডলাইট|ডিসি কারেন্ট.*হেডলাইট/i.test(evidence);
-  if (hasSocketEvidence && hasModelEvidence) {
-    let reply = `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''} মডেল সম্পর্কে অনলাইন ফলাফলে H4/সমজাতীয় 3-pin কানেক্টরের তথ্য পাওয়া গেছে। কানেক্টরটি সরাসরি মিলে গেলে আমাদের H4 হেডলাইট প্লাগ-অ্যান্ড-প্লে ব্যবহার করা যাবে।`;
-    if (hasACHeadlightEvidence && !hasDCSupplyEvidence) reply += ' নোট: এই মডেলের হেডলাইট AC সাপ্লাইয়ে চলার তথ্য পাওয়া গেছে; ব্যবহার করার আগে DC-তে কনভার্ট করতে হবে।';
-    else if (!hasDCSupplyEvidence) reply += ' ভ্যারিয়েন্টভেদে সকেট/ভোল্টেজ বদলাতে পারে—পুরোনো প্লাগের ছবি মিলিয়ে নিন।';
-    return reply;
+  if (!vehicle) {
+    return 'আপনার গাড়ি/বাইকের ব্র্যান্ড, সঠিক মডেল ও সম্ভব হলে সাল/ভ্যারিয়েন্ট লিখুন। শুধু অনুমান করে সকেট টাইপ নিশ্চিত বলা ঠিক হবে না।';
   }
-  if (results.length) return `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''} মডেলের H4/3-pin প্লাগ এবং AC/DC সাপ্লাই নির্ভরযোগ্য সূত্রে নিশ্চিত করতে পারিনি। ভুল তথ্য না দিতে পুরোনো হেডলাইটের কানেক্টরের পরিষ্কার ছবি, গায়ের লেখা এবং বাইকের সাল/ভ্যারিয়েন্ট পাঠান; যাচাই করে জানাব।`;
-  return `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''} মডেলের H4/3-pin প্লাগের তথ্য এখন নির্ভরযোগ্যভাবে যাচাই করা যায়নি। পুরোনো হেডলাইটের কানেক্টরের পরিষ্কার ছবি এবং বাইকের সাল/ভ্যারিয়েন্ট পাঠান। প্লাগ মিললেই শুধু প্লাগের দিক থেকে plug-and-play হবে; AC সাপ্লাই থাকলে DC conversion লাগতে পারে।`;
+
+  if (!EXA_API_KEY) {
+    console.warn('[FITMENT] EXA_API_KEY missing; socket fitment cannot be verified');
+    return `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর সকেট টাইপ এখন অনলাইনে যাচাই করতে পারছি না। মডেল ইয়ার/ভ্যারিয়েন্ট এবং পুরোনো হেডলাইটের প্লাগের পরিষ্কার ছবি পাঠান; অনুমান করে H4/3-pin নিশ্চিত বলব না।`;
+  }
+
+  const query = `"${vehicle}" ${yearMatch?.[0] || ''} original headlight bulb socket type H4 HS1 H7 H11 9003 HB2 P43t PX43t connector`;
+  const results = await exaSearch(query).catch(() => []);
+  const socketPattern = /\bH\s*-?\s*4\b|\bHS\s*-?\s*1\b|\bH\s*-?\s*7\b|\bH\s*-?\s*11\b|\bH\s*-?\s*3\b|\b9003\b|\bHB2\b|\bP43t\b|\bPX43t\b|\bH1\b|\bH13\b|\bH6M\b|\b3[ -]?pin\b|three[- ]pin|৩\s*পিন|তিন\s*পিন/i;
+  const vehicleTokens = [vehicle, exactVehicle?.model].filter(Boolean).map(normalizeText).filter(x => x.length >= 3);
+  const verified = (Array.isArray(results) ? results : []).map(r => {
+    const title = String(r.name || '');
+    const content = String(r.content || '');
+    const url = String(r.url || '');
+    const combined = `${title}\n${content}\n${url}`;
+    const normalized = normalizeText(combined);
+    const modelMatched = vehicleTokens.some(token => normalized.includes(token));
+    const socketMatch = combined.match(socketPattern);
+    return { title, url, content, modelMatched, socket: socketMatch?.[0] || '' };
+  }).find(r => r.modelMatched && r.socket);
+
+  if (verified) {
+    const socket = verified.socket.replace(/\s+/g, ' ').trim();
+    return `অনলাইন সূত্রে ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর জন্য ${socket} সকেটের উল্লেখ পেয়েছি। আপনার লাইটের প্লাগ একই টাইপ হলে সকেটের দিক থেকে ফিট হতে পারে; ভ্যারিয়েন্টভেদে পার্থক্য থাকতে পারে, তাই পুরোনো প্লাগের ছবি মিলিয়ে নিশ্চিত করুন।`;
+  }
+
+  if (results.length) {
+    return `${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর সকেট টাইপ নির্ভরযোগ্যভাবে নিশ্চিত করার মতো মিল পাওয়া যায়নি। ভুল ফিটমেন্ট না বলতে মডেল ইয়ার/ভ্যারিয়েন্ট এবং পুরোনো হেডলাইট প্লাগের পরিষ্কার ছবি পাঠান।`;
+  }
+  return `${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর সকেট টাইপ এখন যাচাই করা যায়নি। মডেল ইয়ার/ভ্যারিয়েন্ট এবং পুরোনো হেডলাইট প্লাগের পরিষ্কার ছবি পাঠালে মিলিয়ে জানাব; অনুমান করে H4/3-pin বলব না।`;
 }
 
 
@@ -754,11 +791,13 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     if(isCriticalHandoverQuestion(customerText)){await askHandoverConsent(id,'Critical customer issue');return;}
     const priorVehicleFitmentContext=getRecentConversationText(id,customerText);
     const contextualVehicleFitment = /(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit)/i.test(customerText) && /(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মডেল|model|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata)/i.test(priorVehicleFitmentContext) && /(?:হেডলাইট|headlight|h4|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|সকেট|plug|প্লাগ)/i.test(priorVehicleFitmentContext);
-    if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment) {
-      if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(customerText) || isH4Confirmed(getRecentConversationText(id,customerText))) { await sendFacebookMessage(id,limitToFiveLines(bikeReply(customerText,id))); return; }
-      const researchedReply=await generateAIResponse(customerText,attachments,id);
-      if (researchedReply && !researchedReply.includes(HANDOVER_MARKER) && !/আমার প্রশ্নটা বুঝতে সমস্যা|বুঝতে সমস্যা হচ্ছে|প্রশ্নটি বুঝতে পারিনি/i.test(researchedReply)) { await sendFacebookMessage(id,limitToFiveLines(researchedReply)); return; }
-      await sendFacebookMessage(id,bikeClarification()); return;
+    const indexedVehicle = identifyBikeModel(getRecentConversationText(id, customerText));
+    if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment || indexedVehicle) {
+      // Socket fitment is answered only from Exa evidence tied to the named model.
+      // Never infer H4/3-pin merely because the customer mentioned a vehicle or socket.
+      const fitmentReply = await buildVerifiedFitmentReply(id, customerText);
+      await sendFacebookMessage(id, limitToFiveLines(fitmentReply));
+      return;
     }
     if(isBillingQuestion(customerText)) {
       const context=getRecentConversationText(id,customerText);
@@ -796,6 +835,21 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
 // -----------------------------------------------------------------------------
 app.get('/webhook',(req,res)=>{const mode=req.query['hub.mode'],token=req.query['hub.verify_token'],challenge=req.query['hub.challenge'];if(mode==='subscribe'&&VERIFY_TOKEN&&token===VERIFY_TOKEN)return res.status(200).send(challenge);return res.sendStatus(403);});
 app.post('/webhook',async(req,res)=>{
+  const incomingEntries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+  let incomingEvents = 0;
+  let incomingEchoes = 0;
+  for (const entry of incomingEntries) {
+    const events = Array.isArray(entry.messaging) ? entry.messaging : [];
+    incomingEvents += events.length;
+    incomingEchoes += events.filter(event => event.message?.is_echo === true).length;
+  }
+  console.log('[Webhook] POST received', {
+    object: req.body?.object ?? null,
+    entryCount: incomingEntries.length,
+    messagingEvents: incomingEvents,
+    echoEvents: incomingEchoes,
+    time: new Date().toISOString()
+  });
   res.status(200).send('EVENT_RECEIVED');
   try {
     if(req.body?.object!=='page')return;
