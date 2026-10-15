@@ -56,7 +56,7 @@ const MAX_FAQS_TO_AI = 5;
 const MAX_OUTPUT_TOKENS = 500;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
-const MAX_AI_LINES = 5;
+const MAX_AI_LINES = 9;
 const HISTORY_LIMIT = 20;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const MEMORY_RETENTION_DAYS = 20;
@@ -495,9 +495,14 @@ function isNo(text='') { return /^(না|না ধন্যবাদ|রাজ
 function extractPhone(text='') { const m=String(text).match(/(?:\+?8801|01)[0-9\s-]{8,14}/); if (!m) return null; const n=m[0].replace(/[\s-]/g,''); return /^\+?8801\d{9}$/.test(n) || /^01\d{9}$/.test(n) ? n : null; }
 function extractAddress(text='') {
   const t=String(text||'').trim();
+  if (!t || extractPhone(t)) return null;
+  // A city name inside a question (e.g. “রাজশাহীতে মোট বিল কত”) is not a delivery address.
+  if (/(মোট\s*বিল|বিল\s*কত|ডেলিভারি\s*চার্জ|দাম\s*কত|কত\s*টাকা|কত\s*হবে|price|bill|delivery\s*charge|how\s*much|total\s*cost)/i.test(t)) return null;
   const explicit=t.match(/(?:ঠিকানা|address|বাসা|বাড়ি|বাড়ি|গ্রাম|রোড|road|থানা|উপজেলা|জেলা|এলাকা|এলাকার নাম)\s*[:：-]?\s*(.{5,220})/i);
   if (explicit) return explicit[1].trim().replace(/[।.!?]+$/,'');
-  if (/(ঢাকা|গাজীপুর|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা|বরিশাল|রংপুর|ময়মনসিংহ|ময়মনসিংহ|কুমিল্লা|নারায়ণগঞ্জ|নারায়ণগঞ্জ|উপজেলা|থানা|গ্রাম|রোড|road|বাসা|বাড়ি|বাড়ি)/i.test(t) && t.length >= 8 && !extractPhone(t)) return t.slice(0,220);
+  const hasAddressLandmark=/(উপজেলা|থানা|গ্রাম|রোড|road|বাসা|বাড়ি|বাড়ি|ওয়ার্ড|ওয়ার্ড|লেন|lane|মহল্লা|বাজার|বাড়ি নম্বর|বাড়ি নম্বর)/i.test(t);
+  const hasMultipleParts=t.split(/[,،]/).map(x=>x.trim()).filter(Boolean).length>=3;
+  if (/(ঢাকা|গাজীপুর|চট্টগ্রাম|সিলেট|রাজশাহী|খুলনা|বরিশাল|রংপুর|ময়মনসিংহ|ময়মনসিংহ|কুমিল্লা|নারায়ণগঞ্জ|নারায়ণগঞ্জ)/i.test(t) && t.length >= 12 && (hasAddressLandmark || hasMultipleParts)) return t.slice(0,220);
   return null;
 }
 function identifyOrderedProduct(senderId, text) {
@@ -666,7 +671,7 @@ function buildSystemPrompt(relevantProducts,relevantFaqs,history,memoryContext,w
   const faqContext=relevantFaqs.length?relevantFaqs.map((f,i)=>`[FAQ ${i+1}] ${f.question||''}\n${f.answer||''}`).join('\n\n'):'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
   const historyContext=history.length?history.map(x=>`${x.role==='assistant'?'বট/প্রতিনিধি':'গ্রাহক'}: ${x.text}`).join('\n'):'পূর্ববর্তী কথোপকথন নেই।';
   const webContext=webResults.length?webResults.map((x,i)=>`[বাহ্যিক সার্চ ${i+1}] ${x.name}\n${x.content}\nURL: ${x.url}`).join('\n\n'):'কোনো বাহ্যিক সার্চ ফল নেই।';
-  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); সর্বোচ্চ ৫ লাইন। Smart Answer হিসেবে আগে কথোপকথন, গ্রাহক মেমোরি, প্রাসঙ্গিক ক্যাটালগ ও FAQ মিলিয়ে সরাসরি উত্তর দিন; একই প্রশ্ন বারবার করবেন না। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ২০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বাইক, কার, CNG, ভ্যান, পিকআপ ও ট্রাকসহ সব যানবাহনের মডেল/ব্র্যান্ড/সালকে BUILTIN_BIKE_DATABASE ইনডেক্সে খুঁজুন। গ্রাহক পরিচিত যানবাহনের নাম বললে সরাসরি উত্তর দিন: H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আমাদের 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে মডেল/বছরভেদে সকেট আলাদা হতে পারে, তাই অজানা fitment-কে নিশ্চিত বলবেন না; প্রয়োজনে একটি ছোট প্রশ্নে বছর/ভ্যারিয়েন্ট বা সকেটের ছবি চান। 35W/35/35W উল্লেখ করবেন না। H4/3-pin ও HS1-কে একই ধরে নেবেন না; দরকার হলে অ্যাডাপ্টার যাচাই করুন। পণ্যের প্রকৃত বিদ্যুৎ খরচ প্রমাণ ছাড়া কম বলে দাবি করবেন না। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক বা নিশ্চিত ফিটমেন্টের প্রমাণ ধরবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (শুধু সাধারণ প্রাসঙ্গিকতা):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
+  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক, বিস্তারিত কিন্তু Messenger-উপযোগী বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); প্রয়োজনে সর্বোচ্চ ৯টি ছোট লাইন/বুলেট ব্যবহার করুন। Gemini-ধাঁচের প্রাসঙ্গিক উত্তর দিন: প্রথম বাক্যেই সরাসরি উত্তর, তারপর কারণ/ফিটমেন্টের শর্ত এবং প্রয়োজন হলে পরবর্তী পদক্ষেপ। আগের কথোপকথন ও গ্রাহক মেমোরি থেকে ব্র্যান্ড, মডেল, সাল, পণ্য/ছবির প্রসঙ্গ ধরে রাখুন। ‘এটা’, ‘ওটা’, ‘ছবিটা’, ‘হবে?’, ‘দাম কত?’ বা ‘অর্ডার করব’ ধরনের ফলো-আপে আগের প্রাসঙ্গিক পণ্য/গাড়ি/বাইক বুঝে উত্তর দিন; আগে বলা তথ্য আবার জানতে চাইবেন না, যদি তা ইতিহাসে থাকে। গ্রাহক একাধিক মেসেজে তথ্য দিলে সেগুলো একত্রে বিবেচনা করুন। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ২০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বর্তমান মেসেজের সঙ্গে আগের মেসেজের যোগসূত্র বুঝুন; কথোপকথনে আগে উল্লেখিত মডেল থাকলে অকারণে আবার মডেল জিজ্ঞেস করবেন না। বাইক, কার, CNG, ভ্যান, পিকআপ ও ট্রাকসহ সব যানবাহনের মডেল/ব্র্যান্ড/সালকে BUILTIN_BIKE_DATABASE ইনডেক্সে খুঁজুন। গ্রাহক পরিচিত যানবাহনের নাম বললে সরাসরি উত্তর দিন: H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আমাদের 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে মডেল/বছরভেদে সকেট আলাদা হতে পারে, তাই অজানা fitment-কে নিশ্চিত বলবেন না; প্রয়োজনে একটি ছোট প্রশ্নে বছর/ভ্যারিয়েন্ট বা সকেটের ছবি চান। 35W/35/35W উল্লেখ করবেন না। H4/3-pin ও HS1-কে একই ধরে নেবেন না; দরকার হলে অ্যাডাপ্টার যাচাই করুন। পণ্যের প্রকৃত বিদ্যুৎ খরচ প্রমাণ ছাড়া কম বলে দাবি করবেন না। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক বা নিশ্চিত ফিটমেন্টের প্রমাণ ধরবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (শুধু সাধারণ প্রাসঙ্গিকতা):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
 }
 async function callOpenRouter(messages,model=TEXT_MODEL) {
   if(!OPENROUTER_API_KEY)throw new Error('OPENROUTER_API_KEY is not configured');
@@ -703,7 +708,7 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
   if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন। অনিশ্চিত হলে তা জানান।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL));}catch(e){console.error('[VOICE] Failed:',e.message);}}
   const image=attachments.find(x=>x.type==='image'&&x.payload?.url);
-  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি দেখে সাহায্য করুন; নিশ্চিত না হলে অনুমান করবেন না।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]));}catch(e){console.error('[VISION] Failed:',e.message);}}
+  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি বিশ্লেষণ করুন এবং আগের কথোপকথনে উল্লেখিত যানবাহন/পণ্যের সঙ্গে সম্পর্ক মিলিয়ে উত্তর দিন। আগে দেওয়া মডেল বা তথ্য পুনরায় জিজ্ঞেস করবেন না। ছবিতে যা স্পষ্ট দেখা যায় শুধু সেটিই বলুন; সকেট/ফিটমেন্ট নিশ্চিত না হলে তা স্পষ্ট করে জানান।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]));}catch(e){console.error('[VISION] Failed:',e.message);}}
   return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:query}]));
 }
 async function buildVerifiedFitmentReply(senderId, customerText) {
@@ -734,7 +739,7 @@ async function buildVerifiedFitmentReply(senderId, customerText) {
     const url = String(r.url || '');
     const combined = `${title}\n${content}\n${url}`;
     const normalized = normalizeText(combined);
-    const modelMatched = vehicleTokens.some(token => normalized.includes(token));
+    const modelMatched = vehicleTokens.some(token => normalized.includes(token)) && (!yearMatch || normalized.includes(normalizeText(yearMatch[0])) || normalized.includes(normalizeText(exactVehicle?.model || '')));
     const socketMatch = combined.match(socketPattern);
     return { title, url, content, modelMatched, socket: socketMatch?.[0] || '' };
   }).find(r => r.modelMatched && r.socket);
@@ -761,11 +766,24 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
   const id=String(senderId), customerText=String(text||'').trim();
   if(getTakeoverState(id)){console.log(`[Takeover] ${id} paused; AI skipped`);return;}
   try {
-    // Existing pending human handover: ask for explicit consent and respect refusal.
+    // A billing question must still be answered while an order draft or handover prompt is pending.
+    if (isBillingQuestion(customerText)) {
+      const context=getRecentConversationText(id,customerText);
+      const p=findExactProduct(customerText)||findExactProduct(context)||findProductFromRecentContext(id);
+      if (p) {
+        const quantity=extractQuantity(customerText)||extractQuantity(context)||Number(db.orderDrafts[id]?.quantity)||1;
+        const address=extractAddress(customerText)||db.orderDrafts[id]?.address||db.customers[id]?.address||extractAddress(context)||'';
+        const deliveryFee=getDeliveryFee(address);
+        await sendFacebookMessage(id,limitToFiveLines(buildSmartBillReply(p,quantity,deliveryFee)));
+        return;
+      }
+    }
+    // Pending handover only consumes a clear yes/no. A new substantive question cancels the prompt and is handled normally.
     if(db.pendingHandover[id] && !db.pendingHandover[id].orderDraft) {
       if(isYes(customerText)){await transferToHuman(id,db.pendingHandover[id].reason);return;}
       if(isNo(customerText)){delete db.pendingHandover[id];saveStorage();await sendFacebookMessage(id,'ঠিক আছে, আপাতত AI সহায়তা চালু থাকছে। কীভাবে সাহায্য করতে পারি?');return;}
-      await sendFacebookMessage(id,'প্রতিনিধির কাছে হস্তান্তর করতে সম্মতি দিলে “হ্যাঁ”, না চাইলে “না” লিখুন।');return;
+      delete db.pendingHandover[id]; saveStorage();
+      console.log(`[Handover] Cleared stale consent prompt for ${id}; processing new message normally`);
     }
     // Order draft in progress. A yes is consent to save/transfer only after all details are gathered.
     if(db.orderDrafts[id]) {
@@ -792,7 +810,9 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     const priorVehicleFitmentContext=getRecentConversationText(id,customerText);
     const contextualVehicleFitment = /(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit)/i.test(customerText) && /(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মডেল|model|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata)/i.test(priorVehicleFitmentContext) && /(?:হেডলাইট|headlight|h4|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|সকেট|plug|প্লাগ)/i.test(priorVehicleFitmentContext);
     const indexedVehicle = identifyBikeModel(getRecentConversationText(id, customerText));
-    if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment || indexedVehicle) {
+    const hasFitmentIntentNow = isBikeCompatibilityQuestion(customerText) || /(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit|সকেট|হেডলাইট|প্লাগ|৩\s*পিন|3\s*-?\s*pin|h4)/i.test(customerText);
+    const imageFollowup = attachments.some(a => a.type === 'image') && !!indexedVehicle;
+    if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment || (indexedVehicle && hasFitmentIntentNow) || imageFollowup) {
       // Socket fitment is answered only from Exa evidence tied to the named model.
       // Never infer H4/3-pin merely because the customer mentioned a vehicle or socket.
       const fitmentReply = await buildVerifiedFitmentReply(id, customerText);
@@ -942,7 +962,8 @@ app.post('/webhook',async(req,res)=>{
         if(phone)c.phone=phone; if(address)c.address=address; db.customers[senderId]=c;
         const completeAddress=String(c.address||'').trim().length>=10;
         if(phone || address) { const mem=getCustomerMemory(senderId); if(phone)addUniqueMemoryItem(mem.facts,`ফোন: ${phone}`); if(address)addUniqueMemoryItem(mem.facts,`ঠিকানা: ${address}`); mem.updatedAt=new Date().toISOString(); }
-        if((phone || address) && !db.orderDrafts[senderId] && !getTakeoverState(senderId)) { saveStorage(); await setTakeoverState(senderId,true,phone && address ? 'Customer provided phone number and full address' : phone ? 'Customer shared phone number' : 'Customer shared address'); await sendFacebookMessage(senderId, phone && address ? `আপনার ফোন নম্বর ও ঠিকানা পেয়েছি। বিষয়টি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}` : phone ? `আপনার ফোন নম্বর পেয়েছি। আপনার অনুরোধটি প্রতিনিধির কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}` : `আপনার ঠিকানা পেয়েছি। আপনার অনুরোধটি প্রতিনিধির কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}`); return; }
+        // Do not pause the bot for a city-only mention or phone-only message. Transfer automatically only when both phone and a full address are available, outside an active order flow.
+        if(phone && completeAddress && !db.orderDrafts[senderId] && !getTakeoverState(senderId)) { saveStorage(); await setTakeoverState(senderId,true,'Customer provided phone number and full address'); await sendFacebookMessage(senderId,`আপনার ফোন নম্বর ও সম্পূর্ণ ঠিকানা পেয়েছি। বিষয়টি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}`); return; }
         if(!paused&&!customerHasOrder(senderId))scheduleFollowup(senderId,Date.now());else cancelFollowup(senderId);
         saveStorage();if(paused)return;
         if(event.call || /(?:আমি\s*কল করছি|কল করতে চাই|আপনাদের কল করছি|call me|calling you|i want to call|call your number|ফোন করছি)/i.test(text)) { await setTakeoverState(senderId,true,'Customer initiated/asked for a call'); await sendFacebookMessage(senderId,`আপনার জন্য Human takeover চালু করা হয়েছে। দ্রুত সহায়তার জন্য সরাসরি কল করুন: ${HELPLINE}`); return; }
