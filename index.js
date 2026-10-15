@@ -51,12 +51,12 @@ const TEXT_MODEL = 'google/gemini-3.1-flash-lite';
 const VOICE_MODEL = TEXT_MODEL;
 const HELPLINE = process.env.HELPLINE || '+8809611042598';
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '01884332067';
-const MAX_PRODUCTS_TO_AI = 2;
-const MAX_FAQS_TO_AI = 3;
-const MAX_OUTPUT_TOKENS = 150;
+const MAX_PRODUCTS_TO_AI = 5;
+const MAX_FAQS_TO_AI = 5;
+const MAX_OUTPUT_TOKENS = 500;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
-const MAX_AI_LINES = 4;
+const MAX_AI_LINES = 9;
 const HISTORY_LIMIT = 20;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const MEMORY_RETENTION_DAYS = 20;
@@ -411,79 +411,22 @@ function getProductMediaReply(text, senderId) {
 }
 
 // -----------------------------------------------------------------------------
-// Motorcycle compatibility: do not infer unverified model/year fitment.
+// Vehicle headlight fitment: never diagnose socket/fitment in the AI.
+// If the customer asks whether a headlight/plug fits their named vehicle,
+// send the owner's exact representative-contact reply and handle later turns normally.
 // -----------------------------------------------------------------------------
-const BUILTIN_BIKE_DATABASE = [
-  // Motorcycle model index: names are searchable; socket fitment remains variant/year-specific unless sourced.
-  {brand:'Yamaha',model:'FZ',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['fz','fz-s','fzs','fz v2','fz v3','yamaha fz']},
-  {brand:'Yamaha',model:'FZ25',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['fz25','fz 25']},
-  {brand:'Yamaha',model:'R15',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['r15','r15 v2','r15 v3','r15 v4','r15m']},
-  {brand:'Yamaha',model:'Fazer',vehicleType:'motorcycle',fitment:'some year variants listed with H4; verify exact variant',aliases:['fazer','yamaha fazer','fazer fz']},
-  {brand:'Yamaha',model:'MT-07',vehicleType:'motorcycle',fitment:'H4 listed for certain model years; verify exact variant',aliases:['mt07','mt 07','yamaha mt-07']},
-  {brand:'Yamaha',model:'XT600',vehicleType:'motorcycle',fitment:'H4 listed for certain model years; verify exact variant',aliases:['xt600','xt 600','yamaha xt600']},
-  {brand:'Bajaj',model:'Discover 125',vehicleType:'motorcycle',fitment:'variant-dependent; HS1 used on some variants, do not assume direct H4',aliases:['discover 125','discover125','bajaj discover 125','ডিসকভার ১২৫','ডিসকভার 125']},
-  {brand:'Bajaj',model:'Discover 100',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['discover 100','discover100','bajaj discover 100']},
-  {brand:'Bajaj',model:'Pulsar 125',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 125','pulsar125','p125']},
-  {brand:'Bajaj',model:'Pulsar 150',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 150','pulsar150','p150']},
-  {brand:'Bajaj',model:'Pulsar 220',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar 220','pulsar220','p220']},
-  {brand:'Bajaj',model:'Pulsar NS200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['pulsar ns200','ns200','ns 200']},
-  {brand:'Bajaj',model:'Platina',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['platina','platina 100','platina 110']},
-  {brand:'Bajaj',model:'CT 100',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['ct100','ct 100','bajaj ct 100']},
-  {brand:'TVS',model:'Apache RTR 160',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['apache rtr 160','rtr160','apache 160']},
-  {brand:'TVS',model:'Apache RTR 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['apache rtr 200','rtr200','apache 200']},
-  {brand:'TVS',model:'Metro',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['tvs metro','metro plus']},
-  {brand:'TVS',model:'Sport',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['tvs sport','sport 100']},
-  {brand:'Hero',model:'Splendor',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['splendor','splendor plus','splendor+']},
-  {brand:'Hero',model:'HF Deluxe',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hf deluxe','hfdeluxe','hero hf deluxe']},
-  {brand:'Hero',model:'Glamour',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['hero glamour','glamour 125']},
-  {brand:'Honda',model:'CB Shine',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['cb shine','cbshine','shine']},
-  {brand:'Honda',model:'Dream 110',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['dream 110','dream neo','honda dream']},
-  {brand:'Honda',model:'Unicorn',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['honda unicorn','unicorn 150','unicorn 160']},
-  {brand:'Honda',model:'Grom',vehicleType:'motorcycle',fitment:'H4/HS1-base options exist in some market variants; verify exact model',aliases:['honda grom','grom 125','msx125','msx 125']},
-  {brand:'Suzuki',model:'Gixxer',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['gixxer','gixxer 150','gixxer sf']},
-  {brand:'Yamaha',model:'Saluto',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['saluto','yamaha saluto']},
-  {brand:'Yamaha',model:'Fascino',vehicleType:'scooter',fitment:'variant-dependent',aliases:['fascino','yamaha fascino']},
-  {brand:'Yamaha',model:'Ray ZR',vehicleType:'scooter',fitment:'variant-dependent',aliases:['ray zr','rayzr','yamaha ray zr']},
-  {brand:'KTM',model:'Duke 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['duke 200','ktm duke 200']},
-  {brand:'KTM',model:'RC 200',vehicleType:'motorcycle',fitment:'variant-dependent',aliases:['rc 200','ktm rc 200']},
-  // Cars and utility vehicles: indexed for fast lookup, but model/year/trim must be checked.
-  {brand:'Toyota',model:'Corolla',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota corolla','corolla gli','corolla xli','corolla axio','axio']},
-  {brand:'Toyota',model:'Allion',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota allion','allion']},
-  {brand:'Toyota',model:'Premio',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota premio','premio']},
-  {brand:'Toyota',model:'Probox',vehicleType:'car',fitment:'variant-dependent',aliases:['toyota probox','probox']},
-  {brand:'Toyota',model:'Hiace',vehicleType:'van',fitment:'variant-dependent',aliases:['toyota hiace','hiace','হাইএস']},
-  {brand:'Honda',model:'Civic',vehicleType:'car',fitment:'variant-dependent',aliases:['honda civic','civic']},
-  {brand:'Honda',model:'Fit/Jazz',vehicleType:'car',fitment:'variant-dependent',aliases:['honda fit','fit','honda jazz','jazz']},
-  {brand:'Honda',model:'City',vehicleType:'car',fitment:'variant-dependent',aliases:['honda city','city']},
-  {brand:'Nissan',model:'Sunny',vehicleType:'car',fitment:'variant-dependent',aliases:['nissan sunny','sunny']},
-  {brand:'Nissan',model:'AD Van',vehicleType:'van',fitment:'variant-dependent',aliases:['nissan ad','ad van','nissan ad van']},
-  {brand:'Suzuki',model:'Alto',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki alto','alto']},
-  {brand:'Suzuki',model:'Wagon R',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki wagon r','wagon r','wagonr']},
-  {brand:'Suzuki',model:'Swift',vehicleType:'car',fitment:'variant-dependent',aliases:['suzuki swift','swift']},
-  {brand:'Mitsubishi',model:'Lancer',vehicleType:'car',fitment:'variant-dependent',aliases:['mitsubishi lancer','lancer']},
-  {brand:'Tata',model:'Ace',vehicleType:'truck',fitment:'variant-dependent',aliases:['tata ace','ace mini truck','টাটা এস']},
-  {brand:'Tata',model:'407',vehicleType:'truck',fitment:'variant-dependent',aliases:['tata 407','407 truck']},
-  {brand:'Mahindra',model:'Bolero Pickup',vehicleType:'pickup',fitment:'variant-dependent',aliases:['mahindra bolero pickup','bolero pickup','bolero pikup']},
-  {brand:'Ashok Leyland',model:'Dost',vehicleType:'truck',fitment:'variant-dependent',aliases:['ashok leyland dost','leyland dost','dost mini truck']},
-  {brand:'CNG',model:'Auto-rickshaw',vehicleType:'cng',fitment:'brand/model and lamp housing vary; verify socket',aliases:['cng','সিএনজি','auto rickshaw','autorickshaw','অটোরিকশা','অটো রিকশা','three wheeler','three-wheeler','থ্রি হুইলার']}
-];
-function isBikeCompatibilityQuestion(text='') { return /h\s*-?\s*[0-9]+|9003|hb2|hs\s*-?\s*1|headlight|head\s*lamp|হেডলাইট|হেড\s*লাইট|plug\s*and\s*play|socket|সকেট|বাল্ব|bulb|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|প্রজেকশন|projector/i.test(text) && /বাইক|মোটরসাইকেল|motorcycle|motorbike|bike|গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|ভ্যান|van|পিকআপ|pickup|মডেল|model|সাল|বছর|year|ফিট|fit|হবে|সাপোর্ট|support|socket|সকেট|পিন|pin|লাগবে|হেডলাইট|টয়োটা|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata|mitsubishi/i.test(text); }
-function identifyBikeModel(text='') {
-  const v=normalizeText(text);
-  for (const entry of BUILTIN_BIKE_DATABASE) for (const name of [entry.model,...entry.aliases]) if (name.length>=3 && (` ${v} `).includes(` ${normalizeText(name)} `)) return entry;
-  return null;
-}
-function isH4Confirmed(text='') { return /\bh\s*-?\s*4\b|\bhs\s*-?\s*1\b|\b9003\b|\bhb2\b|৩\s*পিন|তিন\s*পিন|3\s*-?\s*pin/i.test(text); }
-function bikeClarification() { return 'হ্যাঁ—আপনার 60W LED প্রজেকশন হেডলাইটটি H4/3-pin সকেট, নির্ধারিত ভোল্টেজ এবং যানবাহনের বৈদ্যুতিক সিস্টেমের সঙ্গে মিলে গেলে ব্যবহার করা যেতে পারে। মডেল/বছর বা পুরোনো সকেটের ছবি দিলে বাইক, কার, CNG, ভ্যান বা ট্রাক—যে যানই হোক—ফিটমেন্ট মিলিয়ে বলব। শুধু H4-এর মতো দেখতে হলেই সব সকেটে সরাসরি লাগবে ধরে নেওয়া যাবে না।'; }
-function bikeReply(text, senderId) {
-  const allText=getRecentConversationText(senderId,text);
-  if (/\bh\s*-?\s*(?:6m|7|11|13|1|3)\b/i.test(allText) && !isH4Confirmed(allText)) return 'আপনার উল্লেখ করা H1/H3/H7/H11/H13/H6M সকেট H4/3-pin-এর থেকে আলাদা হতে পারে। আপনার 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে কি না, তা সকেট/অ্যাডাপ্টার, ভোল্টেজ ও ফিটমেন্ট মিলিয়ে নিশ্চিত করতে হবে। প্লাগের পরিষ্কার ছবি পাঠান।';
-  if (isH4Confirmed(allText)) return 'হ্যাঁ—H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও কানেক্টর মিলে গেলে আপনার 60W LED প্রজেকশন হেডলাইট ব্যবহার করা যাবে। LED-র প্রকৃত বিদ্যুৎ খরচ মডেলভেদে আলাদা হতে পারে; তাই শুধু “60W” লেখা দেখে কম পাওয়ার নেয় ধরে নিচ্ছি না। HS1 বা অন্য কাছাকাছি সকেট সরাসরি মেলে কি না, তা কানেক্টর/অ্যাডাপ্টার দেখে নিশ্চিত করতে হবে।';
-  const knownBike=identifyBikeModel(allText);
-  if (knownBike) return `আপনি ${knownBike.brand} ${knownBike.model} (${knownBike.vehicleType}) বলেছেন। এই মডেলটি আমার যানবাহন ইনডেক্সে আছে। ফিটমেন্ট নোট: ${knownBike.fitment}. সকেটটি H4/3-pin হলে এবং নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আপনার 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে এই মডেলের সব বছর/ভ্যারিয়েন্টে H4 আছে বলে নিশ্চিত করছি না; মডেল ইয়ার/ভ্যারিয়েন্ট বা পুরোনো সকেটের ছবি দিলে মিলিয়ে বলব।`;
-  const vehicle=allText.match(/(?:আমার|my)?\s*(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মোটরসাইকেল|motorcycle|ভ্যান|van|পিকআপ|pickup)[^।.!?\n]{0,100}/i);
-  if(vehicle) return `আপনি ${vehicle[0].trim()} বলেছেন। আপনার 60W LED প্রজেকশন লাইটটি H4/3-pin সকেট, ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে ব্যবহার করা যাবে। এই নির্দিষ্ট মডেলের সকেট এখনো নিশ্চিত নয়—ব্র্যান্ড, মডেল, সাল/ভ্যারিয়েন্ট অথবা পুরোনো হেডলাইট প্লাগের ছবি পাঠান।`;
-  return bikeClarification();
+const VEHICLE_FITMENT_HANDOFF_REPLY = 'আমাদের প্রতিনিধি শীঘ্রই আপনার সাথে যোগাযোগ করবে এবং নিশ্চিত করবে যে আমাদের এই হেডলাইটটি আপনার বাইকে সঠিকভাবে ফিট হবে কিনা।';
+function isVehicleHeadlightFitmentInquiry(currentText='', recentContext='') {
+  const current = String(currentText || '').trim();
+  const context = `${String(recentContext || '')}\n${current}`;
+  const asksFitOrMatch = /(?:fit(?:s|ment)?|ফিট(?:িং)?|compatible|compatibility|will\s+it\s+fit|does\s+it\s+fit|match(?:es|ing)?|ম্যাচ|মিলবে|মিলে\s*কি|মিলবে\s*কি|হবে\s*কি|ফিট\s*হবে|লাগবে\s*কি|সাপোর্ট\s*করবে|support\s*(?:it|my)|কাজ\s*করবে\s*কি)/i.test(current);
+  const genericFitmentFollowup = /(?:এটা|এটি|ওটা|ওইটা|এইটা|সেটা|লাইটটা|হেডলাইটটা)\s*(?:(?:কি|কী)\s*)?(?:হবে|লাগবে|ফিট\s*হবে|মিলবে)|(?:ফিট\s*হবে|হবে\s*কি|লাগবে\s*কি|মিলবে\s*কি)/i.test(current)
+    && !/(?:দাম|মূল্য|price|কত\s*টাকা|খরচ|বিল|bill|delivery|ডেলিভারি|quantity|পরিমাণ)/i.test(current);
+  const mentionsPlugOrSocket = /(?:plug|প্লাগ|socket|সকেট|h\s*-?\s*4|hs\s*-?\s*1|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন)/i.test(current);
+  const asksPlugMatch = mentionsPlugOrSocket && /(?:মিলবে|মিলে|ম্যাচ|match|fit|ফিট|হবে|লাগবে|সাপোর্ট|support|compatible)/i.test(current);
+  const vehicleMentioned = /(?:বাইক|মোটরসাইকেল|bike|motorcycle|motorbike|গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|ভ্যান|van|পিকআপ|pickup|যানবাহন|vehicle|মডেল|model|discover|ডিসকভার|pulsar|পালসার|apache|অ্যাপাচি|yamaha|bajaj|tvs|hero|honda|suzuki|gixxer|splendor|fz\s*\d*|r15|corolla|allion|premio|hiace|civic|alto|wagon\s*r|swift|nissan|toyota|mahindra|tata|mitsubishi)/i.test(context);
+  const headlightContext = /(?:হেড\s*লাইট|হেডলাইট|head\s*light|headlight|headlamp|head\s*lamp|বাল্ব|bulb|projector|প্রজেক্টর|plug|প্লাগ|socket|সকেট|h\s*-?\s*4|hs\s*-?\s*1|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন)/i.test(context);
+  return vehicleMentioned && headlightContext && (asksFitOrMatch || asksPlugMatch || genericFitmentFollowup);
 }
 
 // -----------------------------------------------------------------------------
@@ -666,12 +609,30 @@ async function exaSearch(query) {
 // AI prompt and OpenRouter
 // -----------------------------------------------------------------------------
 function limitToFiveLines(text) { const lines=String(text||'').replace(/\r/g,'').split('\n').map(x=>x.trim()).filter(Boolean);return lines.slice(0,MAX_AI_LINES).join('\n'); }
-function buildSystemPrompt(relevantProducts,relevantFaqs,history,memoryContext,webResults=[]) {
-  const productContext=relevantProducts.length?relevantProducts.map((p,i)=>[`[পণ্য ${i+1}]`,`ID: ${p.id||'N/A'}`,`নাম: ${p.name||'N/A'}`,`ব্র্যান্ড: ${p.brand||'N/A'}`,`মডেল: ${p.model||'N/A'}`,`মূল্য: ${p.price??'ক্যাটালগে নেই'} টাকা`,`স্টক: ${p.stockStatus||(p.inStock===true?'IN_STOCK':'তথ্য নেই')}`,`বিবরণ: ${p.shortDescription||p.description||'N/A'}`,`বৈশিষ্ট্য: ${Array.isArray(p.features)?p.features.join(', '):'N/A'}`,`ছবি: ${getProductMediaUrls(p,'images').join(' | ')||'নেই'}`,`ভিডিও: ${getProductMediaUrls(p,'videos').join(' | ')||'নেই'}`].join('\n')).join('\n\n'):'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
-  const faqContext=relevantFaqs.length?relevantFaqs.map((f,i)=>`[FAQ ${i+1}] ${f.question||''}\n${f.answer||''}`).join('\n\n'):'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
-  const historyContext=history.length?history.map(x=>`${x.role==='assistant'?'বট/প্রতিনিধি':'গ্রাহক'}: ${x.text}`).join('\n'):'পূর্ববর্তী কথোপকথন নেই।';
-  const webContext=webResults.length?webResults.map((x,i)=>`[বাহ্যিক সার্চ ${i+1}] ${x.name}\n${x.content}\nURL: ${x.url}`).join('\n\n'):'কোনো বাহ্যিক সার্চ ফল নেই।';
-  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র বিক্রয় ও কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি: গাজীপুরের ভেতরে ৫০ টাকা, বাইরে ১০০ টাকা।\nনিয়ম: স্বাভাবিক, বিস্তারিত কিন্তু Messenger-উপযোগী বাংলায় উত্তর দিন (গ্রাহক ইংরেজিতে লিখলে ইংরেজিতে); প্রয়োজনে সর্বোচ্চ ৯টি ছোট লাইন/বুলেট ব্যবহার করুন। Gemini-ধাঁচের প্রাসঙ্গিক উত্তর দিন: প্রথম বাক্যেই সরাসরি উত্তর, তারপর কারণ/ফিটমেন্টের শর্ত এবং প্রয়োজন হলে পরবর্তী পদক্ষেপ। আগের কথোপকথন ও গ্রাহক মেমোরি থেকে ব্র্যান্ড, মডেল, সাল, পণ্য/ছবির প্রসঙ্গ ধরে রাখুন। ‘এটা’, ‘ওটা’, ‘ছবিটা’, ‘হবে?’, ‘দাম কত?’ বা ‘অর্ডার করব’ ধরনের ফলো-আপে আগের প্রাসঙ্গিক পণ্য/গাড়ি/বাইক বুঝে উত্তর দিন; আগে বলা তথ্য আবার জানতে চাইবেন না, যদি তা ইতিহাসে থাকে। গ্রাহক একাধিক মেসেজে তথ্য দিলে সেগুলো একত্রে বিবেচনা করুন। ক্যাটালগে নেই এমন দাম/স্টক/ওয়ারেন্টি/বৈশিষ্ট্য বানাবেন না। পণ্যের ID, নাম, দাম বা লিংক বদলাবেন না। অস্পষ্ট হলে একটি প্রশ্ন করুন। শেষ ২০ বার্তা ও গ্রাহক মেমোরি ব্যবহার করুন। বর্তমান মেসেজের সঙ্গে আগের মেসেজের যোগসূত্র বুঝুন; কথোপকথনে আগে উল্লেখিত মডেল থাকলে অকারণে আবার মডেল জিজ্ঞেস করবেন না। বাইক, কার, CNG, ভ্যান, পিকআপ ও ট্রাকসহ সব যানবাহনের মডেল/ব্র্যান্ড/সালকে BUILTIN_BIKE_DATABASE ইনডেক্সে খুঁজুন। গ্রাহক পরিচিত যানবাহনের নাম বললে সরাসরি উত্তর দিন: H4/3-pin সকেট, নির্ধারিত ভোল্টেজ ও বৈদ্যুতিক সিস্টেম মিলে গেলে আমাদের 60W LED প্রজেকশন লাইট ব্যবহার করা যাবে। তবে মডেল/বছরভেদে সকেট আলাদা হতে পারে, তাই অজানা fitment-কে নিশ্চিত বলবেন না; প্রয়োজনে একটি ছোট প্রশ্নে বছর/ভ্যারিয়েন্ট বা সকেটের ছবি চান। 35W/35/35W উল্লেখ করবেন না। H4/3-pin ও HS1-কে একই ধরে নেবেন না; দরকার হলে অ্যাডাপ্টার যাচাই করুন। Dimension & Clearance Check Rule: গ্রাহক H4 Mini LED Projector সম্পর্কে জানতে চাইলে পণ্যের দেওয়া মাপ হিসেবে লেন্সের ব্যাস 37mm, পেছনে কুলিং ফ্যান/হিটসিংকের জন্য 57mm গভীরতা এবং মোট দৈর্ঘ্য 113mm উল্লেখ করুন। সামনের হাউজিং/রিফ্লেক্টরে অন্তত 37mm ক্লিয়ারেন্স এবং পেছনে অন্তত 57mm খালি জায়গা যাচাই না করে নিশ্চিত ফিট বলবেন না; রাবার ডাস্ট কভার সামান্য কাটতে হতে পারে, তবে কাটার আগে মেকানিক দিয়ে পরীক্ষা করাতে বলুন। Bajaj Discover 125, Pulsar, Apache RTR, FZ বা অন্য কোনো মডেলে শুধু নাম দেখে “সহজেই ফিট হবে” বা “Plug and Play নিশ্চিত” বলবেন না—সঠিক বছর/ভ্যারিয়েন্ট, সকেট এবং বাস্তব জায়গা মিলতে হবে। Pure 12V DC প্রয়োজন: চাবি অন করলেই হেডলাইট জ্বলে বা ইঞ্জিন চালুর পর জ্বলে—এগুলো শুধু প্রাথমিক ইঙ্গিত, AC/DC নিশ্চিত করার নির্ভরযোগ্য পরীক্ষা নয়; মাল্টিমিটার দিয়ে মাপা বা মেকানিক দিয়ে যাচাই করতে বলুন। AC হলে মেকানিক দিয়ে সঠিক fused battery DC connection করানোর পরামর্শ দিন; নিজে সরাসরি তার জোড়া দিতে বলবেন না। সকেট/ডাইমেনশন/ভোল্টেজ নিশ্চিত না হলে অনিশ্চয়তা স্পষ্ট করুন এবং পুরোনো প্লাগ ও হাউজিংয়ের ছবি/মাপ বা মেকানিকের পরীক্ষা চান। পণ্যের প্রকৃত বিদ্যুৎ খরচ প্রমাণ ছাড়া কম বলে দাবি করবেন না। বাহ্যিক সার্চ ফলকে পণ্যের মূল্য/স্টক বা নিশ্চিত ফিটমেন্টের প্রমাণ ধরবেন না। অর্ডার জমা হলে স্বয়ংক্রিয়ভাবে human takeover চালু করুন। গ্রাহক ফোন নম্বর এবং সম্পূর্ণ ঠিকানা দিলে, তথ্য একাধিক মেসেজে এলেও, স্বয়ংক্রিয়ভাবে takeover চালু করুন। গ্রাহক কল করার কথা বললে বা webhook-এ call event এলে takeover চালু করুন। AI প্রশ্ন বুঝতে না পারলে আগে ঠিক এই বাক্যটি বলুন: ‘আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?’ শুধু গ্রাহক হ্যাঁ বললে takeover চালু করুন। সিদ্ধান্তে অনিশ্চয়তা থাকলে সরাসরি হেল্পলাইনে কল করতে বলুন। হেডলাইটের ক্ষেত্রে বাইক, গাড়ি, CNG, বাস ও ট্রাক—সব যানবাহনে মডেল দেখে অনুমান করবেন না; H4/3-pin প্লাগের মিল যাচাই করুন, না জানলে প্লাগের ছবি/ধরন জানতে চান। ${HANDOVER_MARKER} ব্যবহার করবেন না, ব্যাকএন্ড সম্মতি আলাদাভাবে নেয়। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (শুধু সাধারণ প্রাসঙ্গিকতা):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
+function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContext, webResults = []) {
+  const productContext = relevantProducts.length
+    ? relevantProducts.map((p, i) => [
+        `[পণ্য ${i + 1}]`, `ID: ${p.id || 'N/A'}`, `নাম: ${p.name || 'N/A'}`,
+        `ব্র্যান্ড: ${p.brand || 'N/A'}`, `মডেল: ${p.model || 'N/A'}`,
+        `মূল্য: ${p.price ?? 'ক্যাটালগে নেই'} টাকা`,
+        `স্টক: ${p.stockStatus || (p.inStock === true ? 'IN_STOCK' : 'তথ্য নেই')}`,
+        `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
+        `বৈশিষ্ট্য: ${Array.isArray(p.features) ? p.features.join(', ') : 'N/A'}`,
+        `ছবি: ${getProductMediaUrls(p, 'images').join(' | ') || 'নেই'}`,
+        `ভিডিও: ${getProductMediaUrls(p, 'videos').join(' | ') || 'নেই'}`
+      ].join('\n')).join('\n\n')
+    : 'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
+  const faqContext = relevantFaqs.length
+    ? relevantFaqs.map((f, i) => `[FAQ ${i + 1}] ${f.question || ''}\n${f.answer || ''}`).join('\n\n')
+    : 'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
+  const historyContext = history.length
+    ? history.map(x => `${x.role === 'assistant' ? 'বট/প্রতিনিধি' : 'গ্রাহক'}: ${x.text}`).join('\n')
+    : 'পূর্ববর্তী কথোপকথন নেই।';
+  const webContext = webResults.length
+    ? webResults.map((x, i) => `[বাহ্যিক সার্চ ${i + 1}] ${x.name}\n${x.content}\nURL: ${x.url}`).join('\n\n')
+    : 'কোনো বাহ্যিক সার্চ ফল নেই।';
+
+  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র, স্মার্ট ও সাহায্যকারী কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি নীতি: গাজীপুরের ভেতরে ৫০ টাকা, গাজীপুরের বাইরে ১০০ টাকা।\n\nউত্তরের নিয়ম:\n১) গ্রাহক যে ভাষায় লিখবেন, সেই ভাষায় স্বাভাবিক Messenger-উপযোগী ভাষায় সরাসরি উত্তর দিন। প্রথমেই মূল উত্তর দিন; অপ্রাসঙ্গিক তথ্য বা অযথা ভূমিকা দেবেন না।\n২) ক্যাটালগ ও FAQ-তে থাকা পণ্যের নাম, দাম, স্টক, স্পেসিফিকেশন, বৈশিষ্ট্য ও ডেলিভারি তথ্য নির্ভুলভাবে ব্যবহার করুন। তথ্য নেই এমন দাম, ওয়ারেন্টি, স্টক বা বৈশিষ্ট্য বানিয়ে বলবেন না। পণ্যের ID, নাম, মূল্য বা URL পরিবর্তন করবেন না।\n৩) ফগ লাইট সম্পর্কে গ্রাহক তথ্য চাইলে তথ্য দেওয়া থেকে বিরত থাকবেন না। প্রাসঙ্গিক ক্যাটালগ/FAQ দেখে মডেল, বৈশিষ্ট্য, আলো, ব্যবহার, দাম, ছবি/ভিডিও বা উপলভ্য তথ্য সরাসরি ব্যাখ্যা করুন। তথ্য অনুপস্থিত থাকলে শুধু যে তথ্যটি নেই সেটি স্পষ্ট করে বলুন এবং প্রয়োজন হলে নির্দিষ্ট পণ্যের নাম জানতে চান।\n৪) হেডলাইট ফিটমেন্ট নিয়ম: বাইক বা গাড়ির কোনো মডেলে হেডলাইট ফিট হবে কি না, H4 Plug/Socket মিলবে কি না, বা সরাসরি লাগবে কি না—নিজে যাচাই, অনুমান, ব্যাখ্যা বা প্রতিশ্রুতি দেবেন না। অ্যাপ্লিকেশন পর্যায়ে এ ধরনের প্রশ্নের জন্য নির্দিষ্ট উত্তর পাঠানো হয়: “${VEHICLE_FITMENT_HANDOFF_REPLY}”। এই নিয়মের বাইরে কখনো H4, 3-pin, সকেটের ধরন, Plug and Play, ডাইমেনশন, AC/DC, তার সংযোগ বা টেকনিক্যাল সার্ভিস সম্পর্কে নিজে থেকে নির্দেশ দেবেন না। সাধারণ পণ্যের পরিচিতি/ক্যাটালগ-ভিত্তিক স্পেসিফিকেশন জানতে চাইলে সেই তথ্য দিতে পারবেন, কিন্তু যানবাহনে ফিটমেন্ট নিশ্চিত করবেন না।\n৫) আগের কথোপকথন, সর্বশেষ বার্তা, গ্রাহক মেমোরি এবং সক্রিয় পণ্যের তথ্য ব্যবহার করুন। “এটা”, “ওটা”, “ছবিটা”, “দাম কত?”, “এটা নেব” ইত্যাদি ফলো-আপে প্রাসঙ্গিক পূর্ববর্তী পণ্য বুঝে উত্তর দিন; ইতিহাসে থাকলে আগের তথ্য পুনরায় জানতে চাইবেন না। একাধিক মেসেজে দেওয়া তথ্য একত্রে বিবেচনা করুন।\n৬) সাধারণ প্রশ্নের উত্তর নিজেই দিন। কেবল জটিল, অস্পষ্ট, অভিযোগ-সংক্রান্ত বা নির্ভরযোগ্যভাবে সমাধান করতে না-পারা সমস্যায় মানব প্রতিনিধির সঙ্গে সংযোগের অনুমতি চান। তখন জিজ্ঞেস করুন: “আমি কি আপনাকে আমাদের একজন প্রতিনিধির সাথে কানেক্ট করে দেব?” অথবা, AI প্রশ্ন বুঝতে না পারলে: “আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?” গ্রাহকের সম্মতি ছাড়া শুধু এমন প্রশ্নের কারণে human handover চালু করতে বলবেন না। অর্ডার, কল, অথবা সম্পূর্ণ যোগাযোগের তথ্য জমা দেওয়ার প্রতিষ্ঠিত ব্যাকএন্ড প্রক্রিয়াগুলো আলাদাভাবে কাজ করতে পারে।\n৭) অস্পষ্ট হলে একবারে একটি নির্দিষ্ট ও প্রাসঙ্গিক প্রশ্ন করুন। আগেই উত্তর দেওয়া বিষয়ে অকারণে একই প্রশ্ন করবেন না।\n৮) প্রয়োজনমতো সর্বোচ্চ ${MAX_AI_LINES}টি ছোট লাইন ব্যবহার করুন। অপ্রাসঙ্গিক মানব হ্যান্ডওভার, অনুমানভিত্তিক টেকনিক্যাল পরামর্শ বা গ্রাহকের প্রশ্নের সঙ্গে সম্পর্কহীন উত্তর দেবেন না। ${HANDOVER_MARKER} নিজে থেকে লিখবেন না; ব্যাকএন্ড আলাদাভাবে সম্মতি পরিচালনা করে। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nবাহ্যিক সার্চ ফল (সাধারণ প্রাসঙ্গিকতার জন্য; ক্যাটালগের দাম/স্টক বদলানোর জন্য নয়):\n${webContext}\n\nকথোপকথন:\n${historyContext}`;
 }
 async function callOpenRouter(messages,model=TEXT_MODEL) {
   if(!OPENROUTER_API_KEY)throw new Error('OPENROUTER_API_KEY is not configured');
@@ -702,63 +663,15 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const relevantFaqs=findRelevantFaqs(context);
   let webResults=[];
   // Search only when catalog/FAQ context is weak and the question is plausibly factual/compatibility-related.
-  if (EXA_API_KEY && ((relevantProducts.length===0 && relevantFaqs.length===0 && /বাইক|মডেল|সকেট|হেডলাইট|compatible|compatibility|fit|ফিট|কানেক্টর|connector|স্পেসিফিকেশন|specification|car|truck|cng|toyota|honda|nissan|suzuki|mitsubishi|tata|mahindra|ট্রাক|গাড়ি|গাড়ি|সিএনজি/i.test(query)) || isBikeCompatibilityQuestion(query))) webResults=await exaSearch(query);
+  if (EXA_API_KEY && relevantProducts.length===0 && relevantFaqs.length===0 && /ফগ|fog|লাইট|light|বাইক|মডেল|হেডলাইট|স্পেসিফিকেশন|specification|car|truck|cng|toyota|honda|nissan|suzuki|mitsubishi|tata|mahindra|ট্রাক|গাড়ি|গাড়ি|সিএনজি/i.test(query)) webResults=await exaSearch(query);
   const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,webResults);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
   const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
   if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন। অনিশ্চিত হলে তা জানান।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL));}catch(e){console.error('[VOICE] Failed:',e.message);}}
   const image=attachments.find(x=>x.type==='image'&&x.payload?.url);
-  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি বিশ্লেষণ করুন এবং আগের কথোপকথনে উল্লেখিত যানবাহন/পণ্যের সঙ্গে সম্পর্ক মিলিয়ে উত্তর দিন। আগে দেওয়া মডেল বা তথ্য পুনরায় জিজ্ঞেস করবেন না। ছবিতে যা স্পষ্ট দেখা যায় শুধু সেটিই বলুন; সকেট/ফিটমেন্ট নিশ্চিত না হলে তা স্পষ্ট করে জানান।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]));}catch(e){console.error('[VISION] Failed:',e.message);}}
+  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি বিশ্লেষণ করে দৃশ্যমান পণ্য/বৈশিষ্ট্য সম্পর্কে উত্তর দিন। আগের কথোপকথনে থাকা প্রাসঙ্গিক তথ্য ব্যবহার করুন এবং ইতিমধ্যে দেওয়া মডেল/তথ্য আবার জিজ্ঞেস করবেন না। যানবাহনে হেডলাইট ফিটমেন্ট বা প্লাগ-ম্যাচিং নির্ধারণ করবেন না; এ বিষয়ে নির্দিষ্ট মানব-প্রতিনিধির বার্তাই ব্যবহার করতে হবে।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]));}catch(e){console.error('[VISION] Failed:',e.message);}}
   return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:query}]));
 }
-async function buildVerifiedFitmentReply(senderId, customerText) {
-  const allText = getRecentConversationText(senderId, customerText);
-  const exactVehicle = identifyBikeModel(allText);
-  const vehicleMatch = allText.match(/(?:yamaha|bajaj|tvs|hero|honda|suzuki|toyota|nissan|mitsubishi|mahindra|tata|maruti|suzuki|discover\s*125|pulsar\s*(?:ns)?\s*\d{2,3}|apache\s*(?:rtr)?\s*\d{2,3}|fz\s*v?\s*\d{0,2}|r15|alto|wagon\s*r|swift|corolla|civic|city|vitz|premio|fielder|axio|prius)[^।.!?\n]{0,60}/i);
-  const vehicle = (exactVehicle?.brand && exactVehicle?.model)
-    ? `${exactVehicle.brand} ${exactVehicle.model}`
-    : (vehicleMatch?.[0] || '').trim();
-  const yearMatch = allText.match(/(?:19|20)\d{2}|(?:সাল|year|বছর)\s*[:：-]?\s*(\d{2,4})/i);
-
-  if (!vehicle) {
-    return 'আপনার গাড়ি/বাইকের ব্র্যান্ড, সঠিক মডেল ও সম্ভব হলে সাল/ভ্যারিয়েন্ট লিখুন। শুধু অনুমান করে সকেট টাইপ নিশ্চিত বলা ঠিক হবে না।';
-  }
-
-  if (!EXA_API_KEY) {
-    console.warn('[FITMENT] EXA_API_KEY missing; socket fitment cannot be verified');
-    return `আপনার ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর সকেট টাইপ এখন অনলাইনে যাচাই করতে পারছি না। মডেল ইয়ার/ভ্যারিয়েন্ট এবং পুরোনো হেডলাইটের প্লাগের পরিষ্কার ছবি পাঠান; অনুমান করে H4/3-pin নিশ্চিত বলব না।`;
-  }
-
-  const query = `"${vehicle}" ${yearMatch?.[0] || ''} original headlight bulb socket type H4 HS1 H7 H11 9003 HB2 P43t PX43t connector`;
-  const results = await exaSearch(query).catch(() => []);
-  const socketPattern = /\bH\s*-?\s*4\b|\bHS\s*-?\s*1\b|\bH\s*-?\s*7\b|\bH\s*-?\s*11\b|\bH\s*-?\s*3\b|\b9003\b|\bHB2\b|\bP43t\b|\bPX43t\b|\bH1\b|\bH13\b|\bH6M\b|\b3[ -]?pin\b|three[- ]pin|৩\s*পিন|তিন\s*পিন/i;
-  const vehicleTokens = [vehicle, exactVehicle?.model].filter(Boolean).map(normalizeText).filter(x => x.length >= 3);
-  const verified = (Array.isArray(results) ? results : []).map(r => {
-    const title = String(r.name || '');
-    const content = String(r.content || '');
-    const url = String(r.url || '');
-    const combined = `${title}\n${content}\n${url}`;
-    const normalized = normalizeText(combined);
-    const modelMatched = vehicleTokens.some(token => normalized.includes(token)) && (!yearMatch || normalized.includes(normalizeText(yearMatch[0])) || normalized.includes(normalizeText(exactVehicle?.model || '')));
-    const socketMatch = combined.match(socketPattern);
-    return { title, url, content, modelMatched, socket: socketMatch?.[0] || '' };
-  }).find(r => r.modelMatched && r.socket);
-
-  if (verified) {
-    const socket = verified.socket.replace(/\s+/g, ' ').trim();
-    const dimensionNote = /h4\s*mini|mini\s*led\s*projector|projector\s*lens|মিনি\s*প্রজেক্টর|প্রজেক্টর\s*লেন্স/i.test(allText)
-      ? ' H4 Mini LED Projector-এর দেওয়া মাপ: লেন্স 37mm, পেছনে ফ্যানের জন্য 57mm গভীরতা, মোট দৈর্ঘ্য 113mm। হাউজিংয়ে এই ক্লিয়ারেন্স মেপে নিন; ডাস্ট কভার কাটতে হতে পারে। এটি Pure 12V DC-তে চালাতে হবে; AC/DC মেকানিক বা মাল্টিমিটার দিয়ে যাচাই করুন।'
-      : '';
-    return `অনলাইন সূত্রে ${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর জন্য ${socket} সকেটের উল্লেখ পেয়েছি। আপনার লাইটের প্লাগ একই টাইপ হলে সকেটের দিক থেকে ফিট হতে পারে; ভ্যারিয়েন্টভেদে পার্থক্য থাকতে পারে, তাই পুরোনো প্লাগের ছবি মিলিয়ে নিশ্চিত করুন।${dimensionNote}`;
-  }
-
-  if (results.length) {
-    return `${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর সকেট টাইপ নির্ভরযোগ্যভাবে নিশ্চিত করার মতো মিল পাওয়া যায়নি। ভুল ফিটমেন্ট না বলতে মডেল ইয়ার/ভ্যারিয়েন্ট এবং পুরোনো হেডলাইট প্লাগের পরিষ্কার ছবি পাঠান।`;
-  }
-  return `${vehicle}${yearMatch ? ` (${yearMatch[0]})` : ''}-এর সকেট টাইপ এখন যাচাই করা যায়নি। মডেল ইয়ার/ভ্যারিয়েন্ট এবং পুরোনো হেডলাইট প্লাগের পরিষ্কার ছবি পাঠালে মিলিয়ে জানাব; অনুমান করে H4/3-pin বলব না।`;
-}
-
-
 function isCriticalHandoverQuestion(text='') { return /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/i.test(text); }
 function isConfusionReply(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|ঠিক আছে|yes|yeah|y|ok|okay|sure|না|no|nope|n)$/i.test(normalizeText(text)); }
 
@@ -769,6 +682,12 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
   const id=String(senderId), customerText=String(text||'').trim();
   if(getTakeoverState(id)){console.log(`[Takeover] ${id} paused; AI skipped`);return;}
   try {
+    // Never diagnose headlight fitment or plug matching. Send the requested fixed reply,
+    // then let any subsequent customer turn proceed through normal support handling.
+    if (isVehicleHeadlightFitmentInquiry(customerText, getRecentConversationText(id, customerText))) {
+      await sendFacebookMessage(id, VEHICLE_FITMENT_HANDOFF_REPLY);
+      return;
+    }
     // A billing question must still be answered while an order draft or handover prompt is pending.
     if (isBillingQuestion(customerText)) {
       const context=getRecentConversationText(id,customerText);
@@ -810,18 +729,6 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     }
     if(isExplicitOrderIntent(customerText)){await handleOrderFlow(id,customerText,messageId);return;}
     if(isCriticalHandoverQuestion(customerText)){await askHandoverConsent(id,'Critical customer issue');return;}
-    const priorVehicleFitmentContext=getRecentConversationText(id,customerText);
-    const contextualVehicleFitment = /(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit)/i.test(customerText) && /(?:গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|বাইক|bike|মডেল|model|toyota|honda|nissan|suzuki|yamaha|bajaj|tvs|hero|mahindra|tata)/i.test(priorVehicleFitmentContext) && /(?:হেডলাইট|headlight|h4|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন|সকেট|plug|প্লাগ)/i.test(priorVehicleFitmentContext);
-    const indexedVehicle = identifyBikeModel(getRecentConversationText(id, customerText));
-    const hasFitmentIntentNow = isBikeCompatibilityQuestion(customerText) || /(?:হবে|ফিট|লাগবে|সাপোর্ট|fit|compatible|will it work|does it fit|সকেট|হেডলাইট|প্লাগ|৩\s*পিন|3\s*-?\s*pin|h4)/i.test(customerText);
-    const imageFollowup = attachments.some(a => a.type === 'image') && !!indexedVehicle;
-    if(isBikeCompatibilityQuestion(customerText) || contextualVehicleFitment || (indexedVehicle && hasFitmentIntentNow) || imageFollowup) {
-      // Socket fitment is answered only from Exa evidence tied to the named model.
-      // Never infer H4/3-pin merely because the customer mentioned a vehicle or socket.
-      const fitmentReply = await buildVerifiedFitmentReply(id, customerText);
-      await sendFacebookMessage(id, limitToFiveLines(fitmentReply));
-      return;
-    }
     if(isBillingQuestion(customerText)) {
       const context=getRecentConversationText(id,customerText);
       const p=findExactProduct(customerText)||findExactProduct(context)||findProductFromRecentContext(id);
