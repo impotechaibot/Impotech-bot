@@ -43,7 +43,7 @@ const GITHUB_REPO = process.env.GITHUB_REPO || 'impotechaibot/Impotech-bot';
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 const CATALOG_FILE = process.env.CATALOG_FILE || 'data/catalog.json';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
-const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v4';
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
 const REQUIRE_ADMIN_SECRET = process.env.REQUIRE_ADMIN_SECRET !== 'false';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const EXA_URL = 'https://api.exa.ai/search';
