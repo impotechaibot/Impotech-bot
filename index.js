@@ -6,7 +6,7 @@
  * Storage: PostgreSQL (DATABASE_URL / POSTGRES_URL)
  * Catalog: GitHub catalog.json + local cache
  * Memory: last 20 messages + customer facts/preferences (20-day retention)
- * Human handover: automatic for completed orders/calls; consent for unclear questions
+ * Human Takeover & Recovery: Robust Meta Business Suite Echo Detection + Admin APIs
  */
 
 const express = require('express');
@@ -66,7 +66,7 @@ const LEGACY_DATA_FILE = path.join(__dirname, 'storage_data.json');
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 const ORDER_CONFIRMATION = 'আপনার অর্ডারের তথ্য সংরক্ষণ করা হয়েছে। আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করে অর্ডারটি নিশ্চিত করবেন।';
 const FOLLOWUP_MESSAGE = 'আপনি কি পণ্যটি সম্পর্কে আরও কিছু জানতে চান? কোনো প্রশ্ন থাকলে জানাবেন, আমরা সাহায্য করতে প্রস্তুত।';
-const FIRST_CONTACT_INTRO = 'আমি ইমপোটেকের AI সহকারী। পণ্য বা সার্ভিস সম্পর্কে যেকোনো প্রশ্ন করতে পারেন। অর্ডার করতে চাইলে সরাসরি জানাতে পারেন।';
+const FIRST_CONTACT_INTRO = 'আমি ইমপোটেকের AI সহকারী। পণ্য সম্পর্কে জানতে বা অর্ডার করতে আমাকে জানাতে পারেন।';
 const VEHICLE_FITMENT_HANDOFF_REPLY = 'আমাদের হেডলাইটের সকেট ও প্লাগ আপনার বাইক বা গাড়িতে সঠিকভাবে ফিট হবে কিনা তা আপনি নিজে সকেট দেখে নিশ্চিত হতে পারেন, অথবা আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করে নিশ্চিত করবেন। হেল্পলাইন: ' + HELPLINE;
 
 if (!DATABASE_URL) {
@@ -82,7 +82,7 @@ const pool = DATABASE_URL ? new Pool({
 if (pool) pool.on('error', err => console.error('[DB] Unexpected pool error:', err.message));
 
 // -----------------------------------------------------------------------------
-// State and Storage
+// State & Storage
 // -----------------------------------------------------------------------------
 let products = [];
 let faqs = [];
@@ -356,9 +356,9 @@ function extractQuantity(text='') {
 
 function getDeliveryFee(addressOrText='') {
   const t=normalizeText(addressOrText);
-  if(!t) return 100; // Default outside Gazipur rate
+  if(!t) return 100;
   if(/গাজীপুর|gazipur/.test(t)) return 50;
-  return 100; // Standard all-Bangladesh rate outside Gazipur
+  return 100;
 }
 
 function buildSmartBillReply(product, quantity, deliveryFee, locationName = '') {
@@ -395,9 +395,6 @@ function isExplicitOrderIntent(text='') {
   return /\b(i want to order|place my order|order this|i will buy|i want to buy|confirm my order|send me this)\b|অর্ডার করতে চাই|অর্ডার করব|অর্ডার করবো|অর্ডার দিন|অর্ডার করে দিন|অর্ডার দিতে চাই|অর্ডার কনফার্ম|অর্ডার নেন|পাঠিয়ে দিন|পাঠিয়ে দেন|কিনে নিব|পার্সেল পাঠান/i.test(text);
 }
 
-function isYes(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|ঠিক আছে|দেন|yes|yeah|y|ok|okay|sure)$/i.test(normalizeText(text)); }
-function isNo(text='') { return /^(না|না ধন্যবাদ|রাজি নই|সম্মতি নেই|করবেন না|no|nope|n|don't|do not)$/i.test(normalizeText(text)); }
-
 function extractPhone(text='') {
   const m = String(text).match(/(?:\+?8801|01)[0-9\s-]{8,14}/);
   if (!m) return null;
@@ -408,7 +405,6 @@ function extractPhone(text='') {
 function extractAddress(text='') {
   const t = String(text || '').trim();
   if (!t || extractPhone(t)) return null;
-  // If user is just asking a question with a city name, it's not a full delivery address
   if (/(মোট\s*বিল|বিল\s*কত|ডেলিভারি\s*চার্জ|দাম\s*কত|কত\s*টাকা|ফিট\s*হবে|হবে\s*কি|price|bill|how\s*much)/i.test(t)) return null;
   const explicit = t.match(/(?:ঠিকানা|address|বাসা|বাড়ি|গ্রাম|রোড|road|থানা|উপজেলা|জেলা|এলাকা)\s*[:：-]?\s*(.{5,220})/i);
   if (explicit) return explicit[1].trim().replace(/[।.!?]+$/, '');
@@ -438,6 +434,9 @@ function cancelFollowup(senderId) {
   if (db.scheduledFollowups[id]) { delete db.scheduledFollowups[id]; saveStorage(); }
 }
 
+// -----------------------------------------------------------------------------
+// Human Takeover & Recovery System
+// -----------------------------------------------------------------------------
 function getTakeoverState(customerId) {
   if (!customerId) return !!db.isGlobalPaused;
   const id = String(customerId).trim();
@@ -450,12 +449,49 @@ function getTakeoverState(customerId) {
 async function setTakeoverState(customerId, enabled, reasonStr) {
   if (!customerId) return false;
   const id = String(customerId).trim(), on = Boolean(enabled), timestamp = new Date().toISOString();
-  db.takeovers[id] = { isPaused: on, reason: reasonStr || (on ? 'Human takeover' : 'Admin resumed AI'), timestamp };
+  db.takeovers[id] = { isPaused: on, reason: reasonStr || (on ? 'Human takeover' : 'AI resumed'), timestamp };
   if (!db.customers[id]) db.customers[id] = { id, name: `Customer ${id.slice(-4)}`, messageCount: 0 };
-  Object.assign(db.customers[id], { isPaused: on, takeover: on, takeoverUpdatedAt: timestamp });
+  Object.assign(db.customers[id], { isPaused: on, takeover: on, takeoverUpdatedAt: timestamp, takeoverReason: reasonStr });
   if (on) cancelFollowup(id);
   saveStorage();
+  console.log(`[Takeover] Status changed for ${id}: ${on ? 'PAUSED (Human)' : 'ACTIVE (AI)'} | Reason: ${reasonStr}`);
   return on;
+}
+
+// Check and process admin echo command (Robust parser for Meta Business Suite)
+async function handleAdminEchoEvent(event) {
+  const message = event.message;
+  if (!message) return false;
+
+  // In Echo events, Meta puts customer PSID in recipient.id
+  const targetCustomerId = String(event.recipient?.id || event.sender?.id || '').trim();
+  if (!targetCustomerId) return false;
+
+  const rawText = String(message.text || '').trim();
+  const cleanCmd = rawText.toLowerCase().replace(/[\s\.\/\\_\-]/g, '');
+
+  // 1. Resume AI Commands (.ai, /ai, ai, resume, .resume, আনপজ, চালু)
+  if (['ai', 'resume', 'unpause', 'bot', 'start', 'চালু'].includes(cleanCmd)) {
+    delete db.pendingHandover[targetCustomerId];
+    delete db.orderDrafts[targetCustomerId];
+    await setTakeoverState(targetCustomerId, false, `Admin echo command: ${rawText}`);
+    await sendFacebookMessage(targetCustomerId, 'AI সহকারী পুনরায় সক্রিয় হয়েছে। আপনাকে কীভাবে সাহায্য করতে পারি?');
+    return true;
+  }
+
+  // 2. Pause AI / Human Takeover Commands (.human, /human, human, pause, stop, .stop, থামো)
+  if (['human', 'pause', 'stop', 'agent', 'takeover', 'হিউম্যান', 'থামো'].includes(cleanCmd)) {
+    await setTakeoverState(targetCustomerId, true, `Admin echo command: ${rawText}`);
+    return true;
+  }
+
+  // 3. Auto-Takeover: Any manual message sent by Page Admin from Business Suite automatically pauses the bot
+  if (rawText && !message.app_id) { // manual admin inbox replies usually lack app_id or match page credentials
+    await setTakeoverState(targetCustomerId, true, 'Admin manual reply from Meta Business Suite');
+    return true;
+  }
+
+  return false;
 }
 
 async function sendFacebookMessage(recipientId, text) {
@@ -523,14 +559,12 @@ async function handleOrderFlow(senderId, text, messageId) {
   const customer = db.customers[id] || {};
   const draft = db.orderDrafts[id] || { retryCount: 0 };
 
-  // 1. Check Global Interrupts
   if (isGlobalInterrupt(text)) {
     delete db.orderDrafts[id];
     saveStorage();
-    return false; // Yield to standard AI/Query processing
+    return false;
   }
 
-  // 2. Identify Product, Phone, Address if provided
   const product = identifyOrderedProduct(id, text);
   if (product) draft.product = product;
   const phone = extractPhone(text);
@@ -539,12 +573,11 @@ async function handleOrderFlow(senderId, text, messageId) {
   if (address) { draft.address = address; customer.address = address; }
   db.customers[id] = customer;
 
-  // 3. Stepwise Collection with Max Retry Count (Fallback Counter)
   if (!draft.product) {
     draft.retryCount = (draft.retryCount || 0) + 1;
     if (draft.retryCount >= 2) {
       delete db.orderDrafts[id]; saveStorage();
-      return false; // Exit order loop, let AI answer
+      return false;
     }
     db.orderDrafts[id] = draft; saveStorage();
     await sendFacebookMessage(id, 'আপনি কোন পণ্যটি অর্ডার করতে চান? পণ্যের নাম বা মডেলটি বলুন।');
@@ -565,7 +598,6 @@ async function handleOrderFlow(senderId, text, messageId) {
   if (!draft.address) {
     draft.retryCount = (draft.retryCount || 0) + 1;
     if (draft.retryCount >= 2) {
-      // User is talking about something else rather than giving address; break loop!
       delete db.orderDrafts[id]; saveStorage();
       return false;
     }
@@ -574,7 +606,6 @@ async function handleOrderFlow(senderId, text, messageId) {
     return true;
   }
 
-  // 4. All info present -> Create Order & Handover
   const created = createMessengerOrder(id, draft, messageId);
   delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
   await setTakeoverState(id, true, `Order created: ${created.order.id}`);
@@ -667,7 +698,7 @@ async function pushCatalogToGitHub(data, customToken, customRepo, customBranch, 
 }
 
 // -----------------------------------------------------------------------------
-// AI Prompt with Negative Constraints
+// AI Prompt with Constraints
 // -----------------------------------------------------------------------------
 function limitToFiveLines(text) {
   const lines = String(text || '').replace(/\r/g, '').split('\n').map(x => x.trim()).filter(Boolean);
@@ -700,10 +731,10 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
 হেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}।
 ডেলিভারি চার্জ নীতি: গাজীপুরের ভেতরে ৫০ টাকা, গাজীপুরের বাইরে সমগ্র বাংলাদেশে ১০০ টাকা।
 
-কঠোর নিয়মাবলি (Negative Constraints):
+কঠোর নিয়মাবলি:
 ১. কাস্টমার নিজে থেকে "অর্ডার করব", "অর্ডার নিতে চাই", "পাঠিয়ে দেন" এমন স্পষ্ট ইচ্ছা প্রকাশ না করা পর্যন্ত কাস্টমারের কাছে ডেলিভারির ঠিকানা বা ফোন নম্বর চাওয়া সম্পূর্ণ নিষিদ্ধ।
-২. কাস্টমার যদি কোনো এলাকার নাম বলে (যেমন: পাবনা, রাজশাহী, চট্টগ্রাম ইত্যাদি) বা বাইকের মডেল বলে (যেমন: Discover 125, Pulsar), তবে কোনোভাবেই ডেলিভারির ঠিকানা চাইবেন না; শুধুমাত্র তার প্রশ্নের সরাসরি উত্তর ও সংশ্লিষ্ট ডেলিভারি চার্জ (যেমন: গাজীপুরের বাইরে ১০০ টাকা) এবং ফিটিং সংক্রান্ত তথ্য জানাবেন।
-৩. হেডলাইট সকেট ও ফিটমেন্ট নিয়ম: বাইক বা গাড়ির যেকোনো মডেলে হেডলাইট বা সকেট (H4 / 3-pin Plug) মিলবে কিনা তা এআই নিজে বানিয়ে শতভাগ নিশ্চিত করবে না। স্পষ্টভাবে বলবেন যে: "হেডলাইটের সকেট ও প্লাগ আপনার বাইকে ফিট হবে কিনা তা আপনি নিজে সকেট দেখে নিশ্চিত হতে পারেন, অথবা আমাদের প্রতিনিধি যোগাযোগ করে নিশ্চিত করবেন।"
+২. কাস্টমার যদি কোনো এলাকার নাম বলে (যেমন: পাবনা, রাজশাহী ইত্যাদি) বা বাইকের মডেল বলে (যেমন: Discover 125, Pulsar), তবে কোনোভাবেই ডেলিভারির ঠিকানা চাইবেন না; শুধুমাত্র তার প্রশ্নের সরাসরি উত্তর, ডেলিভারি চার্জ (যেমন: গাজীপুরের বাইরে ১০০ টাকা) এবং ফিটিং সংক্রান্ত তথ্য জানাবেন।
+৩. হেডলাইট সকেট ও ফিটমেন্ট নিয়ম: বাইক বা গাড়ির যেকোনো মডেলে হেডলাইট বা সকেট (H4 / 3-pin Plug) মিলবে কিনা তা এআই নিজে বানিয়ে শতভাগ নিশ্চিত করবে না। বলবেন: "হেডলাইটের সকেট ও প্লাগ আপনার বাইকে ফিট হবে কিনা তা আপনি নিজে সকেট দেখে নিশ্চিত হতে পারেন, অথবা আমাদের প্রতিনিধি যোগাযোগ করে নিশ্চিত করবেন।"
 ৪. গ্রাহক যে ভাষায় প্রশ্ন করবেন, সেই ভাষায় সংক্ষিপ্ত, ভদ্র ও সর্বোচ্চ ৪-৫ লাইনের মধ্যে উত্তর দিন।
 ৫. ক্যাটালগ ও FAQ-তে থাকা তথ্যের বাইরে কাল্পনিক কোনো দাম, স্টক বা ওয়ারেন্টি বলবেন না।
 
@@ -771,17 +802,17 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
 // -----------------------------------------------------------------------------
 async function processCustomerMessage(senderId, text, attachments = [], messageId = null) {
   const id = String(senderId), customerText = String(text || '').trim();
-  if (getTakeoverState(id)) return;
+  if (getTakeoverState(id)) {
+    console.log(`[Takeover] Bot paused for ${id}; skipping AI response.`);
+    return;
+  }
 
   try {
-    // 1. Check if user explicitly wants to order
     if (isExplicitOrderIntent(customerText) || db.orderDrafts[id]) {
       const handled = await handleOrderFlow(id, customerText, messageId);
-      if (handled) return; // If successfully handled or collecting, stop here
-      // If handled is false (due to interrupt or retry exceeded), fall through to normal AI
+      if (handled) return;
     }
 
-    // 2. Billing & Delivery Charges Query (Without asking for address)
     if (isBillingQuestion(customerText)) {
       const context = getRecentConversationText(id, customerText);
       const p = findExactProduct(customerText) || findExactProduct(context) || findProductFromRecentContext(id);
@@ -794,7 +825,6 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
       }
     }
 
-    // 3. Price Query
     if (isPriceQuestion(customerText)) {
       const p = findExactProduct(customerText) || (isGenericPriceQuestion(customerText) ? findProductFromRecentContext(id) : null);
       if (p) {
@@ -804,13 +834,11 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
       }
     }
 
-    // 4. Media (Images/Videos) Query
     if (getMediaType(customerText)) {
       const reply = getProductMediaReply(customerText, id);
       if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply)); return; }
     }
 
-    // 5. Generate Standard AI Response
     let reply = await generateAIResponse(customerText, attachments, id);
     if (!reply) throw new Error('AI returned empty response');
 
@@ -844,129 +872,7 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
   try {
     if (req.body?.object !== 'page') return;
+
     for (const entry of req.body.entry || []) {
-      for (const event of entry.messaging || []) {
-        const senderId = event.sender?.id, message = event.message, messageId = message?.mid;
-
-        // Admin Echo & Takeover Commands (.ai / .human)
-        if (message?.is_echo && message?.text && event.recipient?.id) {
-          const echoCommand = normalizeText(message.text).replace(/\s+/g, '');
-          const targetCustomerId = String(event.recipient.id);
-          if (['.human', '.stop', '.pause'].includes(echoCommand)) {
-            await setTakeoverState(targetCustomerId, true, `Admin command ${echoCommand}`);
-          } else if (['.ai', '.resume'].includes(echoCommand)) {
-            delete db.pendingHandover[targetCustomerId];
-            await setTakeoverState(targetCustomerId, false, `Admin command ${echoCommand}`);
-          }
-          continue;
-        }
-
-        if (event.call && senderId) {
-          await setTakeoverState(senderId, true, 'Incoming call event');
-          await sendFacebookMessage(senderId, `কল করার জন্য ধন্যবাদ। জরুরি প্রয়োজনে সরাসরি যোগাযোগ করুন: ${HELPLINE}`);
-          continue;
-        }
-
-        if (event.postback && senderId) {
-          const payload = String(event.postback.payload || '').toUpperCase();
-          if (payload === 'HANDOVER_YES') await transferToHuman(senderId, 'Postback handover consent');
-          else if (payload === 'HANDOVER_NO') { delete db.pendingHandover[String(senderId)]; saveStorage(); await sendFacebookMessage(senderId, 'ঠিক আছে, আমি আপনাকে সাহায্য করছি।'); }
-          continue;
-        }
-
-        if (!message || message.is_echo || !senderId) continue;
-        if (messageId && processedMessageIds.has(messageId)) continue;
-        if (messageId) processedMessageIds.set(messageId, Date.now());
-
-        const text = String(message.text || '').trim(), attachments = message.attachments || [];
-        const previous = customerQueues.get(senderId) || Promise.resolve();
-
-        const task = previous.catch(() => {}).then(async () => {
-          const now = new Date().toISOString(), paused = getTakeoverState(senderId);
-          appendHistory(senderId, 'user', text || '[Media File]');
-          addStoredMessage({ id: 'msg_' + crypto.randomUUID(), senderId, sender: 'customer', text: text || `[Media]`, timestamp: now, messageId: messageId || null });
-
-          if (!db.customers[senderId]) {
-            db.customers[senderId] = { id: senderId, name: `Customer ${senderId.slice(-4)}`, messageCount: 1, lastActive: now, lastMessageText: text };
-          } else {
-            const c = db.customers[senderId]; c.messageCount = (c.messageCount || 0) + 1; c.lastActive = now; c.lastMessageText = text;
-          }
-
-          if (text) updateCustomerMemory(senderId, text);
-
-          // One-time introduction per customer
-          const customerRecord = db.customers[senderId] || {};
-          const command = normalizeText(text).replace(/\s+/g, '');
-          if (!customerRecord.introSent && !['.human', '.stop', '.pause', '.ai', '.resume'].includes(command)) {
-            customerRecord.introSent = true; db.customers[senderId] = customerRecord; saveStorage();
-            await sendFacebookMessage(senderId, FIRST_CONTACT_INTRO);
-          }
-
-          if (['.human', '.stop', '.pause'].includes(command)) {
-            await setTakeoverState(senderId, true, `Chat command ${command}`);
-            await sendFacebookMessage(senderId, 'Human takeover সক্রিয় করা হয়েছে। আমাদের প্রতিনিধি কথা বলবেন।');
-            return;
-          }
-
-          if (['.ai', '.resume'].includes(command)) {
-            await setTakeoverState(senderId, false, `Chat command ${command}`);
-            await sendFacebookMessage(senderId, 'AI সহকারী পুনরায় চালু হয়েছে। আপনাকে কীভাবে সাহায্য করতে পারি?');
-            return;
-          }
-
-          if (!paused && !customerHasOrder(senderId)) scheduleFollowup(senderId, Date.now());
-          else cancelFollowup(senderId);
-          saveStorage();
-
-          if (paused) return;
-
-          if (normalizeText(text) === 'প্রতিনিধি' || normalizeText(text) === 'human' || normalizeText(text) === 'agent') {
-            await askHandoverConsent(senderId, 'Customer requested agent');
-            return;
-          }
-
-          await processCustomerMessage(senderId, text, attachments, messageId || null);
-        });
-
-        customerQueues.set(senderId, task);
-        task.finally(() => { if (customerQueues.get(senderId) === task) customerQueues.delete(senderId); });
-      }
-    }
-  } catch (err) { console.error('[Webhook] Processing error:', err.message); }
-});
-
-// -----------------------------------------------------------------------------
-// Catalog & Admin APIs
-// -----------------------------------------------------------------------------
-app.get('/api/catalog', (req, res) => { const catalog = loadLocalCatalog(); res.json({ success: true, catalog, products: catalog.products || [], faqs: catalog.faqs || [], meta: catalogMeta }); });
-app.post('/api/catalog/sync', async (req, res) => { try { const data = req.body; validateCatalogShape(data); replaceCatalogAtomically(data, 'admin'); let gh = { synced: false }; if (GITHUB_TOKEN) gh = await pushCatalogToGitHub(data); res.json({ success: true, totalProducts: products.length, totalFaqs: faqs.length, githubSynced: gh.synced, meta: catalogMeta }); } catch (e) { res.status(400).json({ success: false, message: e.message }); } });
-app.post('/api/github/upload', async (req, res) => { try { const { catalog: payload, githubRepo, githubBranch, githubToken, githubFilePath } = req.body; const result = await pushCatalogToGitHub(payload || loadLocalCatalog(), githubToken || GITHUB_TOKEN, githubRepo || GITHUB_REPO, githubBranch || GITHUB_BRANCH, githubFilePath || CATALOG_FILE); if (!result.synced) return res.status(400).json({ success: false, message: result.error || result.message }); res.json({ success: true, commit: result.commit }); } catch (e) { res.status(400).json({ success: false, message: e.message }); } });
-
-// Health & Status
-app.get('/health', (req, res) => res.status(200).json({ success: true, status: 'ok', storage: pool ? 'postgresql' : 'memory-only' }));
-app.get('/api/status', (req, res) => res.json({ success: true, status: 'LIVE_PRODUCTION', catalogProducts: products.length, helpline: HELPLINE, whatsapp: WHATSAPP_NUMBER, timestamp: new Date().toISOString() }));
-
-// -----------------------------------------------------------------------------
-// Server Initialization
-// -----------------------------------------------------------------------------
-async function startServer() {
-  await initDatabase();
-  loadLocalCatalog();
-  await pullCatalogFromGitHub();
-  restoreFollowupTasks();
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] ImpoTech Bot running on port ${PORT}`);
-    console.log(`[CATALOG] ${products.length} products, ${faqs.length} FAQs loaded`);
-  });
-}
-startServer().catch(err => { console.error('[SERVER] Startup error:', err.message); process.exit(1); });
-
-setInterval(() => {
-  const cutoff = Date.now() - DUPLICATE_WINDOW_MS;
-  for (const [id, t] of processedMessageIds) if (t < cutoff) processedMessageIds.delete(id);
-}, 60000).unref();
-
-setInterval(() => {
-  pruneOldMemory();
-  saveStorage();
-}, FOLLOWUP_CHECK_INTERVAL_MS).unref();
+      // Support both normal messaging and standby (Handover protocol) events
+      const rawEvents = [...(entry.messaging || []), ...(entry.standb…[truncated]
