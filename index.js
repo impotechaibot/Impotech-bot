@@ -54,7 +54,7 @@ const MAX_FAQS_TO_AI = 3;
 const MAX_OUTPUT_TOKENS = 200;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
-const MAX_AI_LINES = 9;
+const MAX_AI_LINES = 5;
 const HISTORY_LIMIT = 20;
 const MESSAGE_RETENTION_LIMIT = 20000;
 const MEMORY_RETENTION_DAYS = 20;
@@ -477,9 +477,9 @@ function isVehicleHeadlightFitmentInquiry(currentText='', recentContext='') {
 // -----------------------------------------------------------------------------
 // Orders, phone/address collection, automatic contact-detail handover
 // -----------------------------------------------------------------------------
-function isExplicitOrderIntent(text='') { return /\b(i want to order|place my order|order this|i will buy|i want to buy|confirm my order|i want this)\b|অর্ডার করতে চাই|অর্ডার করব|অর্ডার করবো|অর্ডার দিন|অর্ডার করে দিন|অর্ডার দিতে চাই|অর্ডার কনফার্ম|কিনতে চাই|কিনব|কিনবো|নিতে চাই|নিব|নেব|এটা নেব|এটি নেব|এটা কিনব|কিনে নেব|কিনে নিব/i.test(text); }
+function isExplicitOrderIntent(text='') { const t=normalizeText(text); if (/(?:করব|করবো|কিনব|কিনবো|নেব|নিব|নিতে)\s*না|অর্ডার\s*(?:করব|করবো)?\s*না|not\s+(?:buy|order)|don't\s+(?:buy|order)|do not\s+(?:buy|order)/i.test(t)) return false; return /\b(i want to order|place my order|order this|i will buy|i want to buy|confirm my order|i want this|send it to me)\b|অর্ডার করতে চাই|অর্ডার করব|অর্ডার করবো|অর্ডার দিন|পাঠিয়ে দিন|পাঠিয়ে দিন|অর্ডার করে দিন|অর্ডার দিতে চাই|অর্ডার কনফার্ম|কিনতে চাই|কিনব|কিনবো|নিতে চাই|নিব|নেব|এটা নেব|এটি নেব|এটা কিনব|কিনে নেব|কিনে নিব/i.test(t); }
 function isYes(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|সম্মতি দিচ্ছি|ঠিক আছে|করুন|দেন|yes|yeah|y|ok|okay|sure|i agree|agree)$/i.test(normalizeText(text)); }
-function isNo(text='') { return /^(না|না ধন্যবাদ|রাজি নই|সম্মতি নেই|করবেন না|no|nope|n|don't|do not)$/i.test(normalizeText(text)); }
+function isNo(text='') { return /^(?:না(?:\s|$)|রাজি নই|সম্মতি নেই|করবেন না|করব না|করবো না|নিবো না|নেব না|কিনব না|কিনবো না|অর্ডার করব না|অর্ডার করবো না|থাক|লাগবে না|দরকার নেই|no(?:\s|$)|no thanks|nope|n|don't|do not|not now)/i.test(normalizeText(text)); }
 function extractPhone(text='') { const m=String(text).match(/(?:\+?8801|01)[0-9\s-]{8,14}/); if (!m) return null; const n=m[0].replace(/[\s-]/g,''); return /^\+?8801\d{9}$/.test(n) || /^01\d{9}$/.test(n) ? n : null; }
 function extractAddress(text='') {
   const t=String(text||'').trim();
@@ -550,22 +550,36 @@ function createMessengerOrder(senderId, draft, messageId) {
   db.customers[id].lastOrderId=order.id;db.customers[id].lastOrderAt=order.createdAt;db.customers[id].phone=order.customerPhone;db.customers[id].address=order.customerAddress;cancelFollowup(id);saveStorage();return {order,created:true};
 }
 async function handleOrderFlow(senderId, text, messageId) {
-  const id=String(senderId), customer=db.customers[id]||{}, old=db.orderDrafts[id]||{};
-  const draft={...old,customerMessage:[old.customerMessage,text].filter(Boolean).join('\n').slice(-1000)};
-  const product=identifyOrderedProduct(id,text); if(product)draft.product=product;
-  const phone=extractPhone(text); if(phone){draft.phone=phone;customer.phone=phone;}
-  const address=extractAddress(text); if(address){draft.address=address;customer.address=address;}
-  db.customers[id]=customer;
-  if(!draft.product) { db.orderDrafts[id]=draft;saveStorage();await sendFacebookMessage(id,'আপনি কোন পণ্যটি অর্ডার করতে চান? পণ্যের সঠিক নাম বা মডেলটি লিখুন।');return true; }
-  if(!draft.phone) { db.orderDrafts[id]=draft;saveStorage();await sendFacebookMessage(id,`${draft.product.name} অর্ডারের জন্য আপনার সচল মোবাইল নম্বরটি দিন।`);return true; }
-  if(!draft.address) { db.orderDrafts[id]=draft;saveStorage();await sendFacebookMessage(id,'ডেলিভারির সম্পূর্ণ ঠিকানা লিখুন—এলাকা/গ্রাম, থানা/উপজেলা ও জেলা সহ।');return true; }
-  draft.messageId=messageId||draft.messageId||null;
-  draft.messageId=messageId||draft.messageId||null;
-  const created=createMessengerOrder(id,draft,draft.messageId);
+  const id = String(senderId), customer = db.customers[id] || {}, old = db.orderDrafts[id] || {};
+  const draft = { ...old, customerMessage: [old.customerMessage, text].filter(Boolean).join('\n').slice(-1000) };
+  const product = identifyOrderedProduct(id, text); if (product) draft.product = product;
+  const phone = extractPhone(text); if (phone) { draft.phone = phone; customer.phone = phone; }
+  const address = extractAddress(text); if (address) { draft.address = address; customer.address = address; }
+  db.customers[id] = customer;
+  if (!draft.product) {
+    db.orderDrafts[id] = draft; saveStorage();
+    if (draft.lastAskedField !== 'product') { draft.lastAskedField = 'product'; saveStorage(); await sendFacebookMessage(id, 'আপনি কোন পণ্যটি অর্ডার করতে চান? পণ্যের সঠিক নাম বা মডেলটি লিখুন।'); }
+    else await sendFacebookMessage(id, 'পণ্যের নাম/মডেল জানালে অর্ডারটি এগিয়ে নিতে পারব। চাইলে অর্ডার না করেও পণ্য সম্পর্কে প্রশ্ন করতে পারেন।');
+    return true;
+  }
+  if (!draft.phone) {
+    db.orderDrafts[id] = draft; saveStorage();
+    if (draft.lastAskedField !== 'phone') { draft.lastAskedField = 'phone'; saveStorage(); await sendFacebookMessage(id, `${draft.product.name} অর্ডারের জন্য আপনার সচল মোবাইল নম্বরটি দিন।`); }
+    else await sendFacebookMessage(id, 'অর্ডার চালিয়ে যেতে চাইলে আপনার সচল মোবাইল নম্বরটি পাঠাতে পারেন।');
+    return true;
+  }
+  if (!draft.address) {
+    db.orderDrafts[id] = draft; saveStorage();
+    if (draft.lastAskedField !== 'address') { draft.lastAskedField = 'address'; saveStorage(); await sendFacebookMessage(id, 'ডেলিভারির সম্পূর্ণ ঠিকানা লিখুন—এলাকা/গ্রাম, থানা/উপজেলা ও জেলা সহ।'); }
+    else await sendFacebookMessage(id, 'অর্ডার চালিয়ে যেতে চাইলে ডেলিভারির সম্পূর্ণ ঠিকানা পাঠাতে পারেন।');
+    return true;
+  }
+  draft.messageId = messageId || draft.messageId || null;
+  const created = createMessengerOrder(id, draft, draft.messageId);
   delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
-  await setTakeoverState(id,true,`Order automatically handed to human ${created.order.id}`);
-  const billLines=created.order.total!==null?`\nবিল: ${created.order.productName} × ${created.order.quantity} = ${created.order.subtotal} টাকা; ডেলিভারি ${created.order.deliveryFee} টাকা; সর্বমোট ${created.order.total} টাকা।`:'\nচূড়ান্ত বিল প্রতিনিধি পণ্যের মূল্য ও ডেলিভারি চার্জ যাচাই করে জানাবেন।';
-  await sendFacebookMessage(id,`আপনার ${draft.product.name} অর্ডারের তথ্য প্রতিনিধি টিমের কাছে পাঠানো হয়েছে।${billLines}\nপণ্য, ফোন ও ঠিকানা প্রতিনিধি যাচাই করে আপনার সঙ্গে যোগাযোগ করবেন। ${HELPLINE}`);
+  await setTakeoverState(id, true, `Order automatically handed to human ${created.order.id}`);
+  const billLines = created.order.total !== null ? `\nবিল: ${created.order.productName} × ${created.order.quantity} = ${created.order.subtotal} টাকা; ডেলিভারি ${created.order.deliveryFee} টাকা; সর্বমোট ${created.order.total} টাকা।` : '\nচূড়ান্ত বিল প্রতিনিধি পণ্যের মূল্য ও ডেলিভারি চার্জ যাচাই করে জানাবেন।';
+  await sendFacebookMessage(id, `আপনার ${draft.product.name} অর্ডারের তথ্য প্রতিনিধি টিমের কাছে পাঠানো হয়েছে।${billLines}\nপণ্য, ফোন ও ঠিকানা প্রতিনিধি যাচাই করে আপনার সঙ্গে যোগাযোগ করবেন। ${HELPLINE}`);
   return true;
 }
 
@@ -642,12 +656,36 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
       ].join('\n')).join('\n\n')
     : 'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
   const faqContext = relevantFaqs.length
-    ? relevantFaqs.map((f, i) => `[FAQ ${i + 1}] ${f.question || ''}\n${f.answer || ''}`).join('\n\n')
+    ? relevantFaqs.map((f, i) => `[FAQ ${i + 1}] ${f.question || f.q || ''}\n${f.answer || ''}`).join('\n\n')
     : 'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
   const historyContext = history.length
     ? history.map(x => `${x.role === 'assistant' ? 'বট/প্রতিনিধি' : 'গ্রাহক'}: ${x.text}`).join('\n')
     : 'পূর্ববর্তী কথোপকথন নেই।';
-  return `আপনি ImpoTech BD ফেসবুক পেজের ভদ্র, স্মার্ট ও সাহায্যকারী কাস্টমার সাপোর্ট সহকারী।\nহেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।\nডেলিভারি নীতি: গাজীপুরের ভেতরে ৫০ টাকা, গাজীপুরের বাইরে ১০০ টাকা।\n\nউত্তরের নিয়ম:\n১) গ্রাহক যে ভাষায় লিখবেন, সেই ভাষায় স্বাভাবিক Messenger-উপযোগী ভাষায় সরাসরি উত্তর দিন। প্রথমেই মূল উত্তর দিন; অপ্রাসঙ্গিক তথ্য বা অযথা ভূমিকা দেবেন না।\n২) ক্যাটালগ ও FAQ-তে থাকা পণ্যের নাম, দাম, স্টক, স্পেসিফিকেশন, বৈশিষ্ট্য ও ডেলিভারি তথ্য নির্ভুলভাবে ব্যবহার করুন। তথ্য নেই এমন দাম, ওয়ারেন্টি, স্টক বা বৈশিষ্ট্য বানিয়ে বলবেন না। পণ্যের ID, নাম, মূল্য বা URL পরিবর্তন করবেন না।\n৩) ফগ লাইট সম্পর্কে গ্রাহক তথ্য চাইলে তথ্য দেওয়া থেকে বিরত থাকবেন না। প্রাসঙ্গিক ক্যাটালগ/FAQ দেখে মডেল, বৈশিষ্ট্য, আলো, ব্যবহার, দাম, ছবি/ভিডিও বা উপলভ্য তথ্য সরাসরি ব্যাখ্যা করুন। তথ্য অনুপস্থিত থাকলে শুধু যে তথ্যটি নেই সেটি স্পষ্ট করে বলুন এবং প্রয়োজন হলে নির্দিষ্ট পণ্যের নাম জানতে চান।\n৪) হেডলাইট ফিটমেন্ট নিয়ম: বাইক বা গাড়ির কোনো মডেলে হেডলাইট ফিট হবে কি না, H4 Plug/Socket মিলবে কি না, বা সরাসরি লাগবে কি না—নিজে যাচাই, অনুমান, ব্যাখ্যা বা প্রতিশ্রুতি দেবেন না। অ্যাপ্লিকেশন পর্যায়ে এ ধরনের প্রশ্নের জন্য নির্দিষ্ট উত্তর পাঠানো হয়: “${VEHICLE_FITMENT_HANDOFF_REPLY}”। এই নিয়মের বাইরে কখনো H4, 3-pin, সকেটের ধরন, Plug and Play, ডাইমেনশন, AC/DC, তার সংযোগ বা টেকনিক্যাল সার্ভিস সম্পর্কে নিজে থেকে নির্দেশ দেবেন না। সাধারণ পণ্যের পরিচিতি/ক্যাটালগ-ভিত্তিক স্পেসিফিকেশন জানতে চাইলে সেই তথ্য দিতে পারবেন, কিন্তু যানবাহনে ফিটমেন্ট নিশ্চিত করবেন না।\n৫) আগের কথোপকথন, সর্বশেষ বার্তা, গ্রাহক মেমোরি এবং সক্রিয় পণ্যের তথ্য ব্যবহার করুন। “এটা”, “ওটা”, “ছবিটা”, “দাম কত?”, “এটা নেব” ইত্যাদি ফলো-আপে প্রাসঙ্গিক পূর্ববর্তী পণ্য বুঝে উত্তর দিন; ইতিহাসে থাকলে আগের তথ্য পুনরায় জানতে চাইবেন না। একাধিক মেসেজে দেওয়া তথ্য একত্রে বিবেচনা করুন।\n৬) সাধারণ প্রশ্নের উত্তর নিজেই দিন। কেবল জটিল, অস্পষ্ট, অভিযোগ-সংক্রান্ত বা নির্ভরযোগ্যভাবে সমাধান করতে না-পারা সমস্যায় মানব প্রতিনিধির সঙ্গে সংযোগের অনুমতি চান। তখন জিজ্ঞেস করুন: “আমি কি আপনাকে আমাদের একজন প্রতিনিধির সাথে কানেক্ট করে দেব?” অথবা, AI প্রশ্ন বুঝতে না পারলে: “আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো?” গ্রাহকের সম্মতি ছাড়া শুধু এমন প্রশ্নের কারণে human handover চালু করতে বলবেন না। অর্ডার, কল, অথবা সম্পূর্ণ যোগাযোগের তথ্য জমা দেওয়ার প্রতিষ্ঠিত ব্যাকএন্ড প্রক্রিয়াগুলো আলাদাভাবে কাজ করতে পারে।\n৭) অস্পষ্ট হলে একবারে একটি নির্দিষ্ট ও প্রাসঙ্গিক প্রশ্ন করুন। আগেই উত্তর দেওয়া বিষয়ে অকারণে একই প্রশ্ন করবেন না।\n৮) প্রয়োজনমতো সর্বোচ্চ ${MAX_AI_LINES}টি ছোট লাইন ব্যবহার করুন। অপ্রাসঙ্গিক মানব হ্যান্ডওভার, অনুমানভিত্তিক টেকনিক্যাল পরামর্শ বা গ্রাহকের প্রশ্নের সঙ্গে সম্পর্কহীন উত্তর দেবেন না। ${HANDOVER_MARKER} নিজে থেকে লিখবেন না; ব্যাকএন্ড আলাদাভাবে সম্মতি পরিচালনা করে। ব্যক্তিগত তথ্য অপ্রয়োজনে প্রকাশ করবেন না।\n\nগ্রাহক মেমোরি:\n${memoryContext}\n\nপ্রাসঙ্গিক পণ্য:\n${productContext}\n\nFAQ:\n${faqContext}\n\nকথোপকথন:\n${historyContext}`;
+  return `আপনি ImpoTech BD ফেসবুক পেজের অত্যন্ত পেশাদার, স্মার্ট ও সাহায্যকারী কাস্টমার সাপোর্ট এজেন্ট।
+হেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
+ডেলিভারি চার্জ: গাজীপুরের ভেতরে ৫০ টাকা, গাজীপুরের বাইরে ১০০ টাকা।
+
+কঠোর কনভার্সেশনাল নিয়ম:
+১) প্রশ্ন বনাম অর্ডার: গ্রাহক স্পষ্টভাবে অর্ডার করার ইচ্ছা না জানানো পর্যন্ত কখনো ফোন নম্বর, ডেলিভারি ঠিকানা বা ব্যক্তিগত তথ্য চাইবে না। পণ্যের বিবরণ, দাম, স্টক, ছবি/ভিডিও, বাইকের মডেল, ফিটমেন্ট বা ডেলিভারি চার্জের প্রশ্নের সরাসরি উত্তর দেবে। শুধু “দাম কত”, “ফিট হবে?”, “ছবি দিন” বা “ডেলিভারি চার্জ কত” বললে অর্ডার শুরু করবে না।
+২) অর্ডার শুরু: কেবল “অর্ডার করতে চাই”, “পাঠিয়ে দিন”, “কিনব/নেব” বা সমার্থক স্পষ্ট সম্মতির পর ব্যাকএন্ডের অর্ডার প্রক্রিয়া চলবে। অর্ডার চলাকালে আগের কথোপকথন ও draft-এ থাকা পণ্য, ফোন এবং ঠিকানা ব্যবহার করবে; ইতিমধ্যে পাওয়া তথ্য আবার চাইবে না।
+৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
+৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। catalog.json ও FAQ-ই পণ্যের তথ্যের মূল উৎস। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
+৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: কোনো যানবাহনে হেডলাইট ফিট হবে কি না, সকেট/প্লাগ মিলবে কি না—নিজে থেকে ১০০% নিশ্চয়তা, অনুমান বা টেকনিক্যাল সিদ্ধান্ত দেবে না। এ ধরনের প্রশ্নে শুধু এই উত্তর দেবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
+৬) মেমোরি ও প্রসঙ্গ: পূর্ববর্তী কথোপকথন, customer memory, সক্রিয় পণ্য ও বর্তমান অর্ডার ড্রাফট ব্যবহার করবে। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে ইতিহাসে থাকা পণ্য বুঝে নেবে; একই তথ্য অকারণে আবার চাইবে না।
+৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
+৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
+
+গ্রাহক মেমোরি:
+${memoryContext}
+
+প্রাসঙ্গিক পণ্য:
+${productContext}
+
+FAQ:
+${faqContext}
+
+কথোপকথন:
+${historyContext}`;
 }
 async function callOpenRouter(messages,model=TEXT_MODEL) {
   if(!OPENROUTER_API_KEY)throw new Error('OPENROUTER_API_KEY is not configured');
@@ -700,6 +738,14 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       await sendFacebookMessage(id, VEHICLE_FITMENT_HANDOFF_REPLY);
       return;
     }
+    // Delivery-charge questions are informational, not order intent; never request address/phone for them.
+    if (/(?:ডেলিভারি|কুরিয়ার|কুরিয়ার)\s*(?:চার্জ|খরচ)|delivery\s*charge|courier\s*(?:fee|charge)/i.test(customerText) && !/(?:সর্বমোট|মোট বিল|grand total|total bill|invoice)/i.test(customerText)) {
+      const place = normalizeText(customerText);
+      if (/গাজীপুরের\s*(?:ভেতরে|মধ্যে|ভিতরে)|inside\s*gazipur|within\s*gazipur/i.test(place)) await sendFacebookMessage(id, 'গাজীপুরের ভেতরে ডেলিভারি চার্জ ৫০ টাকা।');
+      else if (/গাজীপুরের\s*(?:বাইরে)|outside\s*gazipur|outside\s*of\s*gazipur/i.test(place)) await sendFacebookMessage(id, 'গাজীপুরের বাইরে ডেলিভারি চার্জ ১০০ টাকা।');
+      else await sendFacebookMessage(id, 'ডেলিভারি চার্জ গাজীপুরের ভেতরে ৫০ টাকা এবং গাজীপুরের বাইরে ১০০ টাকা।');
+      return;
+    }
     // A billing question must still be answered while an order draft or handover prompt is pending.
     if (isBillingQuestion(customerText)) {
       const context=getRecentConversationText(id,customerText);
@@ -718,6 +764,12 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       if(isNo(customerText)){delete db.pendingHandover[id];saveStorage();await sendFacebookMessage(id,'ঠিক আছে, আপাতত AI সহায়তা চালু থাকছে। কীভাবে সাহায্য করতে পারি?');return;}
       delete db.pendingHandover[id]; saveStorage();
       console.log(`[Handover] Cleared stale consent prompt for ${id}; processing new message normally`);
+    }
+    // Explicit refusal during an order draft cancels it and stops all detail requests.
+    if (db.orderDrafts[id] && isNo(customerText)) {
+      delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
+      await sendFacebookMessage(id, 'ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।');
+      return;
     }
     // Order draft in progress. A yes is consent to save/transfer only after all details are gathered.
     if(db.orderDrafts[id]) {
