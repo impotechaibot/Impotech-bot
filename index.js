@@ -252,12 +252,13 @@ function updateCustomerMemory(senderId, customerText) {
   const text = String(customerText || '').trim();
   if (!senderId || !text || text.length > 1000) return;
   const id = String(senderId), memory = getCustomerMemory(id), customer = db.customers[id] || {};
-  const matches = products.map(product => ({ product, score: productScore(text, product) })).filter(x => x.score > 0).sort((a,b) => b.score-a.score);
-  if (matches.length && (matches.length === 1 || matches[0].score > matches[1].score)) {
-    addUniqueMemoryItem(memory.facts, `আলোচিত পণ্য: ${matches[0].product.name} (ID: ${matches[0].product.id})`);
-    // A clearly identified new product replaces the previous topic; generic follow-ups do not.
-    customer.activeProductId = matches[0].product.id;
-    customer.activeProductName = matches[0].product.name || null;
+  // Active product may change only when the customer explicitly names one unique catalog product.
+  // Fuzzy matches from generic follow-up messages must never switch the active product.
+  const explicitlyNamedProduct = findExactProduct(text);
+  if (explicitlyNamedProduct) {
+    addUniqueMemoryItem(memory.facts, `আলোচিত পণ্য: ${explicitlyNamedProduct.name} (ID: ${explicitlyNamedProduct.id})`);
+    customer.activeProductId = explicitlyNamedProduct.id;
+    customer.activeProductName = explicitlyNamedProduct.name || null;
   }
   const phone = text.match(/(?:\+?8801|01)[0-9\s-]{8,14}/);
   if (phone) customer.phone = phone[0].replace(/[\s-]/g, '');
@@ -642,7 +643,7 @@ async function pushCatalogToGitHub(data,customToken,customRepo,customBranch,cust
 // AI prompt and OpenRouter
 // -----------------------------------------------------------------------------
 function limitToFiveLines(text) { const lines=String(text||'').replace(/\r/g,'').split('\n').map(x=>x.trim()).filter(Boolean);return lines.slice(0,MAX_AI_LINES).join('\n'); }
-function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContext) {
+function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContext, activeProduct = null) {
   const productContext = relevantProducts.length
     ? relevantProducts.map((p, i) => [
         `[পণ্য ${i + 1}]`, `ID: ${p.id || 'N/A'}`, `নাম: ${p.name || 'N/A'}`,
@@ -671,9 +672,16 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
 ৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। catalog.json ও FAQ-ই পণ্যের তথ্যের মূল উৎস। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: কোনো যানবাহনে হেডলাইট ফিট হবে কি না, সকেট/প্লাগ মিলবে কি না—নিজে থেকে ১০০% নিশ্চয়তা, অনুমান বা টেকনিক্যাল সিদ্ধান্ত দেবে না। এ ধরনের প্রশ্নে শুধু এই উত্তর দেবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
-৬) মেমোরি ও প্রসঙ্গ: পূর্ববর্তী কথোপকথন, customer memory, সক্রিয় পণ্য ও বর্তমান অর্ডার ড্রাফট ব্যবহার করবে। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে ইতিহাসে থাকা পণ্য বুঝে নেবে; একই তথ্য অকারণে আবার চাইবে না।
-৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
-৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
+৬) Active Product Memory & Context Lock (অত্যন্ত গুরুত্বপূর্ণ):
+- বর্তমান সক্রিয় পণ্য: ${activeProduct ? `${activeProduct.name} (ID: ${activeProduct.id})` : 'এখনো কোনো নির্দিষ্ট সক্রিয় পণ্য শনাক্ত হয়নি'}।
+- গ্রাহক যে নির্দিষ্ট ক্যাটালগ পণ্যটি প্রথম স্পষ্টভাবে উল্লেখ করেছে, সেটি activeProduct হিসেবে ধরে রাখবে। “ছবি দেখাও”, “ছবি কই?”, “দাম কত?”, “কম হবে না?”, “এটা ফিট হবে?”, “ভিডিও দাও” বা অন্য সংক্ষিপ্ত follow-up সবসময় ওই সক্রিয় পণ্য সম্পর্কেই বুঝবে।
+- গ্রাহক নতুন পণ্যের নাম স্পষ্টভাবে উল্লেখ না করলে সক্রিয় পণ্য বদলাবে না। সাধারণ প্রশ্ন, সর্বনাম, ছবি/ভিডিও চাওয়া, দাম জানতে চাওয়া বা অস্পষ্ট শব্দ দেখে অন্য পণ্য নির্বাচন করা সম্পূর্ণ নিষিদ্ধ।
+- সক্রিয় পণ্য শনাক্ত থাকলে কেবল ওই পণ্যের ক্যাটালগ তথ্য ব্যবহার করবে; অন্য পণ্যের দাম, ছবি, ভিডিও বা বৈশিষ্ট্য মিশিয়ে দেবে না। ওই পণ্যের তথ্য ক্যাটালগে না থাকলে তা স্পষ্টভাবে বলবে, অন্য পণ্যের তথ্য দিয়ে পূরণ করবে না।
+- গ্রাহক নিজে নতুন কোনো নির্দিষ্ট পণ্যের নাম বললে তবেই সেটিকে নতুন activeProduct হিসেবে গ্রহণ করবে; এরপরের follow-up নতুন পণ্যটির হবে।
+- সক্রিয় পণ্য মেমোরিতে/কাস্টমার রেকর্ডে সংরক্ষিত থাকবে, যাতে একাধিক বার্তা ও পরবর্তী কথোপকথনেও ধারাবাহিকতা বজায় থাকে।
+৭) মেমোরি ও অর্ডার প্রসঙ্গ: পূর্ববর্তী কথোপকথন, customer memory, সক্রিয় পণ্য ও বর্তমান অর্ডার ড্রাফট ব্যবহার করবে। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে সক্রিয় পণ্যকে অগ্রাধিকার দেবে; একই তথ্য অকারণে আবার চাইবে না।
+৮) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
+৯) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
 
 গ্রাহক মেমোরি:
 ${memoryContext}
@@ -714,7 +722,7 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const activeProduct = explicitProduct || findActiveProduct(senderId);
   const relevantProducts = activeProduct ? [activeProduct] : findRelevantProducts(context);
   const relevantFaqs=findRelevantFaqs(context);
-  const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory);
+  const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,activeProduct);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
   const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
   if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন। অনিশ্চিত হলে তা জানান।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL));}catch(e){console.error('[VOICE] Failed:',e.message);}}
