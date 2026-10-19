@@ -60,6 +60,9 @@ const MESSAGE_RETENTION_LIMIT = 20000;
 const MEMORY_RETENTION_DAYS = 20;
 const MEMORY_RETENTION_MS = MEMORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
+// Add a human-like response delay to each inbound customer turn (3–5 seconds).
+const RESPONSE_DELAY_MIN_MS = 3000;
+const RESPONSE_DELAY_MAX_MS = 5000;
 const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
 const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
 const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
@@ -163,6 +166,46 @@ function normalizeText(value = '') {
     .replace(/[^\p{L}\p{N}\s৳$.-]/gu, ' ').replace(/\s+/g, ' ').trim();
 }
 function tokenize(value = '') { return normalizeText(value).split(/\s+/).filter(word => word.length >= 2); }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+async function waitBeforeCustomerReply() {
+  const span = RESPONSE_DELAY_MAX_MS - RESPONSE_DELAY_MIN_MS;
+  const delay = RESPONSE_DELAY_MIN_MS + crypto.randomInt(0, span + 1);
+  await sleep(delay);
+}
+function getRecentAssistantReplies(senderId, limit = 8) {
+  return getHistory(senderId)
+    .filter(item => item.role === 'assistant' && String(item.text || '').trim())
+    .slice(-limit)
+    .map(item => String(item.text).trim());
+}
+function splitReplySentences(text = '') {
+  return String(text || '').split(/(?<=[.!?।])\\s+|\\n+/).map(x => x.trim()).filter(Boolean);
+}
+function sentenceSimilarity(a, b) {
+  const aa = new Set(tokenize(a)), bb = new Set(tokenize(b));
+  if (!aa.size || !bb.size) return 0;
+  let common = 0;
+  for (const token of aa) if (bb.has(token)) common++;
+  return common / (aa.size + bb.size - common);
+}
+// Remove repeated long descriptive sentences, while keeping short factual answers (e.g. a price).
+function removeRepeatedDescription(reply, senderId) {
+  const previousSentences = getRecentAssistantReplies(senderId, 10).flatMap(splitReplySentences);
+  const kept = splitReplySentences(reply).filter(sentence => {
+    const normalized = normalizeText(sentence);
+    if (normalized.length < 40) return true;
+    return !previousSentences.some(old => {
+      const oldNorm = normalizeText(old);
+      if (oldNorm.length < 40) return false;
+      return oldNorm === normalized || sentenceSimilarity(sentence, old) >= 0.76;
+    });
+  });
+  if (kept.length) return kept.join('\\n');
+  return 'আগের পণ্যের বিবরণ পুনরাবৃত্তি করছি না। নতুন করে যে নির্দিষ্ট তথ্যটি জানতে চান, সেটির সরাসরি উত্তর দেব।';
+}
+function limitToThreeLines(text) {
+  return String(text || '').replace(/\\r/g, '').split('\\n').map(x => x.trim()).filter(Boolean).slice(0, 3).join('\\n');
+}
 function addStoredMessage(message) {
   db.messages.push(message);
   if (db.messages.length > MESSAGE_RETENTION_LIMIT) db.messages.splice(0, db.messages.length - MESSAGE_RETENTION_LIMIT);
@@ -681,7 +724,15 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
 - সক্রিয় পণ্য মেমোরিতে/কাস্টমার রেকর্ডে সংরক্ষিত থাকবে, যাতে একাধিক বার্তা ও পরবর্তী কথোপকথনেও ধারাবাহিকতা বজায় থাকে।
 ৭) মেমোরি ও অর্ডার প্রসঙ্গ: পূর্ববর্তী কথোপকথন, customer memory, সক্রিয় পণ্য ও বর্তমান অর্ডার ড্রাফট ব্যবহার করবে। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে সক্রিয় পণ্যকে অগ্রাধিকার দেবে; একই তথ্য অকারণে আবার চাইবে না।
 ৮) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
-৯) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
+৯) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সাধারণ প্রশ্নের উত্তর ১–৩টি ছোট লাইনে দেবে; অপ্রয়োজনীয় ভূমিকা নয়।
+১০) Anti-Repetition / History Check (অবশ্যই মানবে):
+- উত্তর দেওয়ার আগে কথোপকথনের ইতিহাসে বট/প্রতিনিধি আগে কী বলেছে তা যাচাই করবে।
+- কোনো পণ্যের নাম, পরিচিতি, ফিচার বা বর্ণনা একবার বিস্তারিত বলা হয়ে গেলে পরের বার্তায় একই প্যারাগ্রাফ/বর্ণনা কপি-পেস্ট করবে না—ভয়েস, ছবি বা follow-up হলেও নয়।
+- নতুন বার্তার সুনির্দিষ্ট প্রশ্নের উত্তরটুকুই দেবে। যেমন, আগে পণ্যের পরিচিতি দেওয়া থাকলে “এটা ১২ ভোল্টে চলবে?” প্রশ্নে শুধু ক্যাটালগে নিশ্চিত থাকলে ১২ ভোল্ট-সংক্রান্ত উত্তর দেবে; নতুন করে পণ্যের ভূমিকা/সুবিধা লিখবে না।
+- আগে পাঠানো বাক্য/তথ্য অপ্রয়োজনীয়ভাবে পুনরাবৃত্তি করবে না। তবে নতুন প্রশ্নের উত্তর দিতে প্রয়োজনীয় সংক্ষিপ্ত তথ্য ক্যাটালগ/FAQ অনুযায়ী বলতে পারবে; কখনো তথ্য বানাবে না।
+- ভয়েস/ছবির ইনপুটে প্রথমে ইনপুটের আসল প্রশ্ন/অনুরোধ শনাক্ত করবে; সেটির বাইরে অপ্রয়োজনীয় পণ্যের বিবরণ যোগ করবে না। উত্তর সাধারণত ১–৩ লাইনের হবে।
+- সক্রিয় পণ্য অপরিবর্তিত থাকবে, যদি না গ্রাহক স্পষ্টভাবে অন্য পণ্যের নাম উল্লেখ করে।
+১১) প্রতিক্রিয়ার সময়: সার্ভার ইনবাউন্ড মেসেজ পাওয়ার ৩–৫ সেকেন্ড পর উত্তর পাঠাবে। এই সময়টি ব্যাকএন্ডে প্রয়োগ করা হয়; তোমার উত্তরে অপেক্ষার কথা বলবে না।
 
 গ্রাহক মেমোরি:
 ${memoryContext}
@@ -725,10 +776,10 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,activeProduct);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
   const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
-  if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন। অনিশ্চিত হলে তা জানান।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL));}catch(e){console.error('[VOICE] Failed:',e.message);}}
+  if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');const voiceReply=await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'ভয়েস মেসেজের আসল প্রশ্ন/অনুরোধ বুঝে তার সরাসরি উত্তর দিন। আগের পণ্যের বর্ণনা বা ফিচার পুনরাবৃত্তি করবেন না। সাধারণত ১–৩ লাইনে উত্তর দিন; ক্যাটালগে নিশ্চিত নয় এমন তথ্য বলবেন না।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL);return limitToThreeLines(removeRepeatedDescription(voiceReply,senderId));}catch(e){console.error('[VOICE] Failed:',e.message);}}
   const image=attachments.find(x=>x.type==='image'&&x.payload?.url);
-  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি বিশ্লেষণ করে দৃশ্যমান পণ্য/বৈশিষ্ট্য সম্পর্কে উত্তর দিন। আগের কথোপকথনে থাকা প্রাসঙ্গিক তথ্য ব্যবহার করুন এবং ইতিমধ্যে দেওয়া মডেল/তথ্য আবার জিজ্ঞেস করবেন না। যানবাহনে হেডলাইট ফিটমেন্ট বা প্লাগ-ম্যাচিং নির্ধারণ করবেন না; এ বিষয়ে নির্দিষ্ট মানব-প্রতিনিধির বার্তাই ব্যবহার করতে হবে।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]));}catch(e){console.error('[VISION] Failed:',e.message);}}
-  return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:query}]));
+  if(image){try{const r=await axios.get(image.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');const imageReply=await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:`${query}\nছবিটি বিশ্লেষণ করে শুধু গ্রাহকের বর্তমান প্রশ্নের সরাসরি উত্তর দিন। আগে বলা পণ্যের পরিচিতি/বৈশিষ্ট্য পুনরাবৃত্তি করবেন না; সাধারণত ১–৩ লাইনে উত্তর দিন। যানবাহনে হেডলাইট ফিটমেন্ট বা প্লাগ-ম্যাচিং নির্ধারণ করবেন না; এ বিষয়ে নির্দিষ্ট মানব-প্রতিনিধির বার্তাই ব্যবহার করতে হবে।`},{type:'image_url',image_url:{url:`data:${r.headers['content-type']||'image/jpeg'};base64,${base64}`}}]}]);return limitToThreeLines(removeRepeatedDescription(imageReply,senderId));}catch(e){console.error('[VISION] Failed:',e.message);}}
+  const textReply=await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:query}]);return limitToThreeLines(removeRepeatedDescription(textReply,senderId));
 }
 function isCriticalHandoverQuestion(text='') { return /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/i.test(text); }
 function isConfusionReply(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|ঠিক আছে|yes|yeah|y|ok|okay|sure|না|no|nope|n)$/i.test(normalizeText(text)); }
@@ -824,8 +875,9 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       db.pendingHandover[id]={reason:'AI could not understand customer question',createdAt:new Date().toISOString()};saveStorage();return;
     }
     const previous=getPreviousAssistantReply(id,customerText);
-    if(previous&&normalizeText(previous)===normalizeText(reply))reply='আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
-    if(!getTakeoverState(id))await sendFacebookMessage(id,limitToFiveLines(reply));
+    if(previous&&normalizeText(previous)===normalizeText(reply))reply='আগের উত্তরে দেওয়া তথ্য পুনরাবৃত্তি করছি না। নতুন করে কোন নির্দিষ্ট তথ্যটি জানতে চান?';
+    reply=limitToThreeLines(removeRepeatedDescription(reply,id));
+    if(!getTakeoverState(id))await sendFacebookMessage(id,reply);
   } catch(err) {
     console.error('[AI] Response error:',err.message);if(getTakeoverState(id))return;
     await sendFacebookMessage(id,'আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো? “হ্যাঁ” বা “না” লিখুন। সিদ্ধান্ত নিতে সমস্যা হলে সরাসরি কল করুন: '+HELPLINE+'। WhatsApp: '+WHATSAPP_NUMBER+'।'); db.pendingHandover[id]={reason:'AI failed to answer; awaiting customer consent',createdAt:new Date().toISOString()}; saveStorage();
@@ -917,6 +969,8 @@ app.post('/webhook',async(req,res)=>{
       const previous=customerQueues.get(senderId)||Promise.resolve();
       const task=previous.catch(()=>{}).then(async()=>{
         if(messageId&&db.messages.some(m=>m.messageId===messageId))return;
+        // Delay all automated responses to this customer turn by a randomized 3–5 seconds.
+        await waitBeforeCustomerReply();
         const now=new Date().toISOString(),paused=getTakeoverState(senderId);
         appendHistory(senderId,'user',text||'[Media File]');
         addStoredMessage({id:'msg_'+crypto.randomUUID(),senderId,sender:'customer',text:text||`[Media: ${attachments[0]?.type||'file'}]`,timestamp:now,messageId:messageId||null});
