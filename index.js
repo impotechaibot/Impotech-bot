@@ -529,6 +529,68 @@ function getMissingActiveProductName(senderId) {
   const customer = db.customers[String(senderId || '')] || {};
   return String(customer.activeProductName || 'আপনার আলোচ্য পণ্য').trim();
 }
+function isPriceQuestion(text='') {
+  const t = normalizeText(text);
+  // Support English, Bangla and common Banglish spellings such as “Price koto” / “dam koto”.
+  return /\b(price|cost|how much|rate)\b|দাম|প্রাইস|মূল্য|কত টাকা|কত দাম|দাম কত|দামটা|কততে|\b(?:dam|daam|dham)\s*(?:koto|kotho)\b|\bkoto\s*(?:price|dam|daam|taka)\b/i.test(t);
+}
+function isContextDependentFollowup(text = '') {
+  const t = normalizeText(text);
+  if (!t) return false;
+  if (isPriceQuestion(t) || getMediaType(t)) return true;
+  if (/(?:ফিট\s*হবে|মিলবে\s*কি|ম্যাচ\s*করবে|compatible|will\s+it\s+fit|does\s+it\s+fit|fit\s+for\s+me|ওয়ারেন্টি|ওয়ারেন্টি|warranty|স্টক আছে|পাওয়া যাবে|পাওয়া যাবে|available আছে|available আছে কি)/i.test(t)) return true;
+  // Short pronoun-led follow-ups refer to the last product only when no new catalog item is named.
+  return t.length <= 100 && /(?:এটা|এটার|এটি|এটির|এইটা|এইটার|ওটা|ওটার|ওইটা|ওইটার|সেটা|সেটার|this|that|it|its|same one|same product)/i.test(t);
+}
+function findProductFromRecentAssistantHistory(senderId) {
+  const history = getHistory(senderId);
+  // The incoming customer message is usually the last history item; start immediately before it.
+  let start = history.length - 1;
+  if (start >= 0 && history[start].role === 'user') start--;
+  const floor = Math.max(0, history.length - HISTORY_LIMIT);
+  for (let i = start; i >= floor; i--) {
+    const item = history[i];
+    if (item.role !== 'assistant') continue;
+    const matches = findExplicitProductMentions(item.text || '');
+    if (matches.length === 1) return { found: true, product: matches[0] };
+    if (matches.length > 1) return { found: true, product: null };
+    // Generic bot follow-up prompts may not repeat the product name; keep scanning older bot turns.
+  }
+  return { found: false, product: null };
+}
+function findAssistantContextProduct(senderId, currentText = '') {
+  if (!isContextDependentFollowup(currentText)) return null;
+  const recent = findProductFromRecentAssistantHistory(senderId);
+  if (recent.found) return recent.product;
+  // Persisted assistant context bridges restarts/history truncation. Explicit customer-selected
+  // activeProductId still has priority and can never be overwritten by this contextual fallback.
+  const customer = db.customers[String(senderId || '')] || {};
+  const savedId = customer.assistantContextProductId;
+  const savedAt = new Date(customer.assistantContextProductAt || 0).getTime();
+  if (!savedId || !Number.isFinite(savedAt) || Date.now() - savedAt > MEMORY_RETENTION_MS) return null;
+  return products.find(p => String(p.id) === String(savedId)) || null;
+}
+function rememberAssistantProductContext(senderId, assistantText) {
+  const id = String(senderId || '');
+  if (!id) return;
+  const matches = findExplicitProductMentions(assistantText);
+  if (matches.length !== 1) {
+    // Multiple product names in one assistant message are ambiguous; don't leave a misleading lock.
+    if (matches.length > 1) {
+      if (!db.customers[id]) db.customers[id] = { id, name: `Customer ${id.slice(-4)}`, messageCount: 0 };
+      delete db.customers[id].assistantContextProductId;
+      delete db.customers[id].assistantContextProductName;
+      db.customers[id].assistantContextProductAt = new Date().toISOString();
+      saveStorage();
+    }
+    return;
+  }
+  if (!db.customers[id]) db.customers[id] = { id, name: `Customer ${id.slice(-4)}`, messageCount: 0 };
+  db.customers[id].assistantContextProductId = String(matches[0].id);
+  db.customers[id].assistantContextProductName = matches[0].name || null;
+  db.customers[id].assistantContextProductAt = new Date().toISOString();
+  saveStorage();
+}
 function resolveCurrentProduct(senderId, currentText = '', contextText = '') {
   const currentMatches = findExplicitProductMentions(currentText);
   if (currentMatches.length > 1) return null;
@@ -537,12 +599,13 @@ function resolveCurrentProduct(senderId, currentText = '', contextText = '') {
   // Never fall back to another product that appeared in older conversation history.
   const customer = db.customers[String(senderId || '')] || {};
   if (customer.activeProductId) return findActiveProduct(senderId);
+  const assistantContextProduct = findAssistantContextProduct(senderId, currentText);
+  if (assistantContextProduct) return assistantContextProduct;
   const contextMatches = findExplicitProductMentions(contextText);
   if (contextMatches.length === 1) return contextMatches[0];
   if (contextMatches.length > 1) return null;
   return findProductFromRecentContext(senderId);
 }
-function isPriceQuestion(text='') { return /\b(price|cost|how much|rate)\b|দাম|প্রাইস|মূল্য|কত টাকা|কত দাম|দাম কত|দামটা|কততে/i.test(normalizeText(text)); }
 function isGenericPriceQuestion(text = '') {
   const t = normalizeText(text);
   if (!isPriceQuestion(t)) return false;
@@ -723,6 +786,10 @@ async function sendFacebookMessage(recipientId, text) {
   try {
     const url=`https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
     const response=await axios.post(url,{recipient:{id:recipientId},message:{text:finalText},messaging_type:'RESPONSE'},{timeout:15000});
+    // Remember which single catalog item this bot message was about. This is a contextual hint,
+    // separate from customer-selected activeProductId, so a bot mention alone cannot override an
+    // explicitly selected product. It lets the next short follow-up resolve after process restart.
+    rememberAssistantProductContext(recipientId, finalText);
     appendHistory(recipientId,'assistant',finalText);
     addStoredMessage({id:'msg_bot_'+crypto.randomUUID(),senderId:recipientId,sender:'bot',text:finalText,timestamp:new Date().toISOString(),messageId:response.data?.message_id||null});
     saveStorage(); return true;
@@ -1066,7 +1133,7 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
   const explicitProduct = findExactProduct(query);
   if (explicitProduct) rememberActiveProduct(senderId, explicitProduct);
   const memory = buildCustomerMemoryContext(senderId);
-  const activeProduct = explicitProduct || findActiveProduct(senderId);
+  const activeProduct = explicitProduct || findActiveProduct(senderId) || findAssistantContextProduct(senderId, query);
   const customerRecord = db.customers[String(senderId || '')] || {};
   const activeProductMissingFromCatalog = Boolean(customerRecord.activeProductId) && !activeProduct && !explicitProduct;
   const relevantProducts = activeProduct ? [activeProduct] : (activeProductMissingFromCatalog ? [] : (findUniqueRelevantProduct(query) ? [findUniqueRelevantProduct(query)] : []));
@@ -1144,6 +1211,16 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
       }
     }
     const explicitProductMentions = findExplicitProductMentions(customerText);
+    // A customer can answer a bot's product-specific offer with only “Price koto”, “photo den”,
+    // etc. Treat that as confirmation of the one product the bot most recently discussed, rather
+    // than forgetting the context and asking them to name the product again.
+    if (!explicitProductMentions.length && !db.customers[id]?.activeProductId && isContextDependentFollowup(customerText)) {
+      const contextualProduct = findAssistantContextProduct(id, customerText);
+      if (contextualProduct) {
+        rememberActiveProduct(id, contextualProduct);
+        console.log(`[Memory] Context-locked ${contextualProduct.name} for follow-up from ${id}`);
+      }
+    }
     const activeProductAtStart = findActiveProduct(id);
     const hasSavedActiveProductLock = Boolean(db.customers[id]?.activeProductId);
     // Strong lock: ambiguous category words/aliases never override an existing active product.
@@ -1217,6 +1294,7 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
         return;
       }
       if (explicit) rememberActiveProduct(id, explicit);
+      // The customer asked for price only: answer the price directly; do not append an order prompt.
       await sendFacebookMessage(id, getPriceReply(p) || `দুঃখিত, ${p.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই।`);
       return;
     }
