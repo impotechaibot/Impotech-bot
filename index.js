@@ -68,7 +68,8 @@ const MEMORY_RETENTION_MS = MEMORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
 const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
 const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
-const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
+const LOCAL_CATALOG_PATH = path.resolve(__dirname, process.env.LOCAL_CATALOG_FILE || CATALOG_FILE || 'data/catalog.json');
+const LEGACY_CATALOG_PATH = path.join(__dirname, 'catalog.json');
 const LEGACY_DATA_FILE = path.join(__dirname, 'storage_data.json');
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 const ORDER_CONFIRMATION = 'আপনার অর্ডারের তথ্য সংরক্ষণ করা হয়েছে। আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করে অর্ডারটি নিশ্চিত করবেন।';
@@ -388,22 +389,64 @@ function applyCatalog(data, source = 'local') {
   faqs = Array.isArray(data.faqs) ? data.faqs.map(f => ({ ...f })) : [];
   catalogMeta = { version: data.version ?? null, updatedAt: data.updatedAt ?? null, source, lastSyncAt: new Date().toISOString(), lastSyncError: null };
 }
+function getCatalogReadPaths() {
+  return [...new Set([LOCAL_CATALOG_PATH, LEGACY_CATALOG_PATH])];
+}
 function loadLocalCatalog() {
-  try {
-    if (!fs.existsSync(LOCAL_CATALOG_PATH)) return { products, faqs, version: catalogMeta.version, updatedAt: catalogMeta.updatedAt };
-    const data = JSON.parse(fs.readFileSync(LOCAL_CATALOG_PATH, 'utf8'));
-    validateCatalogShape(data);
-    // Existing local file is the persisted baseline; load it as-is at startup.
-    applyCatalog(data, 'local');
-    return data;
-  } catch (err) { console.error('[CATALOG] Local load error:', err.message); catalogMeta.lastSyncError = err.message; return { products, faqs, version: catalogMeta.version, updatedAt: catalogMeta.updatedAt }; }
+  let lastError = null;
+  for (const filePath of getCatalogReadPaths()) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      validateCatalogShape(data);
+      // data/catalog.json (or LOCAL_CATALOG_FILE) is primary; root catalog.json is legacy fallback.
+      applyCatalog(data, filePath === LOCAL_CATALOG_PATH ? 'local-primary' : 'local-legacy');
+      return data;
+    } catch (err) {
+      lastError = err;
+      console.error(`[CATALOG] Local load error (${filePath}):`, err.message);
+    }
+  }
+  if (lastError) catalogMeta.lastSyncError = lastError.message;
+  return { products, faqs, version: catalogMeta.version, updatedAt: catalogMeta.updatedAt };
+}
+function writeCatalogFileAtomically(filePath, data) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temp = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(temp, filePath);
 }
 function saveLocalCatalog(data, source = 'local') {
   validateCatalogShape(data);
-  const temp = LOCAL_CATALOG_PATH + '.tmp';
-  fs.writeFileSync(temp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(temp, LOCAL_CATALOG_PATH);
+  // Write the admin-configured catalog path first, creating the data/ directory if needed.
+  writeCatalogFileAtomically(LOCAL_CATALOG_PATH, data);
+  // Keep the old root-level cache in sync so previous tooling/deployments continue to work.
+  if (path.resolve(LOCAL_CATALOG_PATH) !== path.resolve(LEGACY_CATALOG_PATH)) {
+    try { writeCatalogFileAtomically(LEGACY_CATALOG_PATH, data); }
+    catch (err) { console.error('[CATALOG] Legacy cache mirror failed:', err.message); }
+  }
   applyCatalog(data, source);
+}
+function refreshCatalogFromLocalFile() {
+  for (const filePath of getCatalogReadPaths()) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      validateCatalogShape(data);
+      const sameProducts = JSON.stringify(data.products) === JSON.stringify(products);
+      const sameFaqs = JSON.stringify(Array.isArray(data.faqs) ? data.faqs : []) === JSON.stringify(faqs);
+      const sameVersion = String(data.version ?? '') === String(catalogMeta.version ?? '')
+        && String(data.updatedAt ?? '') === String(catalogMeta.updatedAt ?? '');
+      if (!sameProducts || !sameFaqs || !sameVersion) {
+        applyCatalog(data, filePath === LOCAL_CATALOG_PATH ? 'local-hot-reload' : 'legacy-hot-reload');
+        console.log(`[CATALOG] Reloaded ${products.length} products and ${faqs.length} FAQs from ${path.relative(__dirname, filePath)}`);
+      }
+      return true;
+    } catch (err) {
+      console.error(`[CATALOG] Hot reload failed (${filePath}); keeping in-memory catalog:`, err.message);
+    }
+  }
+  return false;
 }
 loadLocalCatalog();
 
@@ -606,6 +649,35 @@ function resolveCurrentProduct(senderId, currentText = '', contextText = '') {
   if (contextMatches.length > 1) return null;
   return findProductFromRecentContext(senderId);
 }
+function findTopicSwitchProduct(query, activeProduct) {
+  const q = normalizeText(query);
+  if (!q) return null;
+  const explicitMatches = findExplicitProductMentions(query);
+  if (explicitMatches.length === 1) return String(explicitMatches[0].id) === String(activeProduct?.id) ? null : explicitMatches[0];
+  if (explicitMatches.length > 1) return null;
+
+  // Only compare identifying fields (name/model/SKU/aliases), never long descriptions.
+  // Common category words are intentionally ignored so "headlight price" cannot switch products.
+  const generic = new Set(['the','a','an','for','and','or','price','cost','how','much','what','is','it','this','that','same','product','photo','picture','image','video','reel','stock','available','order','buy','want','light','headlight','head','lamp','bulb','led','projector','bike','motorcycle','car','দাম','কত','টাকা','এই','এটা','এটির','এটার','ওটা','ছবি','ভিডিও','লাইট','হেডলাইট','বাল্ব','বাইক','গাড়ি','গাড়ি','দিতে','চাই','করতে','অর্ডার']);
+  const qTerms = new Set(tokenize(q).filter(t => t.length >= 3 && !generic.has(t)));
+  if (!qTerms.size) return null;
+
+  const identifyingFields = p => [p.name, p.model, p.sku, p.id, ...(Array.isArray(p.aliases) ? p.aliases : [])]
+    .filter(Boolean).join(' ');
+  const activeTerms = new Set(tokenize(identifyingFields(activeProduct || {})).filter(t => t.length >= 3 && !generic.has(t)));
+  const ranked = products.map(product => {
+    const terms = [...new Set(tokenize(identifyingFields(product)).filter(t => t.length >= 3 && !generic.has(t)))];
+    const overlap = terms.filter(t => qTerms.has(t));
+    const newDistinctive = overlap.filter(t => !activeTerms.has(t));
+    return { product, score: overlap.length, newDistinctive: newDistinctive.length };
+  }).filter(x => String(x.product.id) !== String(activeProduct?.id) && x.score > 0 && x.newDistinctive > 0)
+    .sort((a, b) => b.score - a.score || b.newDistinctive - a.newDistinctive);
+  if (!ranked.length) return null;
+  // Require a clear winner; ambiguous partial product names should be clarified rather than guessed.
+  if (ranked.length > 1 && ranked[0].score === ranked[1].score && ranked[0].newDistinctive === ranked[1].newDistinctive) return null;
+  return ranked[0].product;
+}
+
 function isGenericPriceQuestion(text = '') {
   const t = normalizeText(text);
   if (!isPriceQuestion(t)) return false;
@@ -790,6 +862,16 @@ async function sendFacebookMessage(recipientId, text) {
     // separate from customer-selected activeProductId, so a bot mention alone cannot override an
     // explicitly selected product. It lets the next short follow-up resolve after process restart.
     rememberAssistantProductContext(recipientId, finalText);
+    if (!db.customers[String(recipientId)]) db.customers[String(recipientId)] = { id: String(recipientId), name: `Customer ${String(recipientId).slice(-4)}`, messageCount: 0 };
+    const customerState = db.customers[String(recipientId)];
+    if (isBotAskingOrderConfirmation(finalText)) {
+      customerState.awaitingOrderConfirmation = true;
+      customerState.awaitingOrderConfirmationAt = new Date().toISOString();
+    } else {
+      // Do not let an old order prompt make a later “yes” start an unrelated order.
+      customerState.awaitingOrderConfirmation = false;
+      customerState.awaitingOrderConfirmationAt = null;
+    }
     appendHistory(recipientId,'assistant',finalText);
     addStoredMessage({id:'msg_bot_'+crypto.randomUUID(),senderId:recipientId,sender:'bot',text:finalText,timestamp:new Date().toISOString(),messageId:response.data?.message_id||null});
     saveStorage(); return true;
@@ -855,12 +937,19 @@ async function handleOrderFlow(senderId, text, messageId) {
     else await sendFacebookMessage(id, 'অর্ডার চালিয়ে যেতে চাইলে ডেলিভারির সম্পূর্ণ ঠিকানা পাঠাতে পারেন।');
     return true;
   }
+  // Never create an order from collected details alone. Show a summary and require clear final consent.
   draft.messageId = messageId || draft.messageId || null;
-  const created = createMessengerOrder(id, draft, draft.messageId);
-  delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
-  await setTakeoverState(id, true, `Order automatically handed to human ${created.order.id}`);
-  const billLines = created.order.total !== null ? `\nবিল: ${created.order.productName} × ${created.order.quantity} = ${created.order.subtotal} টাকা; ডেলিভারি ${created.order.deliveryFee} টাকা; সর্বমোট ${created.order.total} টাকা।` : '\nচূড়ান্ত বিল প্রতিনিধি পণ্যের মূল্য ও ডেলিভারি চার্জ যাচাই করে জানাবেন।';
-  await sendFacebookMessage(id, `আপনার ${draft.product.name} অর্ডারের তথ্য প্রতিনিধি টিমের কাছে পাঠানো হয়েছে।${billLines}\nপণ্য, ফোন ও ঠিকানা প্রতিনিধি যাচাই করে আপনার সঙ্গে যোগাযোগ করবেন। ${HELPLINE}`);
+  draft.awaitingFinalConfirmation = true;
+  draft.lastAskedField = 'confirmation';
+  db.orderDrafts[id] = draft;
+  db.pendingHandover[id] = {
+    orderDraft: true,
+    reason: 'Customer order confirmed for human verification',
+    createdAt: new Date().toISOString(),
+    promptSent: true
+  };
+  saveStorage();
+  await sendFacebookMessage(id, getOrderConfirmationMessage(draft));
   return true;
 }
 
@@ -1180,6 +1269,32 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
   }
   return limitToThreeLines(await callOpenRouter([{ role: 'system', content: system }, ...prior, { role: 'user', content: query }]));
 }
+function isBotAskingOrderConfirmation(text = '') {
+  const t = normalizeText(text);
+  return /(?:অর্ডার\s*(?:করতে|দিতে|কনফার্ম)\s*চান|কিনতে\s*চান|নিতে\s*চান|would you like to order|do you want to order|shall i place (?:the )?order|want me to place (?:the )?order)/i.test(t);
+}
+function isYesToOrderOffer(senderId, text = '') {
+  const customer = db.customers[String(senderId || '')] || {};
+  if (!isYes(text) || !customer.awaitingOrderConfirmation) return false;
+  const at = new Date(customer.awaitingOrderConfirmationAt || 0).getTime();
+  return Number.isFinite(at) && Date.now() - at <= 30 * 60 * 1000;
+}
+function getOrderConfirmationMessage(draft) {
+  const unit = parseCatalogPrice(draft?.product?.price);
+  const qty = Math.max(1, Number(draft?.quantity) || 1);
+  const subtotal = unit === null ? null : unit * qty;
+  const fee = getDeliveryFee(draft?.address || '');
+  const total = subtotal !== null && fee !== null ? subtotal + fee : null;
+  const bill = total === null ? 'চূড়ান্ত মূল্য প্রতিনিধি যাচাই করবেন।' : `পণ্যমূল্য ${subtotal} টাকা + ডেলিভারি ${fee} টাকা = মোট ${total} টাকা।`;
+  return `অর্ডারের তথ্য যাচাই করুন:
+পণ্য: ${draft.product?.name || 'নির্ধারিত নয়'}
+পরিমাণ: ${qty}
+ফোন: ${draft.phone}
+ঠিকানা: ${draft.address}
+${bill}
+অর্ডারটি সংরক্ষণ করে প্রতিনিধির কাছে পাঠাতে “হ্যাঁ”, বাতিল করতে “না” লিখুন।`;
+}
+
 function isCriticalHandoverQuestion(text='') { return /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/i.test(text); }
 function isConfusionReply(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|ঠিক আছে|yes|yeah|y|ok|okay|sure|না|no|nope|n)$/i.test(normalizeText(text)); }
 
@@ -1210,7 +1325,19 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
         return;
       }
     }
-    const explicitProductMentions = findExplicitProductMentions(customerText);
+    let explicitProductMentions = findExplicitProductMentions(customerText);
+    const productBeforeCurrentMessage = findActiveProduct(id);
+    // Topic-switch detection: if the current message contains distinctive identifiers for another
+    // catalog item, replace the prior active product before any price/media/AI routing happens.
+    if (!explicitProductMentions.length) {
+      // Works both when an old active product exists and when the prior topic was only in bot context.
+      const switchedProduct = findTopicSwitchProduct(customerText, productBeforeCurrentMessage);
+      if (switchedProduct) {
+        explicitProductMentions = [switchedProduct];
+        rememberActiveProduct(id, switchedProduct);
+        console.log(`[Memory] Topic selected/changed from ${productBeforeCurrentMessage?.name || 'no saved active product'} to ${switchedProduct.name} for ${id}`);
+      }
+    }
     // A customer can answer a bot's product-specific offer with only “Price koto”, “photo den”,
     // etc. Treat that as confirmation of the one product the bot most recently discussed, rather
     // than forgetting the context and asking them to name the product again.
@@ -1265,6 +1392,25 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
         return;
       }
     }
+    // A short “yes/জি/ঠিক আছে” is order intent only when the bot recently asked specifically
+    // whether the customer wants to order. It must not be confused with human-handover consent.
+    if (isYesToOrderOffer(id, customerText) && !db.orderDrafts[id]) {
+      const customerState = db.customers[id] || {};
+      customerState.awaitingOrderConfirmation = false;
+      customerState.awaitingOrderConfirmationAt = null;
+      db.customers[id] = customerState;
+      saveStorage();
+      await handleOrderFlow(id, 'আমি অর্ডার করতে চাই', messageId);
+      return;
+    }
+    // An explicit new product topic clears any stale order offer, so a later “yes” cannot order the old item.
+    if (explicitProductMentions.length === 1) {
+      const customerState = db.customers[id] || {};
+      customerState.awaitingOrderConfirmation = false;
+      customerState.awaitingOrderConfirmationAt = null;
+      db.customers[id] = customerState;
+      saveStorage();
+    }
     // Pending handover only consumes a clear yes/no. A new substantive question cancels the prompt and is handled normally.
     if(db.pendingHandover[id] && !db.pendingHandover[id].orderDraft) {
       if(isYes(customerText)){await transferToHuman(id,db.pendingHandover[id].reason);return;}
@@ -1281,6 +1427,7 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
     // An explicit refusal ends the sales loop; otherwise informational questions interrupt order-data collection.
     if (!db.orderDrafts[id] && isPurchaseDecline(customerText)) {
       cancelFollowup(id);
+      if (db.customers[id]) { db.customers[id].awaitingOrderConfirmation=false; db.customers[id].awaitingOrderConfirmationAt=null; saveStorage(); }
       await sendFacebookMessage(id, 'ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।');
       return;
     }
@@ -1308,17 +1455,27 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
       if(db.pendingHandover[id]?.orderDraft) {
         if(isYes(customerText)) {
           const created=createMessengerOrder(id,draft,draft.messageId||messageId);
-          delete db.orderDrafts[id];delete db.pendingHandover[id];saveStorage();
-          await setTakeoverState(id,true,`Customer consented to order handover ${created.order.id}`);
-          await sendFacebookMessage(id,ORDER_CONFIRMATION);return;
+          delete db.orderDrafts[id];delete db.pendingHandover[id];
+          if (db.customers[id]) { db.customers[id].awaitingOrderConfirmation=false; db.customers[id].awaitingOrderConfirmationAt=null; }
+          saveStorage();
+          await setTakeoverState(id,true,`Customer confirmed order; human verification required ${created.order.id}`);
+          await sendFacebookMessage(id, `${ORDER_CONFIRMATION}\nHuman Takeover: চালু হয়েছে। আমাদের প্রতিনিধি পণ্য, মূল্য, ফোন ও ঠিকানা যাচাই করে যোগাযোগ করবেন। ${HELPLINE}`);return;
         }
         if(isNo(customerText)){delete db.orderDrafts[id];delete db.pendingHandover[id];saveStorage();await sendFacebookMessage(id,'ঠিক আছে, অর্ডারটি জমা দেওয়া হয়নি এবং আপনার তথ্য প্রতিনিধির কাছে পাঠানো হবে না। চাইলে পরে আবার অর্ডার করতে পারবেন।');return;}
+        // A new topic with multiple product names must be clarified before changing a pending order.
+        const correctionProducts = findExplicitProductMentions(customerText);
+        if (correctionProducts.length > 1) {
+          const names = correctionProducts.slice(0, 3).map(p => p.name).filter(Boolean);
+          await sendFacebookMessage(id, `অর্ডারের পণ্য পরিবর্তন করতে চাইছেন বুঝেছি। কোন একটি পণ্য অর্ডারে রাখব তা নিশ্চিত করুন: ${names.join(' / ')}।`);
+          return;
+        }
         // If the customer is sending corrected details rather than consent, update and show confirmation again.
         const phone=extractPhone(customerText);if(phone)draft.phone=phone;
         const address=extractAddress(customerText);if(address)draft.address=address;
         const p=identifyOrderedProduct(id,customerText);if(p)draft.product=p;
+        const quantity=extractQuantity(customerText); if(quantity)draft.quantity=quantity;
         db.orderDrafts[id]=draft;saveStorage();
-        await sendFacebookMessage(id,'অর্ডার জমা ও প্রতিনিধির কাছে হস্তান্তরের জন্য “হ্যাঁ”, বাতিল করতে “না” লিখুন।');return;
+        await sendFacebookMessage(id, getOrderConfirmationMessage(draft));return;
       }
       if (mentionedProducts.length > 1) {
         const names = mentionedProducts.slice(0, 3).map(p => p.name).filter(Boolean);
@@ -1452,6 +1609,9 @@ app.post('/webhook',async(req,res)=>{
       const previous=customerQueues.get(senderId)||Promise.resolve();
       const task=previous.catch(()=>{}).then(async()=>{
         if(messageId&&db.messages.some(m=>m.messageId===messageId))return;
+        // The admin panel may update data/catalog.json between messages. Refresh before
+        // product matching or memory updates so new SKUs/FAQs are usable immediately.
+        refreshCatalogFromLocalFile();
         const now=new Date().toISOString(),paused=getTakeoverState(senderId);
         appendHistory(senderId,'user',text||'[Media File]');
         addStoredMessage({id:'msg_'+crypto.randomUUID(),senderId,sender:'customer',text:text||`[Media: ${attachments[0]?.type||'file'}]`,timestamp:now,messageId:messageId||null});
