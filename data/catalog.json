@@ -1,6 +1,6 @@
 {
-  "version": 14,
-  "updatedAt": "2026-10-21T09:45:36Z",
+  "version": 15,
+  "updatedAt": "2026-10-21T11:03:04Z",
   "products": [
     {
       "category": "বাইক এক্সেসরিজ",
@@ -584,6 +584,42 @@
         "​#ImportedProduct #ChineseBrand #PremiumQuality #OriginalImport"
       ],
       "question": "এই লাইটটি কি দেশি নাকি ইমপোর্টেড?"
+    },
+    {
+      "answer": "আপনার বাইকের অরিজিনাল হেডলাইটে H4 Socket/Plug থাকলে কোনো তার কাটা বা মডিফিকেশন ছাড়াই এটি সরাসরি Plug and Play ফিট হয়ে যাবে। আপনার বাইকের নির্দিষ্ট মডেলটি জানালে আমরা নিশ্চিত করে বলতে পারব।",
+      "category": "GENERAL",
+      "id": "faq_944427",
+      "keywords": [
+        "#CompatibilityCheck"
+      ],
+      "question": "Is this headlight compatible with my bike?\"এই হেডলাইটটি কি আমার বাইকে ফিট বা সাপোর্ট করবে?"
+    },
+    {
+      "answer": "এটি হাই-কোয়ালিটি প্রিমিয়াম চাইনিজ ব্র্যান্ডের ইম্পোর্টেড লাইট। এতে CNC অ্যালুমিনিয়াম বডি, IP68 ওয়াটারপ্রুফ রেটিং, টার্বো কুলিং ফ্যান এবং Canbus ড্রাইভারের মতো সর্বাধুনিক ফিচার রয়েছে",
+      "category": "GENERAL",
+      "id": "faq_077505",
+      "keywords": [
+        "#BrandInfo #ChineseBrand #Imports #LightingQuality #ProductBrand"
+      ],
+      "question": "এটি কোন কোম্পানির বা ব্র্যান্ডের প্রোডাক্ট?"
+    },
+    {
+      "answer": "এই প্রজেক্টর হেডলাইটটির মডেল হলো T9 H4 LED Mini Projector Headlight with Red/Blue Devil Eye (60W)।",
+      "category": "GENERAL",
+      "id": "faq_501723",
+      "keywords": [
+        "​#LightModel #H4Projector #DevilEye #ModelName #60WHeadlight"
+      ],
+      "question": "হেডলাইটটির মডেল নাম বা নম্বর কী?"
+    },
+    {
+      "answer": "এটি হাই-কোয়ালিটি প্রিমিয়াম চাইনিজ ব্র্যান্ডের ইম্পোর্টেড লাইট। এতে CNC অ্যালুমিনিয়াম বডি, IP68 ওয়াটারপ্রুফ রেটিং, টার্বো কুলিং ফ্যান এবং Canbus ড্রাইভারের মতো সর্বাধুনিক ফিচার রয়েছে",
+      "category": "GENERAL",
+      "id": "faq_571081",
+      "keywords": [
+        "#BrandInfo #ChineseBrand #Imports #LightingQuality #ProductBrand"
+      ],
+      "question": "এটি কোন কোম্পানির বা ব্র্যান্ডের প্রোডাক্ট?"
     }
   ],
   "delivery": {
