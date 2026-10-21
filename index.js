@@ -46,8 +46,11 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
 const REQUIRE_ADMIN_SECRET = process.env.REQUIRE_ADMIN_SECRET !== 'false';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const TEXT_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash-lite';
+const TEXT_MODEL = 'google/gemini-2.5-flash-lite'; // Fixed by requirement: text, voice and vision all use this exact model.
 const VOICE_MODEL = TEXT_MODEL;
+// Vision/OCR must use the same Gemini 2.5 Flash-Lite model as requested.
+const VISION_MODEL = TEXT_MODEL;
+const VISION_MAX_CANDIDATES = Math.max(2, Math.min(8, Number(process.env.VISION_MAX_CANDIDATES) || 6));
 const HELPLINE = process.env.HELPLINE || '+8809611042598';
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '01884332067';
 const MAX_PRODUCTS_TO_AI = 2;
@@ -68,8 +71,7 @@ const MEMORY_RETENTION_MS = MEMORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
 const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
 const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
-const LOCAL_CATALOG_PATH = path.resolve(__dirname, process.env.LOCAL_CATALOG_FILE || CATALOG_FILE || 'data/catalog.json');
-const LEGACY_CATALOG_PATH = path.join(__dirname, 'catalog.json');
+const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
 const LEGACY_DATA_FILE = path.join(__dirname, 'storage_data.json');
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 const ORDER_CONFIRMATION = 'আপনার অর্ডারের তথ্য সংরক্ষণ করা হয়েছে। আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করে অর্ডারটি নিশ্চিত করবেন।';
@@ -223,7 +225,7 @@ function scoreRecord(query, record, fields) {
   return score;
 }
 function productScore(query, product) {
-  return scoreRecord(query, product, ['id','name','description','shortDescription','category','brand','model','sku','keywords','tags','aliases']);
+  return scoreRecord(query, product, ['id','name','description','shortDescription','category','brand','model','sku','keywords','tags','aliases','imageKeywords','visualDescription','productUrl','url','link','facebookUrl']);
 }
 function findRelevantProducts(query) {
   return products.map(product => ({ product, score: productScore(query, product) }))
@@ -236,8 +238,26 @@ function findUniqueRelevantProduct(query, minimumScore = 12, minimumMargin = 6) 
   if (scored.length > 1 && scored[0].score - scored[1].score < minimumMargin) return null;
   return scored[0].product;
 }
+function faqIntent(text='') {
+  const t = normalizeText(text);
+  const intents = [];
+  if (isPriceQuestion(t) || /price|cost|dam|daam|dham|মূল্য|দাম/.test(t)) intents.push('price');
+  if (/warranty|guarantee|ওয়ারেন্টি|ওয়ারেন্টি|গ্যারান্টি|replacement|রিপ্লেসমেন্ট/.test(t)) intents.push('warranty');
+  if (/delivery|shipping|ডেলিভারি|কুরিয়ার|কুরিয়ার|চার্জ/.test(t)) intents.push('delivery');
+  if (/install|installation|মেকানিক|ইনস্টল|লাগানো/.test(t)) intents.push('installation');
+  if (/stock|available|পাওয়া যাবে|পাওয়া যাবে|স্টক|আছে কি/.test(t)) intents.push('availability');
+  if (/return|refund|exchange|ফেরত|রিফান্ড|এক্সচেঞ্জ/.test(t)) intents.push('return');
+  if (/fit|fitment|compatible|plug|socket|ফিট|মিলবে|সকেট|প্লাগ/.test(t)) intents.push('fitment');
+  return intents;
+}
+function faqIntentScore(query, faq) {
+  const qi = faqIntent(query);
+  if (!qi.length) return 0;
+  const fi = faqIntent(`${faq?.question || faq?.q || ''} ${faq?.category || ''} ${Array.isArray(faq?.keywords) ? faq.keywords.join(' ') : faq?.keywords || ''}`);
+  return qi.some(x => fi.includes(x)) ? 28 : 0;
+}
 function findRelevantFaqs(query) {
-  return faqs.map(faq => ({ faq, score: scoreRecord(query, faq, ['question','answer','category','keywords']) }))
+  return faqs.map(faq => ({ faq, score: Math.max(scoreRecord(query, faq, ['question','answer','category','keywords']), faqIntentScore(query, faq)) }))
     .filter(x => x.score > 0).sort((a,b) => b.score-a.score).slice(0, MAX_FAQS_TO_AI).map(x => x.faq);
 }
 function getHistory(senderId) {
@@ -389,64 +409,22 @@ function applyCatalog(data, source = 'local') {
   faqs = Array.isArray(data.faqs) ? data.faqs.map(f => ({ ...f })) : [];
   catalogMeta = { version: data.version ?? null, updatedAt: data.updatedAt ?? null, source, lastSyncAt: new Date().toISOString(), lastSyncError: null };
 }
-function getCatalogReadPaths() {
-  return [...new Set([LOCAL_CATALOG_PATH, LEGACY_CATALOG_PATH])];
-}
 function loadLocalCatalog() {
-  let lastError = null;
-  for (const filePath of getCatalogReadPaths()) {
-    try {
-      if (!fs.existsSync(filePath)) continue;
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      validateCatalogShape(data);
-      // data/catalog.json (or LOCAL_CATALOG_FILE) is primary; root catalog.json is legacy fallback.
-      applyCatalog(data, filePath === LOCAL_CATALOG_PATH ? 'local-primary' : 'local-legacy');
-      return data;
-    } catch (err) {
-      lastError = err;
-      console.error(`[CATALOG] Local load error (${filePath}):`, err.message);
-    }
-  }
-  if (lastError) catalogMeta.lastSyncError = lastError.message;
-  return { products, faqs, version: catalogMeta.version, updatedAt: catalogMeta.updatedAt };
-}
-function writeCatalogFileAtomically(filePath, data) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temp = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(temp, filePath);
+  try {
+    if (!fs.existsSync(LOCAL_CATALOG_PATH)) return { products, faqs, version: catalogMeta.version, updatedAt: catalogMeta.updatedAt };
+    const data = JSON.parse(fs.readFileSync(LOCAL_CATALOG_PATH, 'utf8'));
+    validateCatalogShape(data);
+    // Existing local file is the persisted baseline; load it as-is at startup.
+    applyCatalog(data, 'local');
+    return data;
+  } catch (err) { console.error('[CATALOG] Local load error:', err.message); catalogMeta.lastSyncError = err.message; return { products, faqs, version: catalogMeta.version, updatedAt: catalogMeta.updatedAt }; }
 }
 function saveLocalCatalog(data, source = 'local') {
   validateCatalogShape(data);
-  // Write the admin-configured catalog path first, creating the data/ directory if needed.
-  writeCatalogFileAtomically(LOCAL_CATALOG_PATH, data);
-  // Keep the old root-level cache in sync so previous tooling/deployments continue to work.
-  if (path.resolve(LOCAL_CATALOG_PATH) !== path.resolve(LEGACY_CATALOG_PATH)) {
-    try { writeCatalogFileAtomically(LEGACY_CATALOG_PATH, data); }
-    catch (err) { console.error('[CATALOG] Legacy cache mirror failed:', err.message); }
-  }
+  const temp = LOCAL_CATALOG_PATH + '.tmp';
+  fs.writeFileSync(temp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(temp, LOCAL_CATALOG_PATH);
   applyCatalog(data, source);
-}
-function refreshCatalogFromLocalFile() {
-  for (const filePath of getCatalogReadPaths()) {
-    try {
-      if (!fs.existsSync(filePath)) continue;
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      validateCatalogShape(data);
-      const sameProducts = JSON.stringify(data.products) === JSON.stringify(products);
-      const sameFaqs = JSON.stringify(Array.isArray(data.faqs) ? data.faqs : []) === JSON.stringify(faqs);
-      const sameVersion = String(data.version ?? '') === String(catalogMeta.version ?? '')
-        && String(data.updatedAt ?? '') === String(catalogMeta.updatedAt ?? '');
-      if (!sameProducts || !sameFaqs || !sameVersion) {
-        applyCatalog(data, filePath === LOCAL_CATALOG_PATH ? 'local-hot-reload' : 'legacy-hot-reload');
-        console.log(`[CATALOG] Reloaded ${products.length} products and ${faqs.length} FAQs from ${path.relative(__dirname, filePath)}`);
-      }
-      return true;
-    } catch (err) {
-      console.error(`[CATALOG] Hot reload failed (${filePath}); keeping in-memory catalog:`, err.message);
-    }
-  }
-  return false;
 }
 loadLocalCatalog();
 
@@ -649,35 +627,6 @@ function resolveCurrentProduct(senderId, currentText = '', contextText = '') {
   if (contextMatches.length > 1) return null;
   return findProductFromRecentContext(senderId);
 }
-function findTopicSwitchProduct(query, activeProduct) {
-  const q = normalizeText(query);
-  if (!q) return null;
-  const explicitMatches = findExplicitProductMentions(query);
-  if (explicitMatches.length === 1) return String(explicitMatches[0].id) === String(activeProduct?.id) ? null : explicitMatches[0];
-  if (explicitMatches.length > 1) return null;
-
-  // Only compare identifying fields (name/model/SKU/aliases), never long descriptions.
-  // Common category words are intentionally ignored so "headlight price" cannot switch products.
-  const generic = new Set(['the','a','an','for','and','or','price','cost','how','much','what','is','it','this','that','same','product','photo','picture','image','video','reel','stock','available','order','buy','want','light','headlight','head','lamp','bulb','led','projector','bike','motorcycle','car','দাম','কত','টাকা','এই','এটা','এটির','এটার','ওটা','ছবি','ভিডিও','লাইট','হেডলাইট','বাল্ব','বাইক','গাড়ি','গাড়ি','দিতে','চাই','করতে','অর্ডার']);
-  const qTerms = new Set(tokenize(q).filter(t => t.length >= 3 && !generic.has(t)));
-  if (!qTerms.size) return null;
-
-  const identifyingFields = p => [p.name, p.model, p.sku, p.id, ...(Array.isArray(p.aliases) ? p.aliases : [])]
-    .filter(Boolean).join(' ');
-  const activeTerms = new Set(tokenize(identifyingFields(activeProduct || {})).filter(t => t.length >= 3 && !generic.has(t)));
-  const ranked = products.map(product => {
-    const terms = [...new Set(tokenize(identifyingFields(product)).filter(t => t.length >= 3 && !generic.has(t)))];
-    const overlap = terms.filter(t => qTerms.has(t));
-    const newDistinctive = overlap.filter(t => !activeTerms.has(t));
-    return { product, score: overlap.length, newDistinctive: newDistinctive.length };
-  }).filter(x => String(x.product.id) !== String(activeProduct?.id) && x.score > 0 && x.newDistinctive > 0)
-    .sort((a, b) => b.score - a.score || b.newDistinctive - a.newDistinctive);
-  if (!ranked.length) return null;
-  // Require a clear winner; ambiguous partial product names should be clarified rather than guessed.
-  if (ranked.length > 1 && ranked[0].score === ranked[1].score && ranked[0].newDistinctive === ranked[1].newDistinctive) return null;
-  return ranked[0].product;
-}
-
 function isGenericPriceQuestion(text = '') {
   const t = normalizeText(text);
   if (!isPriceQuestion(t)) return false;
@@ -862,16 +811,6 @@ async function sendFacebookMessage(recipientId, text) {
     // separate from customer-selected activeProductId, so a bot mention alone cannot override an
     // explicitly selected product. It lets the next short follow-up resolve after process restart.
     rememberAssistantProductContext(recipientId, finalText);
-    if (!db.customers[String(recipientId)]) db.customers[String(recipientId)] = { id: String(recipientId), name: `Customer ${String(recipientId).slice(-4)}`, messageCount: 0 };
-    const customerState = db.customers[String(recipientId)];
-    if (isBotAskingOrderConfirmation(finalText)) {
-      customerState.awaitingOrderConfirmation = true;
-      customerState.awaitingOrderConfirmationAt = new Date().toISOString();
-    } else {
-      // Do not let an old order prompt make a later “yes” start an unrelated order.
-      customerState.awaitingOrderConfirmation = false;
-      customerState.awaitingOrderConfirmationAt = null;
-    }
     appendHistory(recipientId,'assistant',finalText);
     addStoredMessage({id:'msg_bot_'+crypto.randomUUID(),senderId:recipientId,sender:'bot',text:finalText,timestamp:new Date().toISOString(),messageId:response.data?.message_id||null});
     saveStorage(); return true;
@@ -937,19 +876,12 @@ async function handleOrderFlow(senderId, text, messageId) {
     else await sendFacebookMessage(id, 'অর্ডার চালিয়ে যেতে চাইলে ডেলিভারির সম্পূর্ণ ঠিকানা পাঠাতে পারেন।');
     return true;
   }
-  // Never create an order from collected details alone. Show a summary and require clear final consent.
   draft.messageId = messageId || draft.messageId || null;
-  draft.awaitingFinalConfirmation = true;
-  draft.lastAskedField = 'confirmation';
-  db.orderDrafts[id] = draft;
-  db.pendingHandover[id] = {
-    orderDraft: true,
-    reason: 'Customer order confirmed for human verification',
-    createdAt: new Date().toISOString(),
-    promptSent: true
-  };
-  saveStorage();
-  await sendFacebookMessage(id, getOrderConfirmationMessage(draft));
+  const created = createMessengerOrder(id, draft, draft.messageId);
+  delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
+  await setTakeoverState(id, true, `Order automatically handed to human ${created.order.id}`);
+  const billLines = created.order.total !== null ? `\nবিল: ${created.order.productName} × ${created.order.quantity} = ${created.order.subtotal} টাকা; ডেলিভারি ${created.order.deliveryFee} টাকা; সর্বমোট ${created.order.total} টাকা।` : '\nচূড়ান্ত বিল প্রতিনিধি পণ্যের মূল্য ও ডেলিভারি চার্জ যাচাই করে জানাবেন।';
+  await sendFacebookMessage(id, `আপনার ${draft.product.name} অর্ডারের তথ্য প্রতিনিধি টিমের কাছে পাঠানো হয়েছে।${billLines}\nপণ্য, ফোন ও ঠিকানা প্রতিনিধি যাচাই করে আপনার সঙ্গে যোগাযোগ করবেন। ${HELPLINE}`);
   return true;
 }
 
@@ -1057,6 +989,10 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
         `স্টক: ${p.stockStatus || (p.inStock === true ? 'IN_STOCK' : 'তথ্য নেই')}`,
         `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
         `বৈশিষ্ট্য: ${Array.isArray(p.features) ? p.features.join(', ') : 'N/A'}`,
+        `ওয়ারেন্টি: ${p.warranty ?? p.warrantyPeriod ?? p.guarantee ?? 'ক্যাটালগে নেই'}`,
+        `পণ্যের URL: ${p.productUrl || p.url || p.link || p.facebookUrl || 'N/A'}`,
+        `ছবির কীওয়ার্ড: ${Array.isArray(p.imageKeywords) ? p.imageKeywords.join(', ') : (p.imageKeywords || 'N/A')}`,
+        `ভিজ্যুয়াল বর্ণনা: ${p.visualDescription || 'N/A'}`,
         `ছবি: ${getProductMediaUrls(p, 'images').join(' | ') || 'নেই'}`,
         `ভিডিও: ${getProductMediaUrls(p, 'videos').join(' | ') || 'নেই'}`
       ].join('\n')).join('\n\n')
@@ -1075,7 +1011,7 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
 ১) প্রশ্ন বনাম অর্ডার: গ্রাহক স্পষ্টভাবে অর্ডার করার ইচ্ছা না জানানো পর্যন্ত কখনো ফোন নম্বর, ডেলিভারি ঠিকানা বা ব্যক্তিগত তথ্য চাইবে না। পণ্যের বিবরণ, দাম, স্টক, ছবি/ভিডিও, বাইকের মডেল, ফিটমেন্ট বা ডেলিভারি চার্জের প্রশ্নের সরাসরি উত্তর দেবে। শুধু “দাম কত”, “ফিট হবে?”, “ছবি দিন” বা “ডেলিভারি চার্জ কত” বললে অর্ডার শুরু করবে না।
 ২) অর্ডার শুরু: কেবল “অর্ডার করতে চাই”, “পাঠিয়ে দিন”, “কিনব/নেব” বা সমার্থক স্পষ্ট সম্মতির পর ব্যাকএন্ডের অর্ডার প্রক্রিয়া চলবে। অর্ডার চলাকালে আগের কথোপকথন ও draft-এ থাকা পণ্য, ফোন এবং ঠিকানা ব্যবহার করবে; ইতিমধ্যে পাওয়া তথ্য আবার চাইবে না।
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
-৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। catalog.json ও FAQ-ই পণ্যের তথ্যের মূল উৎস। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
+৪) ক্যাটালগ-ভিত্তিক তথ্য: FAQ-তে প্রশ্নের ভাষা ইংরেজি/বাংলা/Banglish ভিন্ন হলেও একই intent হলে FAQ-এর উত্তর ব্যবহার করবে। পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। catalog.json ও FAQ-ই পণ্যের তথ্যের মূল উৎস। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: কোনো যানবাহনে হেডলাইট ফিট হবে কি না, সকেট/প্লাগ মিলবে কি না—নিজে থেকে ১০০% নিশ্চয়তা, অনুমান বা টেকনিক্যাল সিদ্ধান্ত দেবে না। এ ধরনের প্রশ্নে শুধু এই উত্তর দেবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
 ৬) Active Product Memory & Context Lock (অত্যন্ত গুরুত্বপূর্ণ):
 - বর্তমান সক্রিয় পণ্য: ${activeProduct ? `${activeProduct.name} (ID: ${activeProduct.id})` : 'এখনো কোনো নির্দিষ্ট সক্রিয় পণ্য শনাক্ত হয়নি'}।
@@ -1214,12 +1150,70 @@ function replaceLatestCustomerMediaText(senderId, transcript, messageId = null) 
   saveStorage();
 }
 
+function extractUrls(text='') {
+  return [...new Set((String(text || '').match(/https?:\/\/[^\s<>"']+/gi) || []).map(u => u.replace(/[),.!?]+$/g, '')))];
+}
+function catalogProductForUrl(url='') {
+  const target = String(url || '').trim().replace(/&amp;/g, '&').replace(/\/$/, '');
+  if (!target) return null;
+  const matches = products.filter(p => {
+    const urls = [p.productUrl, p.url, p.link, p.facebookUrl, p.videoUrl, p.imageUrl, p.image, p.photo, p.thumbnail,
+      ...(Array.isArray(p.images) ? p.images : []), ...(Array.isArray(p.gallery) ? p.gallery : []),
+      ...getProductMediaUrls(p, 'images'), ...getProductMediaUrls(p, 'videos')]
+      .filter(x => typeof x === 'string');
+    return urls.some(u => String(u).trim().replace(/\/$/, '') === target);
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+function getCatalogImageUrls(p) {
+  if (!p) return [];
+  const raw = [p.imageUrl, p.image_url, p.image, p.photo, p.photoUrl, p.thumbnail, p.thumbnailUrl,
+    ...(Array.isArray(p.images) ? p.images : []), ...(Array.isArray(p.gallery) ? p.gallery : []),
+    ...(Array.isArray(p.photos) ? p.photos : []), ...(Array.isArray(p.media?.images) ? p.media.images : [])];
+  return [...new Set(raw.map(x => typeof x === 'string' ? x : (x?.url || x?.src || '')).filter(u => /^https:\/\//i.test(u)))].slice(0, 2);
+}
+function safeImageMime(contentType='') {
+  const mime = String(contentType).split(';')[0].trim().toLowerCase();
+  return ['image/jpeg','image/png','image/webp','image/gif'].includes(mime) ? mime : 'image/jpeg';
+}
+async function fetchImageDataUrl(url) {
+  const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000, maxContentLength: MAX_ATTACHMENT_BYTES, maxRedirects: 3 });
+  const mime = safeImageMime(r.headers['content-type']);
+  if (!String(r.headers['content-type'] || '').toLowerCase().startsWith('image/')) throw new Error('URL did not return an image');
+  return `data:${mime};base64,${Buffer.from(r.data).toString('base64')}`;
+}
+async function fetchFacebookLinkPreview(url) {
+  if (!isFacebookLink(url)) return null;
+  try {
+    const r = await axios.get(url, { timeout: 12000, maxContentLength: 2 * 1024 * 1024, maxRedirects: 3,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ImpoTechBot/1.0)', 'Accept': 'text/html,application/xhtml+xml' }, responseType: 'text' });
+    const html = String(r.data || '');
+    const meta = (key) => {
+      const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const patterns = [new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`, 'i'), new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${escaped}["'][^>]*>`, 'i')];
+      for (const re of patterns) { const m = html.match(re); if (m) return m[1].replace(/&amp;/g,'&').replace(/&#x([0-9a-f]+);/gi,(_,h)=>String.fromCharCode(parseInt(h,16))).replace(/&quot;/g,'"'); }
+      return '';
+    };
+    return { title: meta('og:title') || meta('twitter:title'), description: meta('og:description') || meta('description'), image: meta('og:image') || meta('twitter:image') };
+  } catch (e) {
+    console.warn('[VISION_URL] Facebook preview unavailable:', e.response?.status || e.code || e.message);
+    return null;
+  }
+}
+function rankVisualCandidates(query, ocrText='') {
+  const combined = `${query || ''} ${ocrText || ''}`;
+  return products.map(product => ({ product, score: productScore(combined, product) }))
+    .filter(x => x.score > 0).sort((a,b) => b.score-a.score).slice(0, VISION_MAX_CANDIDATES).map(x => x.product);
+}
 async function generateAIResponse(customerText, attachments = [], senderId) {
   const query = customerText || 'গ্রাহক একটি মিডিয়া ফাইল পাঠিয়েছেন। ফাইলটি বুঝে প্রাসঙ্গিক উত্তর দিন।';
   let history = getHistory(senderId).slice();
   if (history.length && history[history.length - 1].role === 'user' && history[history.length - 1].text === query) history.pop();
   const context = getRecentConversationText(senderId, query);
-  const explicitProduct = findExactProduct(query);
+  const urls = extractUrls(query);
+  const linkedProducts = urls.map(catalogProductForUrl).filter(Boolean);
+  const uniqueLinkedProducts = [...new Map(linkedProducts.map(p => [String(p.id), p])).values()];
+  const explicitProduct = findExactProduct(query) || (uniqueLinkedProducts.length === 1 ? uniqueLinkedProducts[0] : null);
   if (explicitProduct) rememberActiveProduct(senderId, explicitProduct);
   const memory = buildCustomerMemoryContext(senderId);
   const activeProduct = explicitProduct || findActiveProduct(senderId) || findAssistantContextProduct(senderId, query);
@@ -1250,51 +1244,85 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
     }
   }
   const image = attachments.find(x => x.type === 'image' && x.payload?.url);
-  if (image) {
+  const facebookUrl = urls.find(isFacebookLink);
+  if (image || (facebookUrl && !explicitProduct)) {
     try {
-      const r = await axios.get(image.payload.url, { responseType: 'arraybuffer', timeout: 15000, maxContentLength: MAX_ATTACHMENT_BYTES });
-      const base64 = Buffer.from(r.data).toString('base64');
-      const response = await callOpenRouter([
-        { role: 'system', content: system }, ...prior,
-        { role: 'user', content: [
-          { type: 'text', text: `${query}\nছবিতে দৃশ্যমান বিষয় সম্পর্কে কেবল যা নিশ্চিত দেখা যাচ্ছে তা বলুন। আগের উত্তরের বিবরণ পুনরাবৃত্তি করবেন না। হেডলাইট ফিটমেন্ট/প্লাগ-ম্যাচিং নিজে নির্ধারণ করবেন না; এ বিষয়ে নির্ধারিত প্রতিনিধির উত্তর ব্যবহার করতে হবে।` },
-          { type: 'image_url', image_url: { url: `data:${r.headers['content-type'] || 'image/jpeg'};base64,${base64}` } }
-        ] }
-      ]);
-      return limitToThreeLines(response);
+      let customerImageDataUrl = null;
+      let linkPreview = null;
+      if (image) customerImageDataUrl = await fetchImageDataUrl(image.payload.url);
+      else if (facebookUrl) {
+        linkPreview = await fetchFacebookLinkPreview(facebookUrl);
+        if (linkPreview?.image) {
+          try { customerImageDataUrl = await fetchImageDataUrl(linkPreview.image); }
+          catch (e) { console.warn('[VISION_URL] Preview image could not be downloaded:', e.message); }
+        }
+      }
+      if (!customerImageDataUrl) {
+        if (explicitProduct) return limitToThreeLines(`${explicitProduct.name} পণ্যটি ক্যাটালগের লিংকের সঙ্গে মিলে গেছে। আপনি কি এর দাম, ওয়ারেন্টি, নাকি অন্য তথ্য জানতে চান?`);
+        return 'লিংকটি পেয়েছি, তবে Facebook Reel/ভিডিওর ভেতরের পণ্য নির্ভরযোগ্যভাবে পড়া যাচ্ছে না। অনুগ্রহ করে ভিডিওর একটি পরিষ্কার স্ক্রিনশট বা পণ্যের সরাসরি ছবি পাঠান।';
+      }
+      const visionPrompt = `আপনি ImpoTech-এর পণ্য শনাক্তকরণ সহকারী। ছবিতে দৃশ্যমান পণ্যের ধরন, ব্র্যান্ড, মডেল/মডেল নম্বর, পণ্যে লেখা প্রতিটি পাঠ (OCR), কানেক্টর/লেন্সের দৃশ্যমান বৈশিষ্ট্য বাংলায় সংক্ষেপে বের করুন। অনুমানকে নিশ্চিত তথ্য হিসেবে লিখবেন না। আউটপুটে এই ফরম্যাট ব্যবহার করুন: দৃশ্যমান লেখা: ...; পণ্যের ধরন: ...; ব্র্যান্ড/মডেল: ...; স্বতন্ত্র দৃশ্যমান বৈশিষ্ট্য: ...; নিশ্চিততার স্তর: উচ্চ/মাঝারি/কম। হেডলাইটের বাইক-ফিটমেন্ট বা প্লাগ-কম্প্যাটিবিলিটি নির্ধারণ করবেন না। ${linkPreview ? `লিংকের শিরোনাম: ${linkPreview.title || ''}; বর্ণনা: ${linkPreview.description || ''}.` : ''} গ্রাহকের লেখা: ${query || 'ছবিটি দেখে পণ্য শনাক্ত করুন।'}`;
+      const ocrText = await callOpenRouter([
+        { role: 'system', content: system },
+        ...prior,
+        { role: 'user', content: [ { type: 'text', text: visionPrompt }, { type: 'image_url', image_url: { url: customerImageDataUrl } } ] }
+      ], VISION_MODEL, 350);
+      const candidates = rankVisualCandidates(`${query} ${linkPreview?.title || ''}`, ocrText);
+      if (!candidates.length) {
+        return limitToThreeLines(`ছবিতে ${ocrText.replace(/\s+/g,' ').slice(0,240)} দেখা যাচ্ছে, তবে বর্তমান ক্যাটালগে নিশ্চিতভাবে মেলা পণ্য পাইনি। পণ্যের মডেল নম্বর বা ক্যাটালগের নামটি পাঠাবেন?`);
+      }
+      // Compare the customer image against up to three candidate catalog images with the SAME model.
+      const visualCandidates = candidates.slice(0, 3);
+      const compareContent = [
+        { type: 'text', text: `গ্রাহকের ছবির সঙ্গে নিচের ক্যাটালগ পণ্যগুলোর তুলনা করুন। OCR/দৃশ্যমান লেখা: ${ocrText}. কেবল স্পষ্ট ভিজ্যুয়াল/মডেল মিল থাকলে একটি পণ্য নির্বাচন করুন; শুধু একই ধরনের লাইট হওয়া যথেষ্ট নয়। মিল না হলে NONE বলুন। নিচের ID/name-গুলোই অনুমোদিত। প্রতিটি ক্যাটালগ ছবির আগে তার ID ও নাম দেওয়া আছে। শেষে এক লাইনে JSON দিন: {"match":"PRODUCT_ID বা NONE","reason":"সংক্ষিপ্ত কারণ","confidence":"high|medium|low"}. গ্রাহকের ছবির আগে দেওয়া হয়েছে। প্রার্থী: ${visualCandidates.map(p => `${p.id}: ${p.name}; model=${p.model || ''}; sku=${p.sku || ''}; visual=${p.visualDescription || ''}; keywords=${Array.isArray(p.imageKeywords) ? p.imageKeywords.join(',') : p.imageKeywords || ''}`).join('\n')}` },
+        { type: 'image_url', image_url: { url: customerImageDataUrl } }
+      ];
+      let addedCatalogImages = 0;
+      for (const p of visualCandidates) {
+        for (const imageUrl of getCatalogImageUrls(p)) {
+          try {
+            const dataUrl = await fetchImageDataUrl(imageUrl);
+            compareContent.push({ type: 'text', text: `CATALOG PRODUCT ID=${p.id}; NAME=${p.name}; MODEL=${p.model || ''}` });
+            compareContent.push({ type: 'image_url', image_url: { url: dataUrl } });
+            addedCatalogImages++;
+            break;
+          } catch (e) { console.warn('[VISION_CATALOG_IMAGE] Failed:', String(p.id), e.message); }
+        }
+      }
+      const compareText = await callOpenRouter([
+        { role: 'system', content: 'আপনি একটি সতর্ক পণ্য-মিল যাচাইকারী। কেবল প্রদত্ত ক্যাটালগ ID-র মধ্যে মিল বেছে নিন। প্রমাণ অপর্যাপ্ত হলে NONE বলুন। দাম/ওয়ারেন্টি উদ্ভাবন করবেন না।' },
+        { role: 'user', content: compareContent }
+      ], VISION_MODEL, 180);
+      const matchId = (compareText.match(/"match"\s*:\s*"([^"]+)"/i) || [])[1];
+      const confidence = ((compareText.match(/"confidence"\s*:\s*"(high|medium|low)"/i) || [])[1] || 'low').toLowerCase();
+      const matched = matchId && matchId.toUpperCase() !== 'NONE' ? visualCandidates.find(p => String(p.id) === String(matchId)) : null;
+      // Only auto-select when model reports high confidence and at least one catalog image was actually compared,
+      // or the OCR/identifier has a uniquely strong catalog match.
+      const strongOcrMatch = findUniqueRelevantProduct(ocrText, 20, 10);
+      const selected = (matched && confidence === 'high' && addedCatalogImages > 0) ? matched : (strongOcrMatch || null);
+      if (selected) {
+        rememberActiveProduct(senderId, selected);
+        const price = selected.price !== undefined && selected.price !== null && String(selected.price).trim() !== '' ? `${selected.price} টাকা` : 'দাম ক্যাটালগে নিশ্চিত করা নেই';
+        return limitToThreeLines(`ছবির সঙ্গে ক্যাটালগে সবচেয়ে ভালো মিল: ${selected.name} (ID: ${selected.id})। ${price}। আপনি কি এই পণ্যটির ওয়ারেন্টি বা অন্য কোনো তথ্য জানতে চান?`);
+      }
+      return limitToThreeLines(`ছবিতে ${ocrText.replace(/\s+/g,' ').slice(0,180)}। ক্যাটালগের সঙ্গে নিশ্চিত মিল পাওয়া যায়নি, তাই ভুল পণ্য শনাক্ত করছি না। পণ্যের গায়ের মডেল নম্বর/আরেকটি পরিষ্কার ছবি পাঠাবেন?`);
     } catch (e) {
       console.error('[VISION] Failed:', e.response?.data?.error?.message || e.message);
-      return 'দুঃখিত, ছবিটি এখন নির্ভরযোগ্যভাবে বিশ্লেষণ করতে পারছি না। ছবির সঙ্গে কী জানতে চান তা লিখে পাঠান।';
+      return 'দুঃখিত, ছবিটি এখন নির্ভরযোগ্যভাবে বিশ্লেষণ করতে পারছি না। অনুগ্রহ করে পরিষ্কার ছবি বা পণ্যের গায়ে লেখা মডেল নম্বর পাঠান।';
     }
+  }
+  // A URL that exactly matches a product URL in catalog is a valid product reference.
+  if (explicitProduct && urls.length) {
+    rememberActiveProduct(senderId, explicitProduct);
+    const faqReply = findRelevantFaqs(`${query} ${explicitProduct.name}`);
+    if (faqReply.length) {
+      const urlSystem = buildSystemPrompt([explicitProduct], faqReply, history, memory, explicitProduct);
+      return limitToThreeLines(await callOpenRouter([{ role: 'system', content: urlSystem }, ...prior, { role: 'user', content: query }], TEXT_MODEL));
+    }
+    return limitToThreeLines(`${explicitProduct.name} পণ্যটি ক্যাটালগের লিংকের সঙ্গে মিলে গেছে। এর দাম, ওয়ারেন্টি বা অন্য কোন তথ্য জানতে চান?`);
   }
   return limitToThreeLines(await callOpenRouter([{ role: 'system', content: system }, ...prior, { role: 'user', content: query }]));
 }
-function isBotAskingOrderConfirmation(text = '') {
-  const t = normalizeText(text);
-  return /(?:অর্ডার\s*(?:করতে|দিতে|কনফার্ম)\s*চান|কিনতে\s*চান|নিতে\s*চান|would you like to order|do you want to order|shall i place (?:the )?order|want me to place (?:the )?order)/i.test(t);
-}
-function isYesToOrderOffer(senderId, text = '') {
-  const customer = db.customers[String(senderId || '')] || {};
-  if (!isYes(text) || !customer.awaitingOrderConfirmation) return false;
-  const at = new Date(customer.awaitingOrderConfirmationAt || 0).getTime();
-  return Number.isFinite(at) && Date.now() - at <= 30 * 60 * 1000;
-}
-function getOrderConfirmationMessage(draft) {
-  const unit = parseCatalogPrice(draft?.product?.price);
-  const qty = Math.max(1, Number(draft?.quantity) || 1);
-  const subtotal = unit === null ? null : unit * qty;
-  const fee = getDeliveryFee(draft?.address || '');
-  const total = subtotal !== null && fee !== null ? subtotal + fee : null;
-  const bill = total === null ? 'চূড়ান্ত মূল্য প্রতিনিধি যাচাই করবেন।' : `পণ্যমূল্য ${subtotal} টাকা + ডেলিভারি ${fee} টাকা = মোট ${total} টাকা।`;
-  return `অর্ডারের তথ্য যাচাই করুন:
-পণ্য: ${draft.product?.name || 'নির্ধারিত নয়'}
-পরিমাণ: ${qty}
-ফোন: ${draft.phone}
-ঠিকানা: ${draft.address}
-${bill}
-অর্ডারটি সংরক্ষণ করে প্রতিনিধির কাছে পাঠাতে “হ্যাঁ”, বাতিল করতে “না” লিখুন।`;
-}
-
 function isCriticalHandoverQuestion(text='') { return /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/i.test(text); }
 function isConfusionReply(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|ঠিক আছে|yes|yeah|y|ok|okay|sure|না|no|nope|n)$/i.test(normalizeText(text)); }
 
@@ -1305,6 +1333,10 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
   const id = String(senderId);
   let customerText = String(text || '').trim();
   attachments = Array.isArray(attachments) ? attachments : [];
+  // A product URL in the same customer message is a strong product reference; lock it before
+  // price/FAQ intent handlers run so they don't ask the customer to repeat the product name.
+  const linked = [...new Map(extractUrls(customerText).map(catalogProductForUrl).filter(Boolean).map(p => [String(p.id), p])).values()];
+  if (linked.length === 1) rememberActiveProduct(id, linked[0]);
   if (getTakeoverState(id)) { console.log(`[Takeover] ${id} paused; AI skipped`); return; }
   try {
     const voiceAttachment = !customerText ? attachments.find(x => x.type === 'audio' && x.payload?.url) : null;
@@ -1325,19 +1357,7 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
         return;
       }
     }
-    let explicitProductMentions = findExplicitProductMentions(customerText);
-    const productBeforeCurrentMessage = findActiveProduct(id);
-    // Topic-switch detection: if the current message contains distinctive identifiers for another
-    // catalog item, replace the prior active product before any price/media/AI routing happens.
-    if (!explicitProductMentions.length) {
-      // Works both when an old active product exists and when the prior topic was only in bot context.
-      const switchedProduct = findTopicSwitchProduct(customerText, productBeforeCurrentMessage);
-      if (switchedProduct) {
-        explicitProductMentions = [switchedProduct];
-        rememberActiveProduct(id, switchedProduct);
-        console.log(`[Memory] Topic selected/changed from ${productBeforeCurrentMessage?.name || 'no saved active product'} to ${switchedProduct.name} for ${id}`);
-      }
-    }
+    const explicitProductMentions = findExplicitProductMentions(customerText);
     // A customer can answer a bot's product-specific offer with only “Price koto”, “photo den”,
     // etc. Treat that as confirmation of the one product the bot most recently discussed, rather
     // than forgetting the context and asking them to name the product again.
@@ -1392,25 +1412,6 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
         return;
       }
     }
-    // A short “yes/জি/ঠিক আছে” is order intent only when the bot recently asked specifically
-    // whether the customer wants to order. It must not be confused with human-handover consent.
-    if (isYesToOrderOffer(id, customerText) && !db.orderDrafts[id]) {
-      const customerState = db.customers[id] || {};
-      customerState.awaitingOrderConfirmation = false;
-      customerState.awaitingOrderConfirmationAt = null;
-      db.customers[id] = customerState;
-      saveStorage();
-      await handleOrderFlow(id, 'আমি অর্ডার করতে চাই', messageId);
-      return;
-    }
-    // An explicit new product topic clears any stale order offer, so a later “yes” cannot order the old item.
-    if (explicitProductMentions.length === 1) {
-      const customerState = db.customers[id] || {};
-      customerState.awaitingOrderConfirmation = false;
-      customerState.awaitingOrderConfirmationAt = null;
-      db.customers[id] = customerState;
-      saveStorage();
-    }
     // Pending handover only consumes a clear yes/no. A new substantive question cancels the prompt and is handled normally.
     if(db.pendingHandover[id] && !db.pendingHandover[id].orderDraft) {
       if(isYes(customerText)){await transferToHuman(id,db.pendingHandover[id].reason);return;}
@@ -1427,7 +1428,6 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
     // An explicit refusal ends the sales loop; otherwise informational questions interrupt order-data collection.
     if (!db.orderDrafts[id] && isPurchaseDecline(customerText)) {
       cancelFollowup(id);
-      if (db.customers[id]) { db.customers[id].awaitingOrderConfirmation=false; db.customers[id].awaitingOrderConfirmationAt=null; saveStorage(); }
       await sendFacebookMessage(id, 'ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।');
       return;
     }
@@ -1455,27 +1455,17 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
       if(db.pendingHandover[id]?.orderDraft) {
         if(isYes(customerText)) {
           const created=createMessengerOrder(id,draft,draft.messageId||messageId);
-          delete db.orderDrafts[id];delete db.pendingHandover[id];
-          if (db.customers[id]) { db.customers[id].awaitingOrderConfirmation=false; db.customers[id].awaitingOrderConfirmationAt=null; }
-          saveStorage();
-          await setTakeoverState(id,true,`Customer confirmed order; human verification required ${created.order.id}`);
-          await sendFacebookMessage(id, `${ORDER_CONFIRMATION}\nHuman Takeover: চালু হয়েছে। আমাদের প্রতিনিধি পণ্য, মূল্য, ফোন ও ঠিকানা যাচাই করে যোগাযোগ করবেন। ${HELPLINE}`);return;
+          delete db.orderDrafts[id];delete db.pendingHandover[id];saveStorage();
+          await setTakeoverState(id,true,`Customer consented to order handover ${created.order.id}`);
+          await sendFacebookMessage(id,ORDER_CONFIRMATION);return;
         }
         if(isNo(customerText)){delete db.orderDrafts[id];delete db.pendingHandover[id];saveStorage();await sendFacebookMessage(id,'ঠিক আছে, অর্ডারটি জমা দেওয়া হয়নি এবং আপনার তথ্য প্রতিনিধির কাছে পাঠানো হবে না। চাইলে পরে আবার অর্ডার করতে পারবেন।');return;}
-        // A new topic with multiple product names must be clarified before changing a pending order.
-        const correctionProducts = findExplicitProductMentions(customerText);
-        if (correctionProducts.length > 1) {
-          const names = correctionProducts.slice(0, 3).map(p => p.name).filter(Boolean);
-          await sendFacebookMessage(id, `অর্ডারের পণ্য পরিবর্তন করতে চাইছেন বুঝেছি। কোন একটি পণ্য অর্ডারে রাখব তা নিশ্চিত করুন: ${names.join(' / ')}।`);
-          return;
-        }
         // If the customer is sending corrected details rather than consent, update and show confirmation again.
         const phone=extractPhone(customerText);if(phone)draft.phone=phone;
         const address=extractAddress(customerText);if(address)draft.address=address;
         const p=identifyOrderedProduct(id,customerText);if(p)draft.product=p;
-        const quantity=extractQuantity(customerText); if(quantity)draft.quantity=quantity;
         db.orderDrafts[id]=draft;saveStorage();
-        await sendFacebookMessage(id, getOrderConfirmationMessage(draft));return;
+        await sendFacebookMessage(id,'অর্ডার জমা ও প্রতিনিধির কাছে হস্তান্তরের জন্য “হ্যাঁ”, বাতিল করতে “না” লিখুন।');return;
       }
       if (mentionedProducts.length > 1) {
         const names = mentionedProducts.slice(0, 3).map(p => p.name).filter(Boolean);
@@ -1597,9 +1587,23 @@ app.post('/webhook',async(req,res)=>{
         continue;
       }
       if(event.postback && senderId) {
-        const payload=String(event.postback.payload||'').toUpperCase();
-        if(payload==='HANDOVER_YES') { await transferToHuman(senderId,'Customer consented via postback'); }
-        else if(payload==='HANDOVER_NO') { delete db.pendingHandover[String(senderId)];saveStorage();await sendFacebookMessage(senderId,'ঠিক আছে, AI সহায়তা চালু থাকছে।'); }
+        const payload=String(event.postback.payload||'').trim();
+        const normalizedPayload=payload.toUpperCase();
+        if(normalizedPayload==='HANDOVER_YES') { await transferToHuman(senderId,'Customer consented via postback'); continue; }
+        if(normalizedPayload==='HANDOVER_NO') { delete db.pendingHandover[String(senderId)];saveStorage();await sendFacebookMessage(senderId,'ঠিক আছে, AI সহায়তা চালু থাকছে।'); continue; }
+        // Handle user-facing postback titles (e.g. FAQ buttons) as normal questions instead of silently ignoring them.
+        const postbackText=String(event.postback.title || '').trim();
+        if(postbackText) {
+          const now=new Date().toISOString();
+          appendHistory(senderId,'user',postbackText);
+          addStoredMessage({id:'msg_'+crypto.randomUUID(),senderId,sender:'customer',text:postbackText,timestamp:now,messageId:`postback_${crypto.randomUUID()}`});
+          if(!db.customers[String(senderId)]) db.customers[String(senderId)]={id:String(senderId),name:`Customer ${String(senderId).slice(-4)}`,messageCount:1,lastActive:now,lastCustomerMessageAt:now,lastMessageText:postbackText};
+          else { const c=db.customers[String(senderId)]; c.messageCount=(c.messageCount||0)+1;c.lastActive=now;c.lastCustomerMessageAt=now;c.lastMessageText=postbackText; }
+          saveStorage();
+          await processCustomerMessage(senderId,postbackText,[],`postback_${Date.now()}`);
+        } else {
+          console.log('[Webhook] Ignoring non-user-facing postback payload:', normalizedPayload.slice(0,80));
+        }
         continue;
       }
       if(!message||message.is_echo||!senderId)continue;
@@ -1609,9 +1613,6 @@ app.post('/webhook',async(req,res)=>{
       const previous=customerQueues.get(senderId)||Promise.resolve();
       const task=previous.catch(()=>{}).then(async()=>{
         if(messageId&&db.messages.some(m=>m.messageId===messageId))return;
-        // The admin panel may update data/catalog.json between messages. Refresh before
-        // product matching or memory updates so new SKUs/FAQs are usable immediately.
-        refreshCatalogFromLocalFile();
         const now=new Date().toISOString(),paused=getTakeoverState(senderId);
         appendHistory(senderId,'user',text||'[Media File]');
         addStoredMessage({id:'msg_'+crypto.randomUUID(),senderId,sender:'customer',text:text||`[Media: ${attachments[0]?.type||'file'}]`,timestamp:now,messageId:messageId||null});
