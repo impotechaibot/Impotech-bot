@@ -1,6 +1,6 @@
 {
-  "version": 13,
-  "updatedAt": "2026-10-20T07:57:53Z",
+  "version": 14,
+  "updatedAt": "2026-10-21T09:45:36Z",
   "products": [
     {
       "category": "বাইক এক্সেসরিজ",
@@ -557,6 +557,33 @@
         "#FreeDelivery #FreeShipping #FreeDeliveryOffer #FreeHomeDelivery #H4LEDProjector #SpecialOffer"
       ],
       "question": "আপনাদের কি সব প্রোডাক্টেই ফ্রি ডেলিভারি আছে?"
+    },
+    {
+      "answer": "বাইক মেকানিকের সাথে কথা বলুন এবং নিচের সাইজগুলো মিলিয়ে নিন:  \n​মোট দৈর্ঘ্য: ১১৩ মিমি  \n​লেন্সের ব্যাস: ৩৭ মিমি  \n​সামনের অংশ: ৭৩ মিমি  \n​পেছনের অংশ: ৫৭ মিমি  \n​বেস উইথ: ২৩ মিমি (H4 প্লাগ)",
+      "category": "GENERAL",
+      "id": "faq_649956",
+      "keywords": [
+        "#H4LEDProjector #HeadlightSize #SeriesDimension #Bikeheadlight #হেডলাইনসাইজ"
+      ],
+      "question": "হেডলাইটটি বাইকে ফিট হবে কিনা কীভাবে বুঝব এবং এর সাইজ কত?"
+    },
+    {
+      "answer": "এটি আপনি আপনার পছন্দমতো যেকোনো সুবিধাজনক জায়গায় লাগাতে পারবেন। হ্যান্ডেলে, বাম্পারে বা বডির নিচের দিকে—যেখান থেকে ডানার প্রজেকশন বা লাইট ইফেক্ট সবচেয়ে সুন্দরভাবে দেখা যায়, সেখানে এটি সেট করতে পারেন। বক্সের সাথেই আপনি প্রয়োজনীয় নাট এবং ডাবল সাইডেড টেপ পেয়ে যাবেন, যা দিয়ে খুব সহজেই এটি ফিক্স করতে পারবেন।",
+      "category": "GENERAL",
+      "id": "faq_883160",
+      "keywords": [
+        "#AngelWings #AngelWingsLight #EagleLight #DanaLight #AngelWingsProjectionLight"
+      ],
+      "question": "এঞ্জেল উইংস (ডানা লাইট বা ইগল লাইট) বাইকে কীভাবে লাগাবো?"
+    },
+    {
+      "answer": "আন্তর্জাতিক মান বজায় রেখে তৈরি প্রিমিয়াম কোয়ালিটির চাইনিজ ইম্পোর্টেড প্রোডাক্ট। আমরা সরাসরি প্রস্তুতকারক কারখানা থেকে প্রিমিয়াম গ্রেডের লাইটিং প্রোডাক্ট ইমপোর্ট করি।",
+      "category": "GENERAL",
+      "id": "faq_782266",
+      "keywords": [
+        "​#ImportedProduct #ChineseBrand #PremiumQuality #OriginalImport"
+      ],
+      "question": "এই লাইটটি কি দেশি নাকি ইমপোর্টেড?"
     }
   ],
   "delivery": {
