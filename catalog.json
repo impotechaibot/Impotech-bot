@@ -1,6 +1,6 @@
 {
-  "version": 20,
-  "updatedAt": "2026-10-22T03:59:37Z",
+  "version": 22,
+  "updatedAt": "2026-10-22T18:04:25Z",
   "products": [
     {
       "category": "বাইক এক্সেসরিজ",
@@ -630,6 +630,83 @@
         "​#HeadlightPrice #H4LEDProjector #DevilEyeHeadlight #1099Taka"
       ],
       "question": "headlight এর দাম কতো টাকা?"
+    },
+    {
+      "answer": "আমরা সাধারণত আমাদের সকল আইটেম স্টেডফাস্ট কুরিয়ার (Steadfast Courier)-এর মাধ্যমে সরাসরি আপনার ঠিকানায় হোম ডেলিভারি করে থাকি।",
+      "category": "GENERAL",
+      "id": "faq_046924",
+      "keywords": [
+        "​#SteadfastCourier #CourierService #HomeDelivery #CashOnDelivery"
+      ],
+      "question": "আপনারা কোন কুরিয়ারের মাধ্যমে পার্সেল পাঠান বা ডেলিভারি দেন?"
+    },
+    {
+      "answer": "আপনার বাইকের হেডলাইটের লাইন যদি সরাসরি ইঞ্জিন স্টার্টের সাথে (AC Current) সংযুক্ত থাকে, তবে আমাদের H4 LED প্রজেক্টর হেডলাইট বা ফগ লাইট ভালোভাবে চালানোর জন্য ডিসি কনভার্ট (DC Convert) করে ব্যাটারি কানেকশনে (DC Current) নিয়ে নেওয়া ভালো। এতে বাইক বন্ধ থাকলেও বা লো-স্পিডে থাকলেও লাইট একদম স্টেবল ও ফুল ব্রাইটনেসে জ্বলবে। এটি যেকোনো ভালো বাইক মেকানিক বা অটো ইলেকট্রিশিয়ান খুব সহজেই করে দিতে পারবেন।",
+      "category": "GENERAL",
+      "id": "faq_674189",
+      "keywords": [
+        "#DCConverter #DCConversion"
+      ],
+      "question": "হেডলাইট লাগানোর জন্য কি ডিসি কনভার্ট (DC Convert) করতে হবে?"
+    },
+    {
+      "answer": "আমাদের এই H4 LED মিনি প্রজেক্টর হেডলাইটটি H4 সকেটযুক্ত সকল বাইকেই সরাসরি (Plug & Play) ইনস্টল করা যায়!\n​কোনো প্রকার তার বা হেডলাইট হাউজিং না কেটে নিচে উল্লিখিত সব বাইকে এটি সহজে সেট হয়ে যাবে:\n​🏍️ Yamaha:\n​FZ V2, FZS V2, FZ V3, FZS V3, FZ-S, FZ-FI, FZ-X, Saluto, Crux\n​🏍️ Bajaj:\n​Pulsar 150 (Single Disc / Twin Disc / Neon), Pulsar 125, Pulsar UG4, Discover 125, Discover 110, Discover 135, Platina 100, Platina 110, Boxer\n​🏍️ TVS:\n​Apache RTR 160 2V, Apache RTR 160 4V (Single Disc & Carburetor Version), TVS Metro, TVS Metro Plus, TVS Stryker, TVS Max 125\n​🏍️ Honda:\n​CB Hornet 160R, Honda Livo, Honda Shine, Honda Dream Neo, Honda CB Trigger, Honda Unicorn\n​🏍️ Suzuki:\n​Gixxer Monotone, Gixxer Carburetor (Non-LED models), Gixxer SF (Carburetor), Hayate\n​🏍️ Hero:\n​Thriller 160R, Hero Hunk, Splendor Plus, Splendor Pro, Passion Pro, Glamour, HF Deluxe, Ignitor\n​🏍️ Runner & Other Brands:\n​Runner Turbo, Runner Royal, Keeway RKS 125/150, Lifan ZPR, Lifan Victor R",
+      "category": "GENERAL",
+      "id": "faq_642177",
+      "keywords": [
+        "​bike compatibility",
+        "fitting",
+        "bike model",
+        "fz",
+        "fzs",
+        "fz v2",
+        "fzs v2",
+        "fz v3",
+        "fzs v3",
+        "fz fi",
+        "fz x",
+        "pulsar",
+        "pulsar 150",
+        "pulsar 125",
+        "pulsar neon",
+        "discover",
+        "discover 125",
+        "platina",
+        "apache",
+        "rtr",
+        "rtr 160",
+        "rtr 4v",
+        "tvs metro",
+        "hornet",
+        "cb hornet",
+        "livo",
+        "shine",
+        "gixxer",
+        "gixxer monotone",
+        "hayate",
+        "hunk",
+        "hero hunk",
+        "thriller 160r",
+        "splendor",
+        "passion pro",
+        "glamour",
+        "runner turbo",
+        "keeway",
+        "h4 led",
+        "mini projector",
+        "headlight fitting",
+        "keno fit hobe",
+        "fit hobe kina",
+        "kon kon bike e lagbe"
+      ],
+      "question": "এই H4 LED মিনি প্রজেক্টর হেডলাইটটি কোন কোন বাইকে সরাসরি (Plug & Play) ইনস্টল বা ফিটিং হবে?"
+    },
+    {
+      "answer": "​আমাদের এই H4 LED মিনি প্রজেক্টর হেডলাইটটি H4 সকেটযুক্ত সকল বাইক, কার, মাইক্রোবাস ও ১২ ভোল্ট (12V) বাসে সরাসরি (Plug & Play) ইনস্টল করা যায়!\n​কোনো প্রকার তার বা হেডলাইট কেসিং না কেটে নিচে উল্লিখিত সব গাড়িতে এটি সহজে ফিট হয়ে যাবে:\n​🏍️ বাইক (Bikes):\n​Yamaha: FZ V2, FZS V2, FZ V3, FZS V3, FZ-S, FZ-FI, FZ-X, Saluto\n​Bajaj: Pulsar 150 (Single/Twin Disc/Neon), Pulsar 125, Discover 125, Discover 110, Platina 100/110\n​TVS: Apache RTR 160 2V, Apache RTR 160 4V (Single Disc/Carb), TVS Metro, TVS Stryker\n​Honda: CB Hornet 160R, Honda Livo, Honda Shine, Honda Dream Neo\n​Suzuki: Gixxer Monotone, Gixxer Carburetor (Non-LED), Hayate\n​Hero: Thriller 160R, Hunk, Splendor Plus, Passion Pro, Glamour\n​🚗 কার ও প্রাইভেটকার (Cars & Sedans):\n​Toyota: Corolla (E100, E110, E120/121), Premio (older models), Axio (Non-HID/Non-LED versions), Platz, Vitz, Starlet, Probox, Succeed, TownAce, LiteAce\n​Suzuki: Maruti 800, Maruti Zen, Alto, Swift (older models), WagonR\n​Hyundai & Kia: Hyundai Santro, Accent (older), Picanto\n​Nissan & Honda: Nissan Sunny, Honda Civic (older models with H4)\n​🚐 মাইক্রোবাস ও পিকআপ (Microbus, Vans & Pickups):\n​Toyota: HiAce (Super GL / Commuter - H4 Socket versions), Noah (KR42/SR40), LiteAce Micro\n​Pickups: Tata Ace, Tata EX, Mahindra Bolero Pickup, Suzuki Carry\n​🚌 বাস ও কমার্শিয়াল গাড়ি (Buses & Mini Trucks - 12V):\n​যেসব লোকাল মিনিবাস, টাউন সার্ভিস বা কমার্শিয়াল পিকআপের হেডলাইট সকেট H4 এবং বিদ্যুৎ ব্যবস্থা 12V (১২ ভোল্ট), সেগুলোতেও এটি সরাসরি ইনস্টল করা যাবে।",
+      "category": "GENERAL",
+      "id": "faq_235361",
+      "keywords": [],
+      "question": "এই H4 LED মিনি প্রজেক্টর হেডলাইটটি কোন কোন বাইক, কার, মাইক্রোবাস বা বাসে সরাসরি (Plug & Play) ফিটিং করা যাবে?"
     }
   ],
   "delivery": {
