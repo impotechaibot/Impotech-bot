@@ -260,6 +260,28 @@ function findRelevantFaqs(query) {
   return faqs.map(faq => ({ faq, score: Math.max(scoreRecord(query, faq, ['question','answer','category','keywords']), faqIntentScore(query, faq)) }))
     .filter(x => x.score > 0).sort((a,b) => b.score-a.score).slice(0, MAX_FAQS_TO_AI).map(x => x.faq);
 }
+// Meta FAQ Intent Rule: resolve direct Meta suggested-reply/FAQ questions before product/order logic.
+// Keep scores internally; findRelevantFaqs() remains backward-compatible and returns FAQ objects.
+function findBestDirectFaq(query) {
+  const text = String(query || '').trim();
+  if (!text) return null;
+  const ranked = faqs.map(faq => ({
+    faq,
+    score: Math.max(
+      scoreRecord(text, faq, ['question','answer','category','keywords']),
+      faqIntentScore(text, faq)
+    )
+  })).filter(x => x.score >= 20 && String(x.faq?.answer || x.faq?.a || '').trim())
+    .sort((a,b) => b.score-a.score);
+  if (!ranked.length) return null;
+  const first = ranked[0];
+  // Avoid using a generic intent-only match when the customer's question is unrelated.
+  const queryIntents = faqIntent(text);
+  const faqIntents = faqIntent(`${first.faq?.question || first.faq?.q || ''} ${first.faq?.category || ''} ${Array.isArray(first.faq?.keywords) ? first.faq.keywords.join(' ') : first.faq?.keywords || ''}`);
+  const intentMatch = queryIntents.some(intent => faqIntents.includes(intent));
+  const lexicalMatch = scoreRecord(text, first.faq, ['question','category','keywords']) >= 20;
+  return (intentMatch || lexicalMatch) ? { faq: first.faq, score: first.score } : null;
+}
 function getHistory(senderId) {
   const id = String(senderId || '');
   if (!id) return [];
@@ -1243,14 +1265,25 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
       return 'দুঃখিত, এই ভয়েস মেসেজটি নির্ভরযোগ্যভাবে বুঝতে পারিনি। অনুগ্রহ করে কথাটি লিখে পাঠান, যাতে ভুল তথ্য না দিই।';
     }
   }
-  const image = attachments.find(x => x.type === 'image' && x.payload?.url);
+  const images = attachments.filter(x => x.type === 'image' && x.payload?.url).slice(0, 4);
+  const image = images[0] || null;
   const facebookUrl = urls.find(isFacebookLink);
-  if (image || (facebookUrl && !explicitProduct)) {
+  if (images.length || (facebookUrl && !explicitProduct)) {
     try {
       let customerImageDataUrl = null;
+      const customerImageDataUrls = [];
       let linkPreview = null;
-      if (image) customerImageDataUrl = await fetchImageDataUrl(image.payload.url);
-      else if (facebookUrl) {
+      if (images.length) {
+        for (const [imageIndex, imageAttachment] of images.entries()) {
+          try {
+            const dataUrl = await fetchImageDataUrl(imageAttachment.payload.url);
+            customerImageDataUrls.push(dataUrl);
+            if (!customerImageDataUrl) customerImageDataUrl = dataUrl;
+          } catch (imageError) {
+            console.warn(`[VISION] Customer image ${imageIndex + 1} download failed:`, imageError.message);
+          }
+        }
+      } else if (facebookUrl) {
         linkPreview = await fetchFacebookLinkPreview(facebookUrl);
         if (linkPreview?.image) {
           try { customerImageDataUrl = await fetchImageDataUrl(linkPreview.image); }
@@ -1265,7 +1298,11 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
       const ocrText = await callOpenRouter([
         { role: 'system', content: system },
         ...prior,
-        { role: 'user', content: [ { type: 'text', text: visionPrompt }, { type: 'image_url', image_url: { url: customerImageDataUrl } } ] }
+        { role: 'user', content: [
+          { type: 'text', text: `${visionPrompt}
+গ্রাহক একই বার্তায় ${customerImageDataUrls.length || 1}টি ছবি পাঠিয়েছেন। সব ছবি একসঙ্গে বিবেচনা করুন; ভিন্ন কোণ/লেবেল/মডেল নম্বর থাকলে মিলিয়ে একটি পণ্য শনাক্ত করুন।` },
+          ...(customerImageDataUrls.length ? customerImageDataUrls : [customerImageDataUrl]).map((url, index) => ({ type: 'image_url', image_url: { url } }))
+        ] }
       ], VISION_MODEL, 350);
       const candidates = rankVisualCandidates(`${query} ${linkPreview?.title || ''}`, ocrText);
       if (!candidates.length) {
@@ -1274,8 +1311,8 @@ async function generateAIResponse(customerText, attachments = [], senderId) {
       // Compare the customer image against up to three candidate catalog images with the SAME model.
       const visualCandidates = candidates.slice(0, 3);
       const compareContent = [
-        { type: 'text', text: `গ্রাহকের ছবির সঙ্গে নিচের ক্যাটালগ পণ্যগুলোর তুলনা করুন। OCR/দৃশ্যমান লেখা: ${ocrText}. কেবল স্পষ্ট ভিজ্যুয়াল/মডেল মিল থাকলে একটি পণ্য নির্বাচন করুন; শুধু একই ধরনের লাইট হওয়া যথেষ্ট নয়। মিল না হলে NONE বলুন। নিচের ID/name-গুলোই অনুমোদিত। প্রতিটি ক্যাটালগ ছবির আগে তার ID ও নাম দেওয়া আছে। শেষে এক লাইনে JSON দিন: {"match":"PRODUCT_ID বা NONE","reason":"সংক্ষিপ্ত কারণ","confidence":"high|medium|low"}. গ্রাহকের ছবির আগে দেওয়া হয়েছে। প্রার্থী: ${visualCandidates.map(p => `${p.id}: ${p.name}; model=${p.model || ''}; sku=${p.sku || ''}; visual=${p.visualDescription || ''}; keywords=${Array.isArray(p.imageKeywords) ? p.imageKeywords.join(',') : p.imageKeywords || ''}`).join('\n')}` },
-        { type: 'image_url', image_url: { url: customerImageDataUrl } }
+        { type: 'text', text: `গ্রাহকের ${customerImageDataUrls.length || 1}টি ছবির সঙ্গে নিচের ক্যাটালগ পণ্যগুলোর তুলনা করুন। OCR/দৃশ্যমান লেখা: ${ocrText}. কেবল স্পষ্ট ভিজ্যুয়াল/মডেল মিল থাকলে একটি পণ্য নির্বাচন করুন; শুধু একই ধরনের লাইট হওয়া যথেষ্ট নয়। মিল না হলে NONE বলুন। নিচের ID/name-গুলোই অনুমোদিত। প্রতিটি ক্যাটালগ ছবির আগে তার ID ও নাম দেওয়া আছে। শেষে এক লাইনে JSON দিন: {"match":"PRODUCT_ID বা NONE","reason":"সংক্ষিপ্ত কারণ","confidence":"high|medium|low"}. প্রার্থী: ${visualCandidates.map(p => `${p.id}: ${p.name}; model=${p.model || ''}; sku=${p.sku || ''}; visual=${p.visualDescription || ''}; keywords=${Array.isArray(p.imageKeywords) ? p.imageKeywords.join(',') : p.imageKeywords || ''}`).join('\n')}` },
+        ...(customerImageDataUrls.length ? customerImageDataUrls : [customerImageDataUrl]).map(url => ({ type: 'image_url', image_url: { url } }))
       ];
       let addedCatalogImages = 0;
       for (const p of visualCandidates) {
@@ -1356,6 +1393,15 @@ async function processCustomerMessage(senderId, text, attachments = [], messageI
         await sendFacebookMessage(id, 'দুঃখিত, ভয়েস মেসেজটি এখন নির্ভরযোগ্যভাবে বুঝতে পারিনি। অনুগ্রহ করে কথাটি লিখে পাঠান, যাতে ভুল তথ্য বা অর্ডার না হয়।');
         return;
       }
+    }
+    // META FAQ INTENT RULE: direct FAQ/Meta suggested-reply answers take priority over product disambiguation,
+    // price prompts, order collection, and AI generation. Never append a product-name/model follow-up here.
+    const directFaqMatch = findBestDirectFaq(customerText);
+    if (directFaqMatch) {
+      const faqAnswer = String(directFaqMatch.faq.answer || directFaqMatch.faq.a || '').trim();
+      console.log(`[FAQ_INTENT] Direct FAQ answer selected for ${id}; score=${directFaqMatch.score}; category=${directFaqMatch.faq.category || 'n/a'}`);
+      await sendFacebookMessage(id, limitToFiveLines(faqAnswer));
+      return;
     }
     const explicitProductMentions = findExplicitProductMentions(customerText);
     // A customer can answer a bot's product-specific offer with only “Price koto”, “photo den”,
