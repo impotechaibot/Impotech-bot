@@ -266,6 +266,57 @@ function catalogProductForUrl(url) {
   });
   return matches.length === 1 ? matches[0] : null;
 }
+
+// Explicit category intents are deliberately separate from generic words like "light".
+// Generic media follow-ups must keep the customer's currently active product.
+function getExplicitProductCategoryIntent(text = '') {
+  const t = normalizeText(text);
+  if (/(?:angel\s*wings?|angle\s*wings?|এঞ্জেল\s*উইংস|এঞ্জেল\s*উইং|এঙ্গেল\s*উইংস|এঙ্গেল\s*উইং)/i.test(t)) return 'angelwings';
+  if (/(?:fog\s*lights?|foglamps?|fog\s*lamps?|ফগ\s*লাইট|ফগলাইট|ফগ\s*ল্যাম্প)/i.test(t)) return 'foglight';
+  if (/(?:head\s*lights?|headlamps?|হেড\s*লাইট|হেডলাইট)/i.test(t)) return 'headlight';
+  return null;
+}
+function getProductCategoryKey(product) {
+  if (!product) return null;
+  const text = normalizeText([
+    product.name, product.category, product.brand, product.model,
+    ...(Array.isArray(product.aliases) ? product.aliases : []),
+    ...(Array.isArray(product.tags) ? product.tags : []),
+    ...(Array.isArray(product.keywords) ? product.keywords : [])
+  ].filter(Boolean).join(' '));
+  if (/(?:angel\s*wings?|angle\s*wings?|এঞ্জেল\s*উইংস|এঙ্গেল\s*উইংস)/i.test(text)) return 'angelwings';
+  if (/(?:fog\s*lights?|foglamps?|fog\s*lamps?|ফগ\s*লাইট|ফগলাইট|ফগ\s*ল্যাম্প)/i.test(text)) return 'foglight';
+  if (/(?:head\s*lights?|headlamps?|হেড\s*লাইট|হেডলাইট)/i.test(text)) return 'headlight';
+  return null;
+}
+function getProductsByExplicitCategory(category) {
+  if (!category) return [];
+  return products.filter(p => getProductCategoryKey(p) === category);
+}
+function hasClearCategorySwitch(text, senderId) {
+  const requested = getExplicitProductCategoryIntent(text);
+  if (!requested) return false;
+  const active = findActiveProduct(senderId) || findProductFromRecentContext(senderId);
+  const activeCategory = getProductCategoryKey(active);
+  // Explicit Fog Light / Angel Wings requests should not be answered with generic headlight FAQ.
+  if (requested === 'foglight' || requested === 'angelwings') return activeCategory !== requested;
+  return Boolean(activeCategory && activeCategory !== requested);
+}
+function resolveMediaProduct(text, senderId) {
+  const explicit = findExactProduct(text);
+  if (explicit) { rememberActiveProduct(senderId, explicit); return { product: explicit, categoryProducts: [] }; }
+  const category = getExplicitProductCategoryIntent(text);
+  const active = findActiveProduct(senderId);
+  if (category) {
+    if (active && getProductCategoryKey(active) === category) return { product: active, categoryProducts: [] };
+    const choices = getProductsByExplicitCategory(category);
+    if (choices.length === 1) { rememberActiveProduct(senderId, choices[0]); return { product: choices[0], categoryProducts: [] }; }
+    if (choices.length > 1) return { product: null, categoryProducts: choices.slice(0, 3) };
+  }
+  // Critical: do NOT run fuzzy product search on "light photo/video". It can switch to fog lights.
+  return { product: active || findProductFromRecentContext(senderId), categoryProducts: [] };
+}
+
 function getHistory(senderId) {
   const id = String(senderId || '');
   if (!id) return [];
@@ -304,13 +355,19 @@ function updateCustomerMemory(senderId, customerText) {
   const text = String(customerText || '').trim();
   if (!senderId || !text || text.length > 1000) return;
   const id = String(senderId), memory = getCustomerMemory(id), customer = db.customers[id] || {};
-  const matches = products.map(product => ({ product, score: productScore(text, product) })).filter(x => x.score > 0).sort((a,b) => b.score-a.score);
-  if (matches.length && (matches.length === 1 || matches[0].score > matches[1].score)) {
-    addUniqueMemoryItem(memory.facts, `আলোচিত পণ্য: ${matches[0].product.name} (ID: ${matches[0].product.id})`);
-    // A clearly identified new product replaces the previous topic; generic follow-ups do not.
-    customer.activeProductId = matches[0].product.id;
-    customer.activeProductName = matches[0].product.name || null;
+  // Do not use fuzzy word overlap for active-product memory: "light photo/video" must
+  // continue the existing topic, not switch to a Fog Light or another light category.
+  const explicitlyNamedProduct = findExactProduct(text);
+  if (explicitlyNamedProduct) {
+    memory.facts = memory.facts.filter(item => !/^বর্তমান আলোচ্য পণ্য:|^আলোচিত পণ্য:/i.test(String(item)));
+    addUniqueMemoryItem(memory.facts, `বর্তমান আলোচ্য পণ্য: ${explicitlyNamedProduct.name} (ID: ${explicitlyNamedProduct.id})`);
+    customer.activeProductId = explicitlyNamedProduct.id;
+    customer.activeProductName = explicitlyNamedProduct.name || null;
+    customer.activeProductUpdatedAt = new Date().toISOString();
   }
+  // Keep the bike/car model separately from the current product topic.
+  const knownVehicle = rememberVehicleModel(id, text);
+  if (knownVehicle) customer.vehicleModelName = knownVehicle.model;
   const phone = text.match(/(?:\+?8801|01)[0-9\s-]{8,14}/);
   if (phone) customer.phone = phone[0].replace(/[\s-]/g, '');
   const vehicle = text.match(/(?:আমার|my)\s*(?:বাইক|মোটরসাইকেল|গাড়ি|bike|motorcycle|car)[^।.!?\n]{0,120}/i);
@@ -439,7 +496,15 @@ app.use('/api', (req, res, next) => ['/health','/status'].includes(req.path) ? n
 // -----------------------------------------------------------------------------
 // Product lookup, price and media
 // -----------------------------------------------------------------------------
-function getProductIdentifiers(p) { return [p.name,p.id,p.sku,p.model,...(Array.isArray(p.aliases)?p.aliases:[])].filter(Boolean).map(normalizeText).filter(Boolean); }
+const GENERIC_PRODUCT_IDENTIFIERS = new Set([
+  'light','lights','headlight','head light','headlamp','head lamp','fog light','fog lights','fog lamp','fog lamps',
+  'bulb','led','projector','angel wings','angle wings','picture','pic','photo','image','video','reel',
+  'লাইট','হেডলাইট','হেড লাইট','বাল্ব','প্রজেক্টর','ফগ লাইট','ছবি','ফটো','ভিডিও','দাম','price'
+].map(normalizeText));
+function getProductIdentifiers(p) {
+  const aliases = (Array.isArray(p.aliases) ? p.aliases : []).filter(alias => !GENERIC_PRODUCT_IDENTIFIERS.has(normalizeText(alias)));
+  return [p.name,p.id,p.sku,p.model,...aliases].filter(Boolean).map(normalizeText).filter(Boolean);
+}
 function findExactProduct(query) {
   const q = normalizeText(query); if (!q) return null;
   const matches = products.filter(p => getProductIdentifiers(p).some(name => name.length >= 3 && (` ${q} `).includes(` ${name} `)));
@@ -457,6 +522,7 @@ function rememberActiveProduct(senderId, product) {
   db.customers[id].activeProductId = product.id;
   db.customers[id].activeProductName = product.name || null;
   const memory = getCustomerMemory(id);
+  memory.facts = memory.facts.filter(item => !/^বর্তমান আলোচ্য পণ্য:|^আলোচিত পণ্য:/i.test(String(item)));
   addUniqueMemoryItem(memory.facts, `বর্তমান আলোচ্য পণ্য: ${product.name} (ID: ${product.id})`);
   memory.updatedAt = new Date().toISOString();
   db.customers[id].lastMemoryUpdatedAt = memory.updatedAt;
@@ -498,21 +564,171 @@ function buildSmartBillReply(product, quantity, deliveryFee) {
 }
 function isFacebookLink(url) { try { const u = new URL(url); return u.protocol === 'https:' && (u.hostname === 'facebook.com' || u.hostname.endsWith('.facebook.com') || u.hostname === 'fb.watch'); } catch (_) { return false; } }
 function getProductMediaUrls(p, type) { const media = p?.media; return media && Array.isArray(media[type]) ? media[type].filter(url => typeof url === 'string' && isFacebookLink(url)) : []; }
-function getMediaType(text='') { const v=normalizeText(text); if (/ভিডিও|video|রিল|reel|clip/.test(v)) return 'videos'; if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture/.test(v)) return 'images'; return null; }
+function getMediaType(text='') { const v=normalizeText(text); if (/ভিডিও|ভিডিয়ো|video|reel|রিল|clip|ভিডিওটা|ভিডিও দেন|অডিও দেন/i.test(v)) return 'videos'; if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture|\bpic\b|pic den|pic dao|ছবি দেন|ছবি দিন|ছবি দাও/i.test(v)) return 'images'; return null; }
 function getProductMediaReply(text, senderId) {
   const type = getMediaType(text); if (!type) return null;
-  const p = findExactProduct(text) || findRelevantProducts(text)[0] || findProductFromRecentContext(senderId);
-  if (!p) return 'আপনি কোন পণ্যের ছবি বা ভিডিও দেখতে চান? পণ্যের নাম বা মডেলটি বলুন।';
-  const urls = getProductMediaUrls(p, type); if (!urls.length) return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`;
-  return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক:\n${urls.map((u,i)=>`${i+1}. ${u}`).join('\n')}`;
+  const resolved = resolveMediaProduct(text, senderId);
+  if (resolved.categoryProducts.length) {
+    const lines = [];
+    for (const p of resolved.categoryProducts) {
+      const urls = getProductMediaUrls(p, type);
+      if (urls.length) lines.push(`${p.name}: ${urls.slice(0, 2).join(' | ')}`);
+    }
+    if (lines.length) return `ক্যাটালগে পাওয়া ${type === 'images' ? 'ছবি' : 'ভিডিও'}:\n${lines.join('\n')}`;
+    return `এই ক্যাটাগরির পণ্যের ${type === 'images' ? 'ছবি' : 'ভিডিও'} লিংক ক্যাটালগে পাওয়া যাচ্ছে না।`;
+  }
+  const p = resolved.product;
+  if (!p) return 'এই কথোপকথনে কোন পণ্যের কথা হচ্ছে তা শনাক্ত করতে পারিনি। অনুগ্রহ করে পণ্যের ছবি বা সঠিক নাম/মডেল পাঠান।';
+  const urls = getProductMediaUrls(p, type);
+  if (!urls.length) return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক বর্তমান ক্যাটালগে পাওয়া যাচ্ছে না।`;
+  return `${p.name}-এর ${type==='images'?'ছবি':'ভিডিও'} লিংক:\n${urls.slice(0, 3).map((u,i)=>`${i+1}. ${u}`).join('\n')}`;
 }
 
 // -----------------------------------------------------------------------------
-// Vehicle headlight fitment: never diagnose socket/fitment in the AI.
-// If the customer asks whether a headlight/plug fits their named vehicle,
-// send the owner's exact representative-contact reply and handle later turns normally.
+// Vehicle/headlight reference table (based on the user's supplied compatibility list).
+// Values are used as the configured business reference; they have not been independently verified.
 // -----------------------------------------------------------------------------
-const VEHICLE_FITMENT_HANDOFF_REPLY = 'আমাদের প্রতিনিধি শীঘ্রই আপনার সাথে যোগাযোগ করবে এবং নিশ্চিত করবে যে আমাদের এই হেডলাইটটি আপনার বাইকে সঠিকভাবে ফিট হবে কিনা।';
+const VEHICLE_FITMENT_DATA = String.raw`BAJAJ~Pulsar 150 (Single / Twin Disc / Neon / SD)~Pulsar 150;Pulsar 150 SD;Pulsar 150 Neon;Pulsar 150 Single Disc;Pulsar 150 Twin Disc;পালসার 150~2001-2026~149 CC~H4 / HS1~Direct Plug-and-Play (DC Conversion Required)
+BAJAJ~Pulsar 125 / Pulsar NS125~Pulsar 125;Pulsar NS125;NS 125;পালসার 125~2019-2026~124.4 CC~H4 / HS1~Direct Plug-and-Play
+BAJAJ~Pulsar 135 LS~Pulsar 135;Pulsar 135 LS;পালসার 135~2010-2018~135 CC~H4~Direct Plug-and-Play
+BAJAJ~Pulsar 180 / 180 Neon / 220F (Halogen)~Pulsar 180;Pulsar 180 Neon;Pulsar 220F;220F Halogen;পালসার 180;পালসার 220~2002-2021~178.6-220 CC~H4~Direct Plug-and-Play
+BAJAJ~Discover 100 / 100M / 100T~Discover 100;Discover 100M;Discover 100T;ডিসকভার 100;ডিসকভার 100m;ডিসকভার 100t~2009-2020~94.3-102 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+BAJAJ~Discover 110~Discover 110;ডিসকভার 110~2018-2022~115.5 CC~HS1 / H4~Direct Plug-and-Play
+BAJAJ~Discover 125 / 125 ST / Disc~Discover 125;Discover 125 ST;Discover 125 Disc;ডিসকভার 125~2004-2026~124.5 CC~HS1 / H4~Direct Plug-and-Play
+BAJAJ~Discover 135 Disc~Discover 135;Discover 135 Disc;ডিসকভার 135~2007-2012~134.2 CC~H4~Direct Plug-and-Play
+BAJAJ~Discover 150 / 150F / 150S~Discover 150;Discover 150F;Discover 150S;ডিসকভার 150~2010-2016~144.8 CC~H4~Direct Plug-and-Play
+BAJAJ~Platina 100 / ES / Comfortec~Platina 100;Platina ES;Platina Comfortec;প্লাটিনা 100~2006-2026~99.3 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+BAJAJ~Platina 110 H-Gear / ES~Platina 110;Platina 110 H-Gear;Platina 110 ES;প্লাটিনা 110~2019-2026~115.4 CC~HS1 / H4~Direct Plug-and-Play
+BAJAJ~CT 100 / CT 100 ES / CT 110~CT 100;CT 100 ES;CT 110;বাজাজ CT 100~2003-2026~99.3-115 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+BAJAJ~Avenger 150 / 160 Street~Avenger 150;Avenger 160;Avenger 160 Street;অ্যাভেঞ্জার 150~2016-2026~150-160 CC~H4~Direct Plug-and-Play
+BAJAJ~V15 / V12~Bajaj V15;Bajaj V12;V15;V12~2016-2020~124.5-149.5 CC~H4~Direct Plug-and-Play
+YAMAHA~FZ V1 / FZ-S V1~Yamaha FZ V1;FZ V1;FZ-S V1;FZS V1;ইয়ামাহা FZ V1;ইয়ামাহা FZ V1~2008-2015~153 CC~H4~Direct Plug-and-Play
+YAMAHA~FZ V2 / FZ-S V2 / FZER V2~Yamaha FZ V2;FZ V2;FZ-S V2;FZS V2;FZER V2;FZ ER V2;ইয়ামাহা FZ V2;ইয়ামাহা FZ V2~2014-2021~149 CC~H4~Direct Plug-and-Play
+YAMAHA~FAZER V1 / FAZER V2~Yamaha Fazer V1;Fazer V1;Fazer V2;FAZER V1;FAZER V2;ফেজার V1;ফেজার V2~2009-2020~149-153 CC~H4 (Dual)~Direct Plug-and-Play
+YAMAHA~SZ-R 153 / SZ-RR V2~Yamaha SZ-R 153;SZ-R 153;SZ-RR V2;SZRR V2~2011-2021~149-153 CC~H4~Direct Plug-and-Play
+YAMAHA~Saluto 125 / Disc~Yamaha Saluto 125;Saluto 125;Saluto;Saluto Disc~2016-2022~125 CC~H4 / HS1~Direct Plug-and-Play
+YAMAHA~YBR 125 / Custom / YBX~Yamaha YBR 125;YBR 125;YBR Custom;YBX;Yamaha YBX~2011-2017~124 CC~H4~Direct Plug-and-Play
+YAMAHA~Crux 106~Yamaha Crux 106;Crux 106;ক্রুক্স 106~2003-2014~106 CC~H4 / HS1~Direct Fit (DC Conversion Required)
+YAMAHA~RayZR 113 / Alpha (Halogen Trim)~Yamaha RayZR 113;RayZR 113;RayZR;Ray ZR 113;Yamaha Alpha;Alpha Halogen~2016-2020~113 CC~HS1 / H4~Direct Plug-and-Play
+TVS~Apache RTR 150 / Hyper Edge~TVS Apache RTR 150;Apache RTR 150;Apache Hyper Edge;Hyper Edge~2007-2012~149.7 CC~HS1 / H4~Direct Plug-and-Play
+TVS~Apache RTR 160 2V (Single / Twin Disc)~TVS Apache RTR 160 2V;Apache RTR 160 2V;Apache 160 2V;Apache RTR 160 Single Disc;Apache RTR 160 Twin Disc~2008-2026~159.7 CC~H4 / HS1~Direct Plug-and-Play
+TVS~Apache RTR 180 2V~TVS Apache RTR 180;Apache RTR 180 2V;Apache 180 2V~2011-2019~177.4 CC~H4~Direct Plug-and-Play
+TVS~Apache RTR 160 4V (Carb Halogen Trim)~Apache RTR 160 4V;TVS Apache 160 4V Carb;Apache 160 4V Halogen~2018-2020~159.7 CC~H4~Direct Fit
+TVS~Metro 100 / KLS / ELS~TVS Metro 100;Metro 100;Metro KLS;Metro ELS;TVS Metro~2009-2026~99.7 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+TVS~Metro Plus 110 / RE~TVS Metro Plus 110;Metro Plus 110;Metro RE~2014-2026~109.7 CC~H4 / HS1~Direct Plug-and-Play
+TVS~Stryker 125~TVS Stryker 125;Stryker 125~2016-2022~124.53 CC~H4~Direct Plug-and-Play
+TVS~Radeon 110~TVS Radeon 110;Radeon 110~2019-2026~109.7 CC~H4~Direct Plug-and-Play
+TVS~Star City / Star City Plus~TVS Star City;Star City Plus;TVS Star City Plus~2005-2020~99.7-109.7 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+TVS~Victor 110~TVS Victor 110;Victor 110~2016-2020~109.7 CC~H4 / HS1~Direct Plug-and-Play
+TVS~XL 100 / Heavy Duty / i-Touch~TVS XL 100;XL 100 Heavy Duty;XL 100 i-Touch;XL100~2017-2026~99.7 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+TVS~Jupiter 110 / Wego 110~TVS Jupiter 110;Jupiter 110;Jupiter;TVS Wego 110;Wego 110;Wego;TVS Wego~2013-2022~109.7 CC~HS1 / H4~Direct Plug-and-Play
+HONDA~CB Shine 125 / Shine SP~Honda CB Shine 125;CB Shine 125;Shine 125;Shine;Honda Shine SP;Shine SP;হোন্ডা শাইন 125~2012-2026~124.73 CC~H4~Direct Plug-and-Play
+HONDA~CB Unicorn 150 / Unicorn 160~Honda CB Unicorn 150;CB Unicorn 150;Honda Unicorn 160;Unicorn 160;ইউনিকর্ন 150~2010-2021~149.2-162.7 CC~H4~Direct Plug-and-Play
+HONDA~CB Trigger 150~Honda CB Trigger 150;CB Trigger 150;Honda Trigger 150~2013-2018~149.1 CC~H4~Direct Plug-and-Play
+HONDA~CB Hornet 160R (Halogen Version)~Honda CB Hornet 160R;CB Hornet 160R;Hornet 160R Halogen~2016-2019~162.7 CC~H4~Direct Plug-and-Play
+HONDA~Livo 110 / Disc~Honda Livo 110;Livo 110;Honda Livo Disc;Livo Disc~2015-2026~109.19 CC~H4~Direct Plug-and-Play
+HONDA~Dream Neo 110 / Dream 110 / CD 110~Honda Dream Neo 110;Dream Neo 110;Honda Dream 110;Dream 110;Honda CD 110;CD 110~2014-2026~109.19 CC~H4~Direct Plug-and-Play
+HONDA~Dio 110 / Activa (Halogen Trim)~Honda Dio 110;Dio 110;Dio;Honda Activa;Activa;Activa Halogen;Honda Activa Halogen~2015-2020~109.2 CC~HS1 / H4~Direct Plug-and-Play
+SUZUKI~Gixxer 155 / Gixxer SF (Halogen Carb)~Suzuki Gixxer 155;Gixxer 155;Gixxer SF Halogen;Gixxer SF Carb;Gixxer SF~2015-2019~154.9 CC~H4~Direct Plug-and-Play
+SUZUKI~GSX 125~Suzuki GSX 125;GSX125~2020-2026~125 CC~H4~Direct Plug-and-Play
+SUZUKI~GS150R~Suzuki GS150R;GS 150 R~2010-2016~149.5 CC~H4~Direct Plug-and-Play
+SUZUKI~Hayate 110 / Hayate EP~Suzuki Hayate 110;Hayate 110;Hayate EP~2015-2022~113 CC~H4~Direct Plug-and-Play
+SUZUKI~Slingshot 125~Suzuki Slingshot 125;Slingshot 125~2011-2015~124 CC~H4~Direct Plug-and-Play
+SUZUKI~Access 125 / Let’s 110~Suzuki Access 125;Access 125;Suzuki Lets 110;Suzuki Let’s 110;Lets 110;Let’s 110~2014-2020~112.8-124 CC~HS1 / H4~Direct Plug-and-Play
+HERO~Hunk 150 / Matt Edition / DD~Hero Hunk 150;Hunk 150;Hunk Matt Edition;Hunk DD~2008-2022~149.2 CC~H4~Direct Plug-and-Play
+HERO~Glamour 125 / BS4 / i3S~Hero Glamour 125;Glamour 125;Glamour BS4;Glamour i3S~2006-2026~124.7 CC~H4 / HS1~Direct Plug-and-Play
+HERO~Passion Pro / Passion XPro / XTec~Hero Passion Pro;Passion Pro;Passion XPro;Passion XTec;Passion Xtec~2010-2026~97.2-109.1 CC~H4 / HS1~Direct Plug-and-Play
+HERO~Splendor Plus / Pro / iSmart 110~Hero Splendor Plus;Splendor Plus;Hero Splendor Pro;Splendor Pro;Hero iSmart 110;Splendor iSmart 110~2004-2026~97.2-109.1 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+HERO~HF Deluxe / Dawn~Hero HF Deluxe;HF Deluxe;Hero Dawn;Hero HF Dawn~2012-2026~97.2 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+HERO~Xtreme 150 / Xtreme Sports~Hero Xtreme 150;Xtreme 150;Hero Xtreme Sports;Xtreme Sports~2011-2019~149.2 CC~H4~Direct Plug-and-Play
+HERO~Achiever 150~Hero Achiever 150;Achiever 150~2012-2019~149.1 CC~H4~Direct Plug-and-Play
+HERO~Ignitor 125~Hero Ignitor 125;Ignitor 125~2018-2023~124.7 CC~H4~Direct Plug-and-Play
+HERO~Pleasure 100 / Maestro Edge 110 (Halogen)~Hero Pleasure 100;Pleasure 100;Pleasure;Hero Maestro Edge 110;Maestro Edge 110;Maestro Edge 110 Halogen;Maestro Edge Halogen~2012-2020~102-110 CC~HS1 / H4~Direct Plug-and-Play
+RUNNER / OTHER~Turbo 125~Runner Turbo 125;Turbo 125;রানার টার্বো 125~2013-2026~124.8 CC~H4~Direct Plug-and-Play
+RUNNER / OTHER~Knight Rider 150~Runner Knight Rider 150;Knight Rider 150~2017-2023~150 CC~H4~Direct Plug-and-Play
+RUNNER / OTHER~Royal 110 / Cheeta 100~Runner Royal 110;Royal 110;Runner Cheeta 100;Cheeta 100;Runner Cheetah 100~2012-2026~100-110 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+RUNNER / OTHER~Bullet 100 / V2~Runner Bullet 100;Bullet 100;Runner Bullet V2;Bullet V2~2013-2026~100 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+RUNNER / OTHER~Skymate 110 / AD80S~Runner Skymate 110;Skymate 110;Runner AD80S;AD80S~2010-2026~85-110 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+RUNNER / OTHER~Keeway RKS 125 / RKS 150 / CBS~Keeway RKS 125;RKS 125;Keeway RKS 150;RKS 150;Keeway RKS CBS;RKS CBS~2015-2023~124.8-148 CC~H4~Direct Plug-and-Play
+RUNNER / OTHER~Keeway Superlight 150 / K-Light 150/200~Keeway Superlight 150;Superlight 150;Keeway K-Light 150;K-Light 150;Keeway K-Light 200;K-Light 200~2016-2026~149.3-197 CC~H4~Direct Plug-and-Play
+RUNNER / OTHER~Keeway Magnet 100~Keeway Magnet 100;Magnet 100~2016-2022~99 CC~HS1 / H4~Direct Plug-and-Play
+RUNNER / OTHER~Lifan KPR 150 / KPR 165 (Halogen)~Lifan KPR 150;KPR 150;Lifan KPR 165;KPR 165 Halogen~2015-2026~149-165 CC~H4~Direct Plug-and-Play
+RUNNER / OTHER~Lifan Victor R 100 / KP Mini 150~Lifan Victor R 100;Victor R 100;Lifan KP Mini 150;KP Mini 150~2016-2024~100-150 CC~H4 / HS1~Direct Plug-and-Play
+RUNNER / OTHER~Speeder Countryman 165~Speeder Countryman 165;Countryman 165~2018-2026~163.7 CC~H4~Direct Plug-and-Play
+RUNNER / OTHER~Speeder FX 150~Speeder FX 150;FX 150~2017-2023~150 CC~H4~Direct Plug-and-Play
+TOYOTA~Corolla X / G (E120 Chassis)~Toyota Corolla X;Corolla X;Corolla;Corolla X E120;Toyota Corolla G;Corolla G;Corolla G E120;Corolla E120~2000-2006~1500 CC~H4 Dual Filament~Direct Plug-and-Play
+TOYOTA~Axio X-Grade (E140 & E160)~Toyota Axio X Grade;Axio X Grade;Axio E140;Axio E160;Axio;Toyota Axio~2006-2020~1500 CC~H4 Halogen~Direct Plug-and-Play
+TOYOTA~Probox / Succeed~Toyota Probox;Probox;Toyota Succeed;Succeed~2002-2026~1300-1500 CC~H4 Halogen~Direct Plug-and-Play
+TOYOTA~Premio / Allion (NZT240 Halogen Grade)~Toyota Premio;Premio;Premio NZT240;Toyota Allion;Allion;Allion NZT240~2001-2007~1500-1800 CC~H4 Halogen~Direct Mountable
+TOYOTA~Vitz / Yaris (XP10 / XP90 Halogen)~Toyota Vitz;Vitz;Vitz XP10;Vitz XP90;Toyota Yaris;Yaris;Yaris XP10;Yaris XP90~1999-2010~1000-1300 CC~H4 Halogen~Direct Plug-and-Play
+TOYOTA~TownAce / LiteAce Van~Toyota TownAce;TownAce;TownAce Van;Toyota LiteAce;LiteAce;LiteAce Van~2008-2026~1500 CC~H4 Halogen~Direct Fit
+TOYOTA~HiAce Van (H200 Halogen Trim)~Toyota HiAce;HiAce;Toyota HiAce H200;HiAce H200 Halogen;HiAce Van~2004-2019~2000-2700 CC~H4 Halogen~Direct Plug-and-Play
+SUZUKI~Alto (BD & Japanese HA25/HA36)~Suzuki Alto;Alto;Alto BD;Alto HA25;Alto HA36;Suzuki Alto HA25;Suzuki Alto HA36~2000-2026~660-1000 CC~H4 Halogen~Direct Plug-and-Play
+SUZUKI~Wagon R (FX Trim)~Suzuki Wagon R;Wagon R;Wagon R FX;Wagon R FX Trim~2010-2026~660-1000 CC~H4 Halogen~Direct Plug-and-Play
+SUZUKI~Swift (Halogen Trim)~Suzuki Swift;Swift;Swift Halogen~2005-2017~1200-1300 CC~H4 Halogen~Direct Plug-and-Play
+HYUNDAI~Grand i10 / i10~Hyundai Grand i10;Grand i10;Hyundai i10;i10~2008-2020~1000-1200 CC~H4 Halogen~Direct Fit
+HYUNDAI~Eon~Hyundai Eon;Eon~2012-2019~800-1000 CC~H4 Halogen~Direct Fit
+NISSAN~Sunny / Sun FB15~Nissan Sunny;Sunny FB15;Nissan Sun FB15;Sun FB15~1998-2004~1300-1500 CC~H4 Halogen~Direct Fit
+NISSAN~AD Van / NV150 AD~Nissan AD Van;AD Van;Nissan NV150 AD;NV150 AD~2006-2021~1200-1500 CC~H4 Halogen~Direct Plug-and-Play`.trim().split(/\r?\n/).map((line, index) => {
+  const [brand, model, aliases, years, cc, socket, fitment] = line.split('~');
+  return { id: index + 1, brand, model, aliases: String(aliases || '').split(';').filter(Boolean), years, cc, socket, fitment };
+});
+function compactVehicleText(value = '') {
+  return normalizeText(value).replace(/[^\p{L}\p{N}]/gu, '');
+}
+function findVehicleCompatibility(text = '') {
+  const query = compactVehicleText(text);
+  if (!query) return null;
+  const hits = [];
+  for (const row of VEHICLE_FITMENT_DATA) {
+    const aliases = [...row.aliases, row.model, `${row.brand} ${row.model}`]
+      .map(compactVehicleText).filter(alias => alias.length >= 4);
+    const matched = aliases.filter(alias => query.includes(alias)).sort((a, b) => b.length - a.length)[0];
+    if (matched) hits.push({ row, score: matched.length, matched });
+  }
+  hits.sort((a, b) => b.score - a.score);
+  if (!hits.length) return null;
+  // A specific longer name beats a short alias; same-length competing models are ambiguous.
+  if (hits.length > 1 && hits[0].score === hits[1].score && hits[0].row.id !== hits[1].row.id) return null;
+  return hits[0].row;
+}
+function rememberVehicleModel(senderId, text) {
+  const row = findVehicleCompatibility(text);
+  if (!row || !senderId) return row;
+  const id = String(senderId);
+  if (!db.customers[id]) db.customers[id] = { id, name: `Customer ${id.slice(-4)}`, messageCount: 0 };
+  Object.assign(db.customers[id], {
+    vehicleModelId: row.id, vehicleModelName: row.model, vehicleBrand: row.brand,
+    vehicleModelYears: row.years, vehicleModelUpdatedAt: new Date().toISOString()
+  });
+  const memory = getCustomerMemory(id);
+  addUniqueMemoryItem(memory.facts, `গ্রাহকের যানবাহন: ${row.brand} ${row.model} (${row.years})`);
+  memory.updatedAt = new Date().toISOString();
+  saveStorage();
+  return row;
+}
+function getKnownVehicleCompatibility(senderId, currentText = '', contextText = '') {
+  const currentMatch = findVehicleCompatibility(currentText);
+  if (currentMatch) return currentMatch;
+  const customer = db.customers[String(senderId || '')] || {};
+  if (customer.vehicleModelId) {
+    const saved = VEHICLE_FITMENT_DATA.find(row => row.id === Number(customer.vehicleModelId));
+    if (saved) return saved;
+  }
+  return findVehicleCompatibility(contextText);
+}
+function buildVehicleFitmentReply(row) {
+  if (!row) return VEHICLE_FITMENT_HANDOFF_REPLY;
+  const socketText = `Socket: ${row.socket}`;
+  if (/DC Conversion Required/i.test(row.fitment)) {
+    const connection = /Direct Plug-and-Play/i.test(row.fitment) ? 'কনভার্সনের পরে Direct Plug-and-Play; ' : 'Direct Fit; ';
+    return `আপনার ${row.brand} ${row.model} (${row.years}, ${row.cc}) সম্পর্কে দেওয়া তালিকা অনুযায়ী ${socketText}। ${connection}তবে হেডলাইট লাগানোর আগে বাইকের AC supply-কে DC-তে convert করতে হবে।`;
+  }
+  if (/Direct Plug-and-Play/i.test(row.fitment)) return `আপনার ${row.brand} ${row.model} (${row.years}, ${row.cc}) সম্পর্কে দেওয়া তালিকা অনুযায়ী ${socketText} এবং fitment: Direct Plug-and-Play।`;
+  return `আপনার ${row.brand} ${row.model} (${row.years}, ${row.cc}) সম্পর্কে দেওয়া তালিকায় ${socketText} এবং fitment: ${row.fitment} উল্লেখ আছে।`;
+}
+
+const VEHICLE_FITMENT_HANDOFF_REPLY = 'আমাদের দেওয়া তালিকায় আপনার বাইক/গাড়ির নির্দিষ্ট মডেলটি নিশ্চিতভাবে মেলেনি। সঠিক ফিটমেন্ট নিশ্চিত করতে আমাদের প্রতিনিধি সাহায্য করবে।';
 function isVehicleHeadlightFitmentInquiry(currentText='', recentContext='') {
   const current = String(currentText || '').trim();
   const context = `${String(recentContext || '')}\n${current}`;
@@ -523,7 +739,8 @@ function isVehicleHeadlightFitmentInquiry(currentText='', recentContext='') {
   const asksPlugMatch = mentionsPlugOrSocket && /(?:মিলবে|মিলে|ম্যাচ|match|fit|ফিট|হবে|লাগবে|সাপোর্ট|support|compatible)/i.test(current);
   const vehicleMentioned = /(?:বাইক|মোটরসাইকেল|bike|motorcycle|motorbike|গাড়ি|গাড়ি|কার|car|cng|সিএনজি|বাস|bus|ট্রাক|truck|ভ্যান|van|পিকআপ|pickup|যানবাহন|vehicle|মডেল|model|discover|ডিসকভার|pulsar|পালসার|apache|অ্যাপাচি|yamaha|bajaj|tvs|hero|honda|suzuki|gixxer|splendor|fz\s*\d*|r15|corolla|allion|premio|hiace|civic|alto|wagon\s*r|swift|nissan|toyota|mahindra|tata|mitsubishi)/i.test(context);
   const headlightContext = /(?:হেড\s*লাইট|হেডলাইট|head\s*light|headlight|headlamp|head\s*lamp|বাল্ব|bulb|projector|প্রজেক্টর|plug|প্লাগ|socket|সকেট|h\s*-?\s*4|hs\s*-?\s*1|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন)/i.test(context);
-  return vehicleMentioned && headlightContext && (asksFitOrMatch || asksPlugMatch || genericFitmentFollowup);
+  const knownModelInContext = Boolean(findVehicleCompatibility(current) || findVehicleCompatibility(context));
+  return (vehicleMentioned || knownModelInContext) && (headlightContext || knownModelInContext) && (asksFitOrMatch || asksPlugMatch || genericFitmentFollowup);
 }
 
 // -----------------------------------------------------------------------------
@@ -722,7 +939,7 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
 ২) অর্ডার শুরু: কেবল “অর্ডার করতে চাই”, “পাঠিয়ে দিন”, “কিনব/নেব” বা সমার্থক স্পষ্ট সম্মতির পর ব্যাকএন্ডের অর্ডার প্রক্রিয়া চলবে। অর্ডার চলাকালে আগের কথোপকথন ও draft-এ থাকা পণ্য, ফোন এবং ঠিকানা ব্যবহার করবে; ইতিমধ্যে পাওয়া তথ্য আবার চাইবে না।
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
 ৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। catalog.json ও FAQ-ই পণ্যের তথ্যের মূল উৎস। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
-৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: কোনো যানবাহনে হেডলাইট ফিট হবে কি না, সকেট/প্লাগ মিলবে কি না—নিজে থেকে ১০০% নিশ্চয়তা, অনুমান বা টেকনিক্যাল সিদ্ধান্ত দেবে না। এ ধরনের প্রশ্নে শুধু এই উত্তর দেবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
+৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”。
 ৬) মেমোরি ও প্রসঙ্গ: পূর্ববর্তী কথোপকথন, customer memory, সক্রিয় পণ্য ও বর্তমান অর্ডার ড্রাফট ব্যবহার করবে। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে ইতিহাসে থাকা পণ্য বুঝে নেবে; একই তথ্য অকারণে আবার চাইবে না।
 ৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
 ৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
@@ -763,8 +980,17 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const context=getRecentConversationText(senderId,query), memory=buildCustomerMemoryContext(senderId);
   const explicitProduct = findExactProduct(query);
   if (explicitProduct) rememberActiveProduct(senderId, explicitProduct);
-  const activeProduct = explicitProduct || findActiveProduct(senderId);
-  const relevantProducts = activeProduct ? [activeProduct] : findRelevantProducts(context);
+  const requestedCategory = getExplicitProductCategoryIntent(query);
+  let activeProduct = explicitProduct || findActiveProduct(senderId);
+  let relevantProducts;
+  if (requestedCategory && hasClearCategorySwitch(query, senderId)) {
+    const categoryChoices = getProductsByExplicitCategory(requestedCategory);
+    relevantProducts = categoryChoices.length ? categoryChoices.slice(0, MAX_PRODUCTS_TO_AI) : (activeProduct ? [activeProduct] : findRelevantProducts(context));
+    if (categoryChoices.length === 1) { activeProduct = categoryChoices[0]; rememberActiveProduct(senderId, activeProduct); }
+  } else {
+    // Generic follow-ups such as "light photo/video please" retain the active model.
+    relevantProducts = activeProduct ? [activeProduct] : findRelevantProducts(context);
+  }
   const relevantFaqs=findRelevantFaqs(context);
   const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
@@ -809,8 +1035,13 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     const incomingUrls = extractUrls(customerText);
     const linkedProducts = [...new Map(incomingUrls.map(url => catalogProductForUrl(url)).filter(Boolean).map(product => [String(product.id), product])).values()];
     if (linkedProducts.length === 1) rememberActiveProduct(id, linkedProducts[0]);
-    // META FAQ INTENT RULE: return the saved FAQ answer verbatim before generic price/model handlers.
-    const matchedFaq = findBestFaqMatch(customerText);
+    // FAQ intent normally has top priority and is returned verbatim with no extra model question.
+    // However, a clearly named new category (Fog Light / Angel Wings) must not receive an
+    // unrelated generic Headlight price FAQ.
+    const explicitCategory = getExplicitProductCategoryIntent(customerText);
+    const categorySwitch = hasClearCategorySwitch(customerText, id);
+    const shouldResolveCategoryInsteadOfGenericFaq = categorySwitch || explicitCategory === 'foglight' || explicitCategory === 'angelwings';
+    const matchedFaq = shouldResolveCategoryInsteadOfGenericFaq ? null : findBestFaqMatch(customerText);
     if (matchedFaq) {
       const faqAnswer = String(matchedFaq.answer || '').trim();
       if (faqAnswer) {
@@ -824,10 +1055,12 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       await sendFacebookMessage(id, 'লিংকটি থেকে পণ্যটি নিশ্চিতভাবে শনাক্ত করতে পারিনি। অনুগ্রহ করে পণ্যের একটি স্ক্রিনশট বা সঠিক নাম/মডেল পাঠান।');
       return;
     }
-    // Never diagnose headlight fitment or plug matching. Send the requested fixed reply,
-    // then let any subsequent customer turn proceed through normal support handling.
-    if (isVehicleHeadlightFitmentInquiry(customerText, getRecentConversationText(id, customerText))) {
-      await sendFacebookMessage(id, VEHICLE_FITMENT_HANDOFF_REPLY);
+    // Deterministic fitment answer from the customer-provided motorcycle/car reference table.
+    // If their model is not listed, never guess: send the representative-contact fallback.
+    const fitmentContext = [getRecentConversationText(id, customerText), db.customers[id]?.vehicleModelName || '', db.customers[id]?.activeProductName || ''].filter(Boolean).join('\n');
+    if (isVehicleHeadlightFitmentInquiry(customerText, fitmentContext)) {
+      const vehicle = getKnownVehicleCompatibility(id, customerText, fitmentContext);
+      await sendFacebookMessage(id, buildVehicleFitmentReply(vehicle));
       return;
     }
     // Delivery-charge questions are informational, not order intent; never request address/phone for them.
@@ -895,8 +1128,21 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       await sendFacebookMessage(id,limitToFiveLines(buildSmartBillReply(p,quantity,deliveryFee)));return;
     }
     if(isPriceQuestion(customerText)) {
-      const p=findExactProduct(customerText)||(isGenericPriceQuestion(customerText)?findProductFromRecentContext(id):null);
-      if(!p){await sendFacebookMessage(id,'আপনি কোন পণ্যটির দাম জানতে চাচ্ছেন? পণ্যের সঠিক নাম বা মডেলটি বলুন।');return;}
+      const explicit = findExactProduct(customerText);
+      const category = getExplicitProductCategoryIntent(customerText);
+      let p = explicit;
+      if (!p && category && (category === 'foglight' || category === 'angelwings' || hasClearCategorySwitch(customerText, id))) {
+        const candidates = getProductsByExplicitCategory(category);
+        if (candidates.length === 1) p = candidates[0];
+        else if (candidates.length > 1) {
+          const priceLines = candidates.slice(0, 3).map(item => getPriceReply(item) || `${item.name}-এর দাম ক্যাটালগে উল্লেখ নেই।`);
+          await sendFacebookMessage(id, priceLines.join('\n'));
+          return;
+        }
+      }
+      if (!p && (isGenericPriceQuestion(customerText) || !category)) p = findProductFromRecentContext(id);
+      if(!p){await sendFacebookMessage(id,'এই ক্যাটাগরির নির্দিষ্ট পণ্য শনাক্ত করতে পারিনি। ক্যাটালগে একাধিক মডেল থাকলে পণ্যের ছবি বা মডেল পাঠান।');return;}
+      if (explicit || (category && getProductCategoryKey(p) === category)) rememberActiveProduct(id, p);
       const reply=getPriceReply(p);await sendFacebookMessage(id,reply||`দুঃখিত, ${p.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই।`);return;
     }
     if(getMediaType(customerText)){const reply=getProductMediaReply(customerText,id);if(reply){await sendFacebookMessage(id,limitToFiveLines(reply));return;}}
@@ -1112,7 +1358,7 @@ app.get('/admin/campaign-tracking', (req,res) => {
 // -----------------------------------------------------------------------------
 app.get('/health',(req,res)=>res.status(200).json({success:true,status:'ok',storage:pool?'postgresql':'memory-only'}));
 app.get('/api/health',(req,res)=>res.status(200).json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',isGlobalPaused:!!db.isGlobalPaused}));
-app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
+app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
 app.get('/api/catalog/media-status',(req,res)=>res.json({success:true,products:products.map(p=>({id:p.id,name:p.name,images:getProductMediaUrls(p,'images').length,videos:getProductMediaUrls(p,'videos').length}))}));
 
 // -----------------------------------------------------------------------------
