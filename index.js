@@ -800,9 +800,27 @@ async function setTakeoverState(customerId, enabled, reasonStr) {
   Object.assign(db.customers[id],{isPaused:on,takeover:on,takeoverUpdatedAt:timestamp});
   if(on)cancelFollowup(id); saveStorage(); return on;
 }
+
+// Messenger sends plain text, so normalize Markdown links before delivery.
+// Examples: [https://example.com](https://example.com) -> https://example.com
+//           [Watch video](https://example.com/video) -> Watch video: https://example.com/video
+function normalizeMessengerLinks(text = '') {
+  return String(text || '')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gi, (match, label, url) => {
+      const cleanLabel = String(label || '').trim();
+      const cleanUrl = String(url || '').trim();
+      if (!cleanLabel || cleanLabel === cleanUrl) return cleanUrl;
+      return `${cleanLabel}: ${cleanUrl}`;
+    })
+    .replace(/^\s*[-*]\s+(https?:\/\/\S+)\s*$/gim, '$1')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 async function sendFacebookMessage(recipientId, text) {
   if(!PAGE_ACCESS_TOKEN){console.error('[Messenger] PAGE_ACCESS_TOKEN missing');return false;}
-  const finalText=String(text||'').trim(); if(!finalText||finalText.length>MAX_MESSENGER_TEXT_LENGTH)return false;
+  const finalText=normalizeMessengerLinks(text); if(!finalText||finalText.length>MAX_MESSENGER_TEXT_LENGTH)return false;
   try {
     const url=`https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
     const response=await axios.post(url,{recipient:{id:recipientId},message:{text:finalText},messaging_type:'RESPONSE'},{timeout:15000});
