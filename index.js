@@ -62,6 +62,9 @@ const MEMORY_RETENTION_MS = MEMORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
 const FOLLOWUP_DELAY_MS = 23 * 60 * 60 * 1000;
 const FOLLOWUP_CHECK_INTERVAL_MS = 60 * 1000;
+const CUSTOMER_REPLY_DELAY_MS = 5000;
+const CATALOG_AUTO_REFRESH_MS = Math.max(30000, Number(process.env.CATALOG_AUTO_REFRESH_MS) || 60000);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const LOCAL_CATALOG_PATH = path.join(__dirname, 'catalog.json');
 const LEGACY_DATA_FILE = path.join(__dirname, 'storage_data.json');
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
@@ -450,8 +453,18 @@ function mergeCatalogData(current, incoming) {
     const key = faqKey(f) || `__new_${crypto.randomUUID()}`;
     faqMap.set(key, faqMap.has(key) ? { ...faqMap.get(key), ...f } : { ...f });
   }
+  if (incoming.replaceAll === true) {
+    faqMap.clear();
+    for (const f of (Array.isArray(incoming.faqs) ? incoming.faqs : [])) faqMap.set(faqKey(f) || `__new_${crypto.randomUUID()}`, { ...f });
+  }
+  if (Array.isArray(incoming.deleteFaqIds)) {
+    for (const id of incoming.deleteFaqIds.map(String)) {
+      for (const [key, faq] of faqMap) if (String(faq.id ?? faq.question ?? faq.q ?? '') === id) faqMap.delete(key);
+    }
+  }
   const result = { ...current, ...incoming, products: mergedProducts, faqs: Array.from(faqMap.values()), version: incoming.version ?? Date.now(), updatedAt: incoming.updatedAt ?? new Date().toISOString() };
   delete result.deleteProductIds;
+  delete result.deleteFaqIds;
   delete result.replaceAll;
   return result;
 }
@@ -564,7 +577,7 @@ function buildSmartBillReply(product, quantity, deliveryFee) {
 }
 function isFacebookLink(url) { try { const u = new URL(url); return u.protocol === 'https:' && (u.hostname === 'facebook.com' || u.hostname.endsWith('.facebook.com') || u.hostname === 'fb.watch'); } catch (_) { return false; } }
 function getProductMediaUrls(p, type) { const media = p?.media; return media && Array.isArray(media[type]) ? media[type].filter(url => typeof url === 'string' && isFacebookLink(url)) : []; }
-function getMediaType(text='') { const v=normalizeText(text); if (/ভিডিও|ভিডিয়ো|video|reel|রিল|clip|ভিডিওটা|ভিডিও দেন|অডিও দেন/i.test(v)) return 'videos'; if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture|\bpic\b|pic den|pic dao|ছবি দেন|ছবি দিন|ছবি দাও/i.test(v)) return 'images'; return null; }
+function getMediaType(text='') { const v=normalizeText(text); if (/ভিডিও|ভিডিয়ো|video|reel|রিল|clip|ভিডিওটা|ভিডিও দেন|ভিডিও দাও/i.test(v)) return 'videos'; if (/ছবি|ফটো|পিকচার|ইমেজ|image|photo|picture|\bpic\b|pic den|pic dao|ছবি দেন|ছবি দিন|ছবি দাও/i.test(v)) return 'images'; return null; }
 function getProductMediaReply(text, senderId) {
   const type = getMediaType(text); if (!type) return null;
   const resolved = resolveMediaProduct(text, senderId);
@@ -892,7 +905,7 @@ async function pullCatalogFromGitHub() {
     const url=`https://api.github.com/repos/${GITHUB_REPO}/contents/${CATALOG_FILE}?ref=${encodeURIComponent(GITHUB_BRANCH)}`;
     const r=await axios.get(url,{headers:{Authorization:`Bearer ${GITHUB_TOKEN}`,Accept:'application/vnd.github+json','User-Agent':'Impotech-Admin-Server'},timeout:15000});
     if(!r.data?.content)throw new Error('GitHub response contains no file content');
-    const parsed=JSON.parse(Buffer.from(r.data.content,'base64').toString('utf8'));replaceCatalogAtomically(parsed,'github');return true;
+    const parsed=JSON.parse(Buffer.from(r.data.content,'base64').toString('utf8')); parsed.replaceAll = true; replaceCatalogAtomically(parsed,'github');return true;
   }catch(err){catalogMeta.lastSyncError=err.response?.data?.message||err.message;console.error('[GITHUB] Pull failed:',catalogMeta.lastSyncError);return false;}
 }
 async function pushCatalogToGitHub(data,customToken,customRepo,customBranch,customPath) {
@@ -940,7 +953,7 @@ function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContex
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
 ৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। catalog.json ও FAQ-ই পণ্যের তথ্যের মূল উৎস। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”。
-৬) মেমোরি ও প্রসঙ্গ: পূর্ববর্তী কথোপকথন, customer memory, সক্রিয় পণ্য ও বর্তমান অর্ডার ড্রাফট ব্যবহার করবে। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে ইতিহাসে থাকা পণ্য বুঝে নেবে; একই তথ্য অকারণে আবার চাইবে না।
+৬) মেমোরি ও প্রসঙ্গ: পূর্ববর্তী কথোপকথন, customer memory, সক্রিয় পণ্য ও বর্তমান অর্ডার ড্রাফট ব্যবহার করবে। সর্বশেষ স্পষ্টভাবে নাম বলা পণ্যই Active Product। গ্রাহক সেই পণ্যের দাম জিজ্ঞেস করার পর “লাইটের আলো কেমন”, “ছবি/ভিডিও/অডিও দেন”, “বিস্তারিত বলুন”, “ডেলিভারি/ওয়ারেন্টি” ইত্যাদি বললে একই পণ্য বোঝাবে; অন্য পণ্যের তথ্য, ছবি বা ভিডিও দেবে না। শুধু গ্রাহক স্পষ্টভাবে নতুন পণ্যের নাম/ক্যাটাগরি বললে Active Product পরিবর্তন করবে। সাধারণ “লাইট” শব্দ দিয়ে Headlight থেকে Fog Light বা অন্য পণ্যে কখনো বদলাবে না। বর্তমান Active Product-এর তথ্য না থাকলে সেটি স্পষ্ট বলবে, বিকল্প পণ্য ধরে উত্তর দেবে না।
 ৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
 ৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
 
@@ -995,7 +1008,23 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
   const audio=attachments.find(x=>x.type==='audio'&&x.payload?.url);
-  if(audio){try{const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:15000,maxContentLength:MAX_ATTACHMENT_BYTES});const base64=Buffer.from(r.data).toString('base64');return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[{type:'text',text:'গ্রাহকের ভয়েস বুঝে বাংলায় সর্বোচ্চ ৫ লাইনে উত্তর দিন। অনিশ্চিত হলে তা জানান।'},{type:'input_audio',input_audio:{data:base64,format:'mp4'}}]}],VOICE_MODEL));}catch(e){console.error('[VOICE] Failed:',e.message);}}
+  if(audio){
+    try {
+      const r=await axios.get(audio.payload.url,{responseType:'arraybuffer',timeout:20000,maxContentLength:MAX_ATTACHMENT_BYTES});
+      const contentType=String(r.headers['content-type']||'').toLowerCase();
+      const urlPath=String(audio.payload.url).split('?')[0].toLowerCase();
+      let audioFormat='mp3';
+      if(/ogg|opus/.test(contentType)||/\.(ogg|opus)$/.test(urlPath)) audioFormat='ogg';
+      else if(/wav/.test(contentType)||/\.wav$/.test(urlPath)) audioFormat='wav';
+      else if(/mp4|m4a|aac/.test(contentType)||/\.(m4a|mp4|aac)$/.test(urlPath)) audioFormat='mp4';
+      else if(/mpeg|mp3/.test(contentType)||/\.mp3$/.test(urlPath)) audioFormat='mp3';
+      const base64=Buffer.from(r.data).toString('base64');
+      return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:[
+        {type:'text',text:'এটি গ্রাহকের পাঠানো ভয়েস মেসেজ। আগে কথাগুলো যথাসম্ভব সঠিকভাবে বুঝে/ট্রান্সক্রাইব করুন, তারপর গ্রাহকের উদ্দেশ্য অনুযায়ী সরাসরি উত্তর দিন। বাংলা, English ও Banglish উচ্চারণ/শব্দ বিবেচনা করুন। শোনা যায়নি এমন তথ্য অনুমান করবেন না। সর্বোচ্চ ৫টি ছোট লাইন।'},
+        {type:'input_audio',input_audio:{data:base64,format:audioFormat}}
+      ]}],VOICE_MODEL));
+    } catch(e) { console.error('[VOICE] Failed:',e.response?.data?.error?.message||e.message); }
+  }
   const images = attachments.filter(x => x.type === 'image' && x.payload?.url).slice(0, 4);
   if (images.length) {
     try {
@@ -1040,6 +1069,12 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     // unrelated generic Headlight price FAQ.
     const explicitCategory = getExplicitProductCategoryIntent(customerText);
     const categorySwitch = hasClearCategorySwitch(customerText, id);
+    // A clearly named category is a topic change. Persist it when it maps to one product;
+    // generic words such as "light", "photo", "video" never change the active product.
+    if (explicitCategory && categorySwitch) {
+      const categoryMatches = getProductsByExplicitCategory(explicitCategory);
+      if (categoryMatches.length === 1) rememberActiveProduct(id, categoryMatches[0]);
+    }
     const shouldResolveCategoryInsteadOfGenericFaq = categorySwitch || explicitCategory === 'foglight' || explicitCategory === 'angelwings';
     const matchedFaq = shouldResolveCategoryInsteadOfGenericFaq ? null : findBestFaqMatch(customerText);
     if (matchedFaq) {
@@ -1260,6 +1295,8 @@ app.post('/webhook',async(req,res)=>{
       const previous=customerQueues.get(senderId)||Promise.resolve();
       const task=previous.catch(()=>{}).then(async()=>{
         if(messageId&&db.messages.some(m=>m.messageId===messageId))return;
+        // Small deliberate reply delay so the bot does not answer instantly.
+        await sleep(CUSTOMER_REPLY_DELAY_MS);
         const now=new Date().toISOString(),paused=getTakeoverState(senderId);
         appendHistory(senderId,'user',text||'[Media File]');
         addStoredMessage({id:'msg_'+crypto.randomUUID(),senderId,sender:'customer',text:text||`[Media: ${attachments[0]?.type||'file'}]`,timestamp:now,messageId:messageId||null});
@@ -1286,9 +1323,15 @@ app.post('/webhook',async(req,res)=>{
         const c=db.customers[senderId]||{}; const phone=extractPhone(text); const address=extractAddress(text);
         if(phone)c.phone=phone; if(address)c.address=address; db.customers[senderId]=c;
         const completeAddress=String(c.address||'').trim().length>=10;
-        if(phone || address) { const mem=getCustomerMemory(senderId); if(phone)addUniqueMemoryItem(mem.facts,`ফোন: ${phone}`); if(address)addUniqueMemoryItem(mem.facts,`ঠিকানা: ${address}`); mem.updatedAt=new Date().toISOString(); }
-        // Do not pause the bot for a city-only mention or phone-only message. Transfer automatically only when both phone and a full address are available, outside an active order flow.
-        if(phone && completeAddress && !db.orderDrafts[senderId] && !getTakeoverState(senderId)) { saveStorage(); await setTakeoverState(senderId,true,'Customer provided phone number and full address'); await sendFacebookMessage(senderId,`আপনার ফোন নম্বর ও সম্পূর্ণ ঠিকানা পেয়েছি। বিষয়টি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}`); return; }
+        if(phone || address) { const mem=getCustomerMemory(senderId); if(phone)addUniqueMemoryItem(mem.facts,`ফোন: ${phone}`); if(address)addUniqueMemoryItem(mem.facts,`ঠিকানা: ${address}`); mem.updatedAt=new Date().toISOString(); c.lastMemoryUpdatedAt=mem.updatedAt; }
+        // User requirement: either a detected phone number or a usable address triggers human takeover.
+        // Do not ask the AI to continue handling personal contact details after they arrive.
+        if((phone || (address && completeAddress)) && !getTakeoverState(senderId)) {
+          saveStorage();
+          await setTakeoverState(senderId,true,phone ? 'Customer provided phone number' : 'Customer provided address');
+          await sendFacebookMessage(senderId,`আপনার ${phone ? 'ফোন নম্বর' : 'ঠিকানা'} পেয়েছি। Human takeover চালু করে বিষয়টি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}`);
+          return;
+        }
         if(!paused&&!customerHasOrder(senderId))scheduleFollowup(senderId,Date.now());else cancelFollowup(senderId);
         saveStorage();if(paused)return;
         if(event.call || /(?:আমি\s*কল করছি|কল করতে চাই|আপনাদের কল করছি|call me|calling you|i want to call|call your number|ফোন করছি)/i.test(text)) { await setTakeoverState(senderId,true,'Customer initiated/asked for a call'); await sendFacebookMessage(senderId,`আপনার জন্য Human takeover চালু করা হয়েছে। দ্রুত সহায়তার জন্য সরাসরি কল করুন: ${HELPLINE}`); return; }
@@ -1304,7 +1347,7 @@ app.post('/webhook',async(req,res)=>{
 // Catalog Admin APIs
 // -----------------------------------------------------------------------------
 app.get('/api/catalog',(req,res)=>{const catalog=loadLocalCatalog();res.json({success:true,catalog,products:catalog.products||[],faqs:catalog.faqs||[],meta:catalogMeta});});
-app.post('/api/catalog/sync',async(req,res)=>{try{const data=req.body;validateCatalogShape(data);const merged=replaceCatalogAtomically(data,'admin');let gh={synced:false};if(GITHUB_TOKEN)gh=await pushCatalogToGitHub(merged);res.json({success:true,message:`Catalog merged safely: ${products.length} products, ${faqs.length} FAQs. Existing products are retained unless deleteProductIds or replaceAll:true is explicitly supplied.`,totalProducts:products.length,totalFaqs:faqs.length,githubSynced:gh.synced,githubError:gh.error||null,meta:catalogMeta});}catch(e){res.status(400).json({success:false,message:e.message});}});
+app.post('/api/catalog/sync',async(req,res)=>{try{const data=req.body;validateCatalogShape(data);const merged=replaceCatalogAtomically(data,'admin');let gh={synced:false};if(GITHUB_TOKEN)gh=await pushCatalogToGitHub(merged);res.json({success:true,message:`Catalog applied to the live bot immediately: ${products.length} products, ${faqs.length} FAQs. GitHub sync: ${gh.synced?'successful':(gh.error||gh.message||'not configured')}.`,totalProducts:products.length,totalFaqs:faqs.length,githubSynced:gh.synced,githubError:gh.error||gh.message||null,meta:catalogMeta});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.post('/api/github/upload',async(req,res)=>{try{const {catalog:payload,githubRepo,githubBranch,githubToken,githubFilePath}=req.body;const result=await pushCatalogToGitHub(payload||loadLocalCatalog(),githubToken||GITHUB_TOKEN,githubRepo||GITHUB_REPO,githubBranch||GITHUB_BRANCH,githubFilePath||CATALOG_FILE);if(!result.synced)return res.status(400).json({success:false,message:result.error||result.message});res.json({success:true,message:`Catalog uploaded to ${githubRepo||GITHUB_REPO}@${githubBranch||GITHUB_BRANCH}`,totalProducts:result.totalProducts,totalFaqs:result.totalFaqs,commit:result.commit});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.post('/api/catalog/refresh',async(req,res)=>{const synced=await pullCatalogFromGitHub();res.status(synced?200:503).json({success:synced,totalProducts:products.length,totalFaqs:faqs.length,meta:catalogMeta});});
 
@@ -1358,7 +1401,7 @@ app.get('/admin/campaign-tracking', (req,res) => {
 // -----------------------------------------------------------------------------
 app.get('/health',(req,res)=>res.status(200).json({success:true,status:'ok',storage:pool?'postgresql':'memory-only'}));
 app.get('/api/health',(req,res)=>res.status(200).json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',isGlobalPaused:!!db.isGlobalPaused}));
-app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
+app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,replyDelayMs:CUSTOMER_REPLY_DELAY_MS,catalogAutoRefreshMs:CATALOG_AUTO_REFRESH_MS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
 app.get('/api/catalog/media-status',(req,res)=>res.json({success:true,products:products.map(p=>({id:p.id,name:p.name,images:getProductMediaUrls(p,'images').length,videos:getProductMediaUrls(p,'videos').length}))}));
 
 // -----------------------------------------------------------------------------
@@ -1383,5 +1426,7 @@ async function startServer() {
 startServer().catch(err=>{console.error('[SERVER] Startup error:',err.message);process.exit(1);});
 setInterval(()=>{const cutoff=Date.now()-DUPLICATE_WINDOW_MS;for(const [id,t] of processedMessageIds)if(t<cutoff)processedMessageIds.delete(id);},60000).unref();
 setInterval(()=>{for(const [id,task] of Object.entries(db.scheduledFollowups)){if(!task||task.status!=='PENDING')continue;if(getTakeoverState(id)||customerHasOrder(id)){cancelFollowup(id);continue;}if(!followupTimers.has(id))armFollowupTimer(id);}pruneOldMemory();saveStorage();},FOLLOWUP_CHECK_INTERVAL_MS).unref();
+// Keep the runtime catalog fresh after admin/GitHub edits; GitHub catalog is authoritative.
+setInterval(()=>{pullCatalogFromGitHub().catch(err=>{catalogMeta.lastSyncError=err.message;console.error('[CATALOG] Auto-refresh failed:',err.message);});},CATALOG_AUTO_REFRESH_MS).unref();
 process.on('SIGTERM',async()=>{try{await persistChain;if(pool)await pool.end();}finally{process.exit(0);}});
 process.on('SIGINT',async()=>{try{await persistChain;if(pool)await pool.end();}finally{process.exit(0);}});
