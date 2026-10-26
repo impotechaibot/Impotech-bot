@@ -1,6 +1,6 @@
 {
-  "version": 32,
-  "updatedAt": "2026-10-26T03:49:57Z",
+  "version": 33,
+  "updatedAt": "2026-10-26T19:28:11Z",
   "products": [
     {
       "category": "বাইক এক্সেসরিজ",
@@ -799,6 +799,14 @@
         "গাড়ির সাথে মানাবে"
       ],
       "question": "এই লাইটগুলো কি সব গাড়িতে লাগানো যাবে?"
+    },
+    {
+      "answer": "এই প্রজেক্টর হেডলাইটটির মডেল হলো T9 H4 LED Mini Projector Headlight with Red/Blue Devil Eye (60W) (এটি টি নাইন টি নাইন প্রজেকশন হেডলাইট সিরিজ)।",
+      "category": "GENERAL",
+      "id": "faq_878730",
+      "keywords": [],
+      "productId": "prod_24378540",
+      "question": "হেডলাইটটির মডেল নাম বা নম্বর কী?"
     }
   ],
   "delivery": {
