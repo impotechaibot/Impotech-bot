@@ -1,6 +1,6 @@
 {
-  "version": 36,
-  "updatedAt": "2026-10-27T10:20:52Z",
+  "version": 37,
+  "updatedAt": "2026-10-27T11:31:35Z",
   "products": [
     {
       "category": "বাইক এক্সেসরিজ",
@@ -843,6 +843,7 @@
         "60W",
         "ডেভিল আই"
       ],
+      "productId": "prod_24378540",
       "question": "এই প্রজেক্টর হেডলাইটটির মূল বৈশিষ্ট্য ও বিস্তারিত তথ্য কি জানতে পারি?"
     },
     {
@@ -850,6 +851,7 @@
       "category": "GENERAL",
       "id": "faq_062968",
       "keywords": [],
+      "productId": "prod_24378540",
       "question": "H4 প্রজেক্টর হেডলাইটটির বিস্তারিত বিবরণ ও স্পেসিফিকেশন কি দেওয়া যাবে?"
     },
     {
@@ -857,6 +859,7 @@
       "category": "GENERAL",
       "id": "faq_317730",
       "keywords": [],
+      "productId": "prod_24378540",
       "question": "আমি কি হেডলাইটের সাদা ও হলুদ (White + Yellow) কালার কম্বিনেশনটা নিতে পারব?"
     },
     {
@@ -864,6 +867,7 @@
       "category": "GENERAL",
       "id": "faq_461385",
       "keywords": [],
+      "productId": "prod_24378540",
       "question": "আমি কি হেডলাইটের সাদা ও সাদা (White + White) কালার কম্বিনেশনটা নিতে পারব?"
     },
     {
@@ -906,6 +910,7 @@
       "category": "GENERAL",
       "id": "faq_701740",
       "keywords": [],
+      "productId": "prod_24378540",
       "question": "T9 H4 LED Mini Projector Headlight\n হেডলাইটের আলো কি যখন ইচ্ছা হলুদ আবার যখন ইচ্ছা সাদা করে চালাতে পারব?"
     },
     {
