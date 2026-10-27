@@ -1,6 +1,6 @@
 {
-  "version": 34,
-  "updatedAt": "2026-10-27T09:01:38Z",
+  "version": 35,
+  "updatedAt": "2026-10-27T09:54:31Z",
   "products": [
     {
       "category": "বাইক এক্সেসরিজ",
@@ -913,7 +913,7 @@
       "category": "GENERAL",
       "id": "faq_655215",
       "keywords": [],
-      "question": "স্যার, আমাদের লোকেশন হচ্ছে কাজীপুরের ভবানীপুর"
+      "question": "আপনাদের শপ বা দোকান কোথায় অবস্থিত? (Shop kothay ace / Shop aceApnder)"
     }
   ],
   "delivery": {
