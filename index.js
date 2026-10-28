@@ -1,3 +1,9 @@
+/*
+ * ImpoTech Messenger Bot — manual-order-loop fix + contextual emoji support.
+ * Base: ImpoTech_MainCode_v10_image_context_fix.txt
+ * Existing integrations and unrelated features are retained. Order intake is now manual-review only:
+ * no repeated phone/address prompts and no automatic order creation/confirmation.
+ */
 'use strict';
 
 /**
@@ -1147,46 +1153,23 @@ function createMessengerOrder(senderId, draft, messageId) {
   db.customers[id].lastOrderId=order.id;db.customers[id].lastOrderAt=order.createdAt;db.customers[id].phone=order.customerPhone;db.customers[id].address=order.customerAddress;cancelFollowup(id);saveStorage();return {order,created:true};
 }
 async function handleOrderFlow(senderId, text, messageId) {
-  const id = String(senderId), customer = ensureCustomer(id), old = db.orderDrafts[id] || {};
-  const draft = { ...old, customerMessage: [old.customerMessage, text].filter(Boolean).join('\n').slice(-1000) };
-  // Keep the product already chosen unless the customer explicitly names a different product/category.
-  const found = identifyOrderedProduct(id, text);
-  if (found && (!draft.product || findExactProduct(text) || getExplicitProductCategoryIntent(text))) draft.product = found;
-  const phone = extractPhone(text); if (phone) { draft.phone = phone; customer.phone = phone; }
-  let address = extractAddress(text);
-  if (!address && draft.lastAskedField === 'address' && !phone) {
-    // The bot just asked for the address: accept a plain reply (e.g. "মিরপুর, ঢাকা") that is not a question.
-    const plain = stripPhones(text);
-    if (plain.length >= 8 && !looksLikeQuestion(plain)) address = cleanAddress(plain);
-  }
-  if (address) { draft.address = address; customer.address = address; }
-  const quantity = extractQuantity(stripPhones(text)); if (quantity) draft.quantity = quantity;
-  if (!draft.product) {
-    db.orderDrafts[id] = draft;
-    const choices = resolveConversationTopic(text, id).categoryProducts;
-    const list = choices.length ? '\n' + choices.map((p, i) => `${i + 1}. ${p.name}`).join('\n') : '';
-    if (draft.lastAskedField !== 'product') { draft.lastAskedField = 'product'; saveStorage(); await sendFacebookMessage(id, `আপনি কোন পণ্যটি অর্ডার করতে চান? পণ্যের সঠিক নাম বা মডেলটি লিখুন।${list}`); }
-    else { saveStorage(); await sendFacebookMessage(id, 'পণ্যের নাম/মডেল জানালে অর্ডারটি এগিয়ে নিতে পারব। চাইলে অর্ডার না করেও পণ্য সম্পর্কে প্রশ্ন করতে পারেন।'); }
-    return true;
-  }
-  if (!draft.phone) {
-    db.orderDrafts[id] = draft;
-    if (draft.lastAskedField !== 'phone') { draft.lastAskedField = 'phone'; saveStorage(); await sendFacebookMessage(id, `${draft.product.name} অর্ডারের জন্য আপনার সচল মোবাইল নম্বরটি দিন।`); }
-    else { saveStorage(); await sendFacebookMessage(id, 'অর্ডার চালিয়ে যেতে চাইলে আপনার সচল মোবাইল নম্বরটি পাঠাতে পারেন।'); }
-    return true;
-  }
-  if (!draft.address) {
-    db.orderDrafts[id] = draft;
-    if (draft.lastAskedField !== 'address') { draft.lastAskedField = 'address'; saveStorage(); await sendFacebookMessage(id, 'ডেলিভারির সম্পূর্ণ ঠিকানা লিখুন—এলাকা/গ্রাম, থানা/উপজেলা ও জেলা সহ।'); }
-    else { saveStorage(); await sendFacebookMessage(id, 'অর্ডার চালিয়ে যেতে চাইলে ডেলিভারির সম্পূর্ণ ঠিকানা পাঠাতে পারেন।'); }
-    return true;
-  }
-  draft.messageId = messageId || draft.messageId || null;
-  const created = createMessengerOrder(id, draft, draft.messageId);
-  delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
-  await setTakeoverState(id, true, `Order automatically handed to human ${created.order.id}`);
-  const billLines = created.order.total !== null ? `\nবিল: ${created.order.productName} × ${created.order.quantity} = ${created.order.subtotal} টাকা; ডেলিভারি ${created.order.deliveryFee} টাকা; সর্বমোট ${created.order.total} টাকা।` : '\nচূড়ান্ত বিল প্রতিনিধি পণ্যের মূল্য ও ডেলিভারি চার্জ যাচাই করে জানাবেন।';
-  await sendFacebookMessage(id, `আপনার ${draft.product.name} অর্ডারের তথ্য প্রতিনিধি টিমের কাছে পাঠানো হয়েছে।${billLines}\nপণ্য, ফোন ও ঠিকানা প্রতিনিধি যাচাই করে আপনার সঙ্গে যোগাযোগ করবেন। ${HELPLINE}`);
+  // MANUAL ORDER REVIEW MODE:
+  // Never collect phone/address, never create an order automatically, and never hand over automatically.
+  // Clear legacy drafts from older deployments so stale drafts cannot re-trigger the old prompt loop.
+  const id = String(senderId || '');
+  if (!id) return false;
+  delete db.orderDrafts[id];
+  delete db.pendingHandover[id];
+  cancelFollowup(id);
+  saveStorage();
+
+  const customerText = String(text || '').trim();
+  const product = identifyOrderedProduct(id, customerText) || findActiveProduct(id);
+  const productName = product?.name ? `\u201c${product.name}\u201d` : 'আপনার পছন্দের পণ্যটি';
+  await sendFacebookMessage(
+    id,
+    `ধন্যবাদ! 😊 ${productName} অর্ডার করার আগ্রহটি জানানো হয়েছে। অর্ডারটি আমি স্বয়ংক্রিয়ভাবে জমা দিচ্ছি না—আমরা ম্যানুয়ালি পণ্য, দাম ও স্টক যাচাই করব। আপাতত এখানে ফোন নম্বর বা ঠিকানা দেওয়ার প্রয়োজন নেই। 🏍️`
+  );
   return true;
 }
 
@@ -1337,14 +1320,14 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
 
 কঠোর কনভার্সেশনাল নিয়ম:
 ১) প্রশ্ন বনাম অর্ডার: গ্রাহক স্পষ্টভাবে অর্ডার করার ইচ্ছা না জানানো পর্যন্ত কখনো ফোন নম্বর, ডেলিভারি ঠিকানা বা ব্যক্তিগত তথ্য চাইবে না। পণ্যের বিবরণ, দাম, স্টক, ছবি/ভিডিও, বাইকের মডেল, ফিটমেন্ট বা ডেলিভারি চার্জের প্রশ্নের সরাসরি উত্তর দেবে। শুধু “দাম কত”, “ফিট হবে?”, “ছবি দিন” বা “ডেলিভারি চার্জ কত” বললে অর্ডার শুরু করবে না।
-২) অর্ডার শুরু: কেবল “অর্ডার করতে চাই”, “পাঠিয়ে দিন”, “কিনব/নেব” বা সমার্থক স্পষ্ট সম্মতির পর ব্যাকএন্ডের অর্ডার প্রক্রিয়া চলবে। অর্ডার চলাকালে আগের কথোপকথন ও draft-এ থাকা পণ্য, ফোন এবং ঠিকানা ব্যবহার করবে; ইতিমধ্যে পাওয়া তথ্য আবার চাইবে না।
+২) অর্ডার (ম্যানুয়াল যাচাই): গ্রাহক “অর্ডার করতে চাই”, “পাঠিয়ে দিন”, “কিনব/নেব” বা সমার্থক স্পষ্ট ইচ্ছা জানালে সংক্ষিপ্তভাবে ধন্যবাদ জানাবে এবং বলবে যে ImpoTech টিম পণ্য, দাম ও স্টক ম্যানুয়ালি যাচাই করবে। ফোন নম্বর/ঠিকানা চাইবে না, অর্ডার draft তৈরি করবে না, অর্ডার নিজে থেকে জমা/কনফার্ম করবে না, এবং একই অর্ডার-বার্তা বারবার পাঠাবে না। পুরোনো সংরক্ষিত orderDraft থাকলে সেটি মুছে দিয়ে এই নতুন নিয়মে ফিরবে। গ্রাহক নিজে তথ্য দিলে স্বাভাবিক কথোপকথনে উত্তর দেবে; সেই কারণে অর্ডার-লুপ শুরু করবে না।
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
 ৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। নিচে দেওয়া “প্রাসঙ্গিক পণ্য” ও “FAQ” অংশই সর্বশেষ ও সঠিক তথ্য। কথোপকথনের ইতিহাসে বা মেমোরিতে আগে বলা দাম, স্টক, অফার, ওয়ারেন্টি বা বিবরণ নিচের ক্যাটালগের সাথে না মিললে ক্যাটালগের তথ্যই সঠিক; পুরোনো তথ্য কখনো পুনরাবৃত্তি করবে না। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। গ্রাহক আলো/কোয়ালিটি/দেখতে কেমন জানতে চাইলে ক্যাটালগে ভিডিও বা ছবির লিংক থাকলে আগে সেটি দেবে। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
 ৬) মেমোরি ও প্রসঙ্গ (সবচেয়ে গুরুত্বপূর্ণ): সাধারণ text follow-up-এ নিচের “বর্তমান আলোচ্য বিষয়” ধরে উত্তর দেবে। গ্রাহক নতুন পণ্যের নাম লিখলে সেই পণ্য ধরবে। গ্রাহক নতুন ছবি পাঠালে ছবিটি বর্তমান পণ্যের পরিচয় যাচাই/পরিবর্তনের প্রধান উৎস; পুরোনো active product বা আগের বটের অনুমান দিয়ে নতুন ছবিকে শ্রেণিবদ্ধ করবে না। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে প্রয়োজনমতো ইতিহাস ও মেমোরি ব্যবহার করবে, কিন্তু নতুন সংযুক্ত ছবি পুরোনো প্রসঙ্গের চেয়ে অগ্রাধিকার পাবে। একই তথ্য অকারণে আবার চাইবে না।
 ৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
 ৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
-
+৯) ইমোজি: উত্তরের সঙ্গে প্রসঙ্গ অনুযায়ী স্বাভাবিকভাবে ১–৩টি উপযুক্ত ইমোজি ব্যবহার করতে পারবে—যেমন পণ্যের জন্য 🏍️💡, ছবি/ভিডিওর জন্য 📸🎥, দাম/অফারের জন্য 💰, ডেলিভারির জন্য 🚚, ধন্যবাদের জন্য 😊। একই ইমোজি বারবার দেবে না, অপ্রয়োজনীয় ইমোজি দিয়ে উত্তর ভরাবে না, এবং গ্রাহক আনুষ্ঠানিক উত্তর চাইলে ইমোজি কমাবে।
 বর্তমান আলোচ্য বিষয়:
 ${topicContext}
 
@@ -1776,26 +1759,11 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         return;
       }
     }
-    // Order draft in progress. A yes is consent to save/transfer only after all details are gathered.
-    if(db.orderDrafts[id]) {
-      const draft=db.orderDrafts[id];
-      if(db.pendingHandover[id]?.orderDraft) {
-        if(isYes(customerText)) {
-          const created=createMessengerOrder(id,draft,draft.messageId||messageId);
-          delete db.orderDrafts[id];delete db.pendingHandover[id];saveStorage();
-          await setTakeoverState(id,true,`Customer consented to order handover ${created.order.id}`);
-          await sendFacebookMessage(id,ORDER_CONFIRMATION);return;
-        }
-        if(isNo(customerText)){delete db.orderDrafts[id];delete db.pendingHandover[id];saveStorage();await sendFacebookMessage(id,'ঠিক আছে, অর্ডারটি জমা দেওয়া হয়নি এবং আপনার তথ্য প্রতিনিধির কাছে পাঠানো হবে না। চাইলে পরে আবার অর্ডার করতে পারবেন।');return;}
-        const phone=extractPhone(customerText);if(phone)draft.phone=phone;
-        const address=extractAddress(customerText);if(address)draft.address=address;
-        const p=identifyOrderedProduct(id,customerText);if(p)draft.product=p;
-        db.orderDrafts[id]=draft;saveStorage();
-        await sendFacebookMessage(id,'অর্ডার জমা ও প্রতিনিধির কাছে হস্তান্তরের জন্য “হ্যাঁ”, বাতিল করতে “না” লিখুন।');return;
-      }
-      await handleOrderFlow(id,customerText,messageId);return;
+    // Manual-only order mode: clear any legacy draft and give one non-repeating acknowledgement.
+    if (db.orderDrafts[id] || orderIntent) {
+      await handleOrderFlow(id, customerText, messageId);
+      return;
     }
-    if(orderIntent){await handleOrderFlow(id,customerText,messageId);return;}
     const lastBotText = [...getHistory(id)].reverse().find(h => h.role === 'assistant')?.text || '';
     if (isYes(customerText) && /(ভিডিও|ছবি|ফটো|video|photo)/i.test(lastBotText)) {
       const wantsVideo = /ভিডিও|video/i.test(lastBotText);
