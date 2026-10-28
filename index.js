@@ -289,7 +289,7 @@ function findRelevantFaqs(query) {
 function getFaqIntent(text = '') {
   const t = normalizeText(text);
   if (/ওয়ারেন্টি|গ্যারান্টি|warranty|guarantee|replacement|রিপ্লেস/i.test(t)) return 'warranty';
-  if (/দাম|মূল্য|প্রাইস|price|\bcost\b|how much|কত\s*টাকা|কত\s*দাম|dam\s*koto|price\s*koto|rate\s*koto|\brate\b/i.test(t)) return 'price';
+  if (/(?:^|\s)দাম(?:টা|টি|ের)?(?=$|\s|[?।!])|মূল্য|প্রাইস|price|\bcost\b|how much|কত\s*টাকা|কত\s*দাম|dam\s*koto|price\s*koto|rate\s*koto|\brate\b/i.test(t)) return 'price';
   if (/ডেলিভারি\s*চার্জ|কুরিয়ার\s*চার্জ|delivery\s*charge|courier\s*fee|shipping\s*cost/i.test(t)) return 'delivery';
   if (/ইনস্টল|installation|install|মেকানিক|mechanic/i.test(t)) return 'installation';
   if (/স্টক\s*আছে|পাওয়া\s*যাবে|available|availability|in\s*stock|stock\s*status/i.test(t)) return 'stock';
@@ -546,11 +546,11 @@ function updateCustomerMemory(senderId, customerText) {
   if (address) { customer.address = address.slice(0, 220); addUniqueMemoryItem(memory.facts, `ঠিকানা: ${customer.address}`); }
   const preference = text.match(/(?:আমার পছন্দ|আমার বাজেট|বাজেট|ডেলিভারি|রং|কালার)[^।.!?\n]{0,120}/i);
   if (preference) addUniqueMemoryItem(memory.preferences, preference[0], 20);
-  if (text.length >= 8 && !/^(হ্যাঁ|না|ok|okay|ধন্যবাদ|thanks)$/i.test(normalizeText(text))) memory.summary = [...(memory.summary ? [memory.summary] : []), `গ্রাহক বলেছেন: ${text.slice(0, 180)}`].slice(-8).join('\n');
+  if (text.length >= 2 && text.length <= 300) { memory.recentQuestions = Array.isArray(memory.recentQuestions) ? memory.recentQuestions : []; memory.recentQuestions.push(text.slice(0, 200)); if (memory.recentQuestions.length > 10) memory.recentQuestions.splice(0, memory.recentQuestions.length - 10); }
   memory.updatedAt = new Date().toISOString(); customer.lastMemoryUpdatedAt = memory.updatedAt;
   saveStorage();
 }
-function buildCustomerMemoryContext(senderId) {
+function buildCustomerMemoryContextLegacy(senderId) {
   const m = getCustomerMemory(senderId);
   if (!m) return 'কোনো সংরক্ষিত মেমোরি নেই।';
   return [m.facts.length ? `তথ্য:\n- ${m.facts.slice(-15).join('\n- ')}` : '', m.preferences.length ? `পছন্দ/প্রসঙ্গ:\n- ${m.preferences.slice(-10).join('\n- ')}` : '', m.summary ? `সারাংশ:\n${m.summary}` : ''].filter(Boolean).join('\n\n') || 'কোনো সংরক্ষিত মেমোরি নেই।';
@@ -725,7 +725,7 @@ function findProductFromRecentContext(senderId) {
   for (const fact of [...(memory?.facts || [])].reverse()) { const p = findExactProduct(fact); if (p) return p; }
   return null;
 }
-function isPriceQuestion(text='') { return /\b(price|cost|how much|rate)\b|দাম|প্রাইস|মূল্য|কত\s*টাকা|কত\s*দাম|দাম\s*কত|দামটা|কততে|dam\s*koto/i.test(normalizeText(text)); }
+function isPriceQuestion(text='') { return /\b(price|cost|how much|rate)\b|(?:^|\s)দাম(?:টা|টি|ের)?(?=$|\s|[?।!])|প্রাইস|মূল্য|কত\s*টাকা|কত\s*দাম|দাম\s*কত|দামটা|কততে|dam\s*koto/i.test(normalizeText(text)); }
 function isGenericPriceQuestion(text='') { return isPriceQuestion(text) && /^(দাম|দাম কত|দামটা কত|প্রাইস|প্রাইস কত|মূল্য|মূল্য কত|কত টাকা|কত দাম|price|how much|how much is it|what is the price)$/.test(normalizeText(text)); }
 function getPriceReply(p) { return p && p.price !== undefined && p.price !== null && String(p.price).trim() !== '' ? `${p.name}-এর দাম ${p.price} টাকা।` : null; }
 // Smart Billing: quote only from catalog prices and the published delivery rates.
@@ -887,7 +887,7 @@ NISSAN~AD Van / NV150 AD~Nissan AD Van;AD Van;Nissan NV150 AD;NV150 AD~2006-2021
   return { id: index + 1, brand, model, aliases: String(aliases || '').split(';').filter(Boolean), years, cc, socket, fitment };
 });
 function compactVehicleText(value = '') {
-  return normalizeText(value).replace(/[^\p{L}\p{M}\p{N}]/gu, '');
+  return normalizeText(bnToEnDigits(value)).replace(/[^\p{L}\p{M}\p{N}]/gu, '');
 }
 function findVehicleCompatibility(text = '') {
   const query = compactVehicleText(text);
@@ -1508,13 +1508,13 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       // 1) Explicit photo / video request: always for the CURRENT product/category.
       if (getMediaTypes(customerText).length) {
         const reply = getProductMediaReply(customerText, id);
-        if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); return; }
+        if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); markServed(id, resolveConversationTopic(customerText, id).product, getMediaTypes(customerText)); return; }
       }
       // 2) "লাইটের আলো কেমন হবে" / "ব্রাইট" / "দেখতে কেমন": show the video (else photo) of the current product.
-      if (isLightQualityQuestion(customerText)) {
+      if (isLightQualityQuestion(customerText) && !alreadyServedMedia(id)) {
         const imageFirst = /দেখতে\s*কেমন|কেমন\s*দেখ/.test(normalizeText(customerText));
         const reply = getProductMediaReply(customerText, id, { implicitTypes: imageFirst ? ['images', 'videos'] : ['videos', 'images'] });
-        if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); return; }
+        if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); markServed(id, resolveConversationTopic(customerText, id).product, ['videos','images']); return; }
       }
       // 3) FAQ: sent verbatim only if it clearly matches and does not belong to another product/category.
       const matchedFaq = orderIntent ? null : findBestFaqMatch(customerText, id);
@@ -1598,8 +1598,18 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       await handleOrderFlow(id,customerText,messageId);return;
     }
     if(orderIntent){await handleOrderFlow(id,customerText,messageId);return;}
+    const lastBotText = [...getHistory(id)].reverse().find(h => h.role === 'assistant')?.text || '';
+    if (isYes(customerText) && /(ভিডিও|ছবি|ফটো|video|photo)/i.test(lastBotText)) {
+      const wantsVideo = /ভিডিও|video/i.test(lastBotText);
+      if (await sendCurrentMedia(id, wantsVideo ? 'videos' : 'images')) return;
+    }
     let reply=await generateAIResponse(customerText,attachments,id);
     if(!reply)throw new Error('AI returned empty response');
+    if (reply.split('\n').some(isMediaOfferLine)) {
+      if (customerAskedMediaBefore(id) && !alreadyServedMedia(id) && await sendCurrentMedia(id)) return;
+      reply = reply.split('\n').filter(l => !isMediaOfferLine(l)).join('\n').trim()
+        || 'এই পণ্যের ভিডিও বা ছবির লিংক বর্তমানে ক্যাটালগে নেই। অন্য কিছু জানতে চাইলে বলুন।';
+    }
     if(reply.includes(HANDOVER_MARKER)) { const clean=reply.replaceAll(HANDOVER_MARKER,'').trim(); await askHandoverConsent(id,'AI requested human assistance',clean);return; }
     if(/আমার প্রশ্নটা বুঝতে সমস্যা|বুঝতে সমস্যা হচ্ছে|প্রশ্নটি বুঝতে পারিনি|দুঃখিত.*বুঝতে পারছি না/i.test(reply)) {
       await sendFacebookMessage(id,'আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো? “হ্যাঁ” বা “না” লিখুন।');
@@ -2010,7 +2020,8 @@ async function analyzeCustomerMessage(text, senderId) {
   } catch (e) { console.warn('[ANALYZE] skipped:', e.message); return null; }
 }
 const SALES_AND_QUALITY_RULES = `
-৯) বিক্রয়ের আচরণ: প্রশ্নের উত্তর দেওয়ার পর গ্রাহক আগ্রহী মনে হলে একটি ছোট পরামর্শ দিন (যেমন ভিডিও দেখা, বা অর্ডার করতে চাইলে জানানো)। ক্যাটালগে নেই এমন পণ্য সাজেস্ট করবেন না। জোর করবেন না।
+৯) বিক্রয়ের আচরণ: প্রশ্নের উত্তর দেওয়ার পর গ্রাহক আগ্রহী মনে হলে একটি ছোট পরবর্তী ধাপ বলুন (যেমন অর্ডার করতে চাইলে জানানো)। ক্যাটালগে নেই এমন পণ্য সাজেস্ট করবেন না। জোর করবেন না। ভিডিও বা ছবি দেখতে চান কি না—এমন প্রশ্ন কখনো করবেন না; গ্রাহক চাইলে লিংক সিস্টেম নিজেই পাঠায়। গ্রাহক যা ইতিমধ্যে চেয়েছেন বা যা পাঠানো হয়েছে, তা আবার জিজ্ঞেস করবেন না।
+১৪) বর্তমান পণ্য: মেমোরিতে 'বর্তমান আলোচনার পণ্য' যেটি আছে, শুধু সেই পণ্যের তথ্য দেবেন। গ্রাহক 'দামি', 'ভালো', 'আলো বেশি' ইত্যাদি মান-প্রশ্ন করলে তা দামের প্রশ্ন নয়; বর্তমান পণ্যের আলোর ক্ষমতা (লুমেন/ওয়াটেজ) ও বৈশিষ্ট্য দিয়ে উত্তর দিন।
 ১০) আপত্তি মোকাবিলা: দাম বেশি মনে হলে দামের সাথে সুবিধা ও ওয়ারেন্টি উল্লেখ করুন; ক্যাটালগের বাইরে কোনো ছাড় বা অফার বানাবেন না। বিশ্বাস নিয়ে সন্দেহ থাকলে ক্যাটালগের তথ্য ও ওয়ারেন্টির শর্ত বলুন।
 ১১) মেজাজ: গ্রাহক বিরক্ত বা রাগী হলে ছোট, শান্ত ও ক্ষমাপ্রার্থী ভাষায় উত্তর দিন। তাড়াহুড়ো থাকলে সংক্ষিপ্ত উত্তর দিন। ধন্যবাদ বললে সুন্দরভাবে উত্তর দিয়ে প্রয়োজনে অর্ডারের আমন্ত্রণ জানান।
 ১২) নিশ্চয়তা: ক্যাটালগ বা FAQ-এ না থাকা তথ্য অনুমান করবেন না। বলুন যে তথ্যটি নিশ্চিতভাবে জানা নেই, প্রতিনিধি নিশ্চিত করবেন, এবং প্রয়োজনে হস্তান্তরের প্রস্তাব দিন।
@@ -2187,6 +2198,67 @@ app.post('/api/eval/run', async (req, res) => {
   res.json({ success: true, total: results.length, passed, failed: results.length - passed, results });
 });
 
+
+// ============================================================================
+// v8: conversation fixes (media already sent / no repeated offers / structured memory)
+// ============================================================================
+function markServed(senderId, product, types) {
+  if (!product || !types || !types.length) return;
+  const c = ensureCustomer(senderId);
+  c.servedMedia = c.servedMedia && typeof c.servedMedia === 'object' ? c.servedMedia : {};
+  const entry = c.servedMedia[String(product.id)] || {};
+  for (const t of types) if (getProductMediaUrls(product, t).length) entry[t === 'videos' ? 'videos' : 'images'] = true;
+  c.servedMedia[String(product.id)] = entry;
+  saveStorage();
+}
+function buildCustomerMemoryContext(senderId) {
+  const id = String(senderId || '');
+  const c = db.customers[id] || {};
+  const m = getCustomerMemory(id);
+  const lines = [];
+  const topic = getCurrentTopic(id);
+  if (topic.product) lines.push(`বর্তমান আলোচনার পণ্য: ${topic.product.name} (ID ${topic.product.id})`);
+  else if (topic.category) lines.push(`বর্তমান আলোচনার ক্যাটাগরি: ${getCategoryLabel(topic.category)} (নির্দিষ্ট মডেল এখনো ঠিক হয়নি)`);
+  for (const [pid, s] of Object.entries(c.servedMedia || {})) {
+    const p = products.find(x => String(x.id) === pid);
+    if (!p) continue;
+    const done = [];
+    if (s.videos) done.push('ভিডিও লিংক দেওয়া হয়েছে');
+    if (s.images) done.push('ছবি দেওয়া হয়েছে');
+    if (done.length) lines.push(`${p.name}: ${done.join(', ')}। এগুলো আবার জিজ্ঞেস করবেন না।`);
+  }
+  const facts = (m?.facts || []).filter(f => !ACTIVE_PRODUCT_FACT_RE.test(String(f))).slice(-8);
+  if (facts.length) lines.push('তথ্য:\n- ' + facts.join('\n- '));
+  if (c.vehicleModelName) lines.push(`গ্রাহকের যানবাহন: ${c.vehicleModelName}`);
+  const recent = (m?.recentQuestions || []).slice(-5);
+  if (recent.length) lines.push('গ্রাহকের সাম্প্রতিক বার্তা (প্রসঙ্গের জন্য):\n- ' + recent.join('\n- '));
+  return lines.join('\n') || 'কোনো সংরক্ষিত মেমোরি নেই।';
+}
+function isMediaOfferLine(line) {
+  return /(ভিডিও|ছবি|ফটো|video|photo)/i.test(line) && /(দেখতে\s*চান|চান\s*\?|চান\?|দেখাব|পাঠাব)/i.test(line);
+}
+function customerAskedMediaBefore(senderId) {
+  return getHistory(senderId).filter(h => h.role === 'user').slice(-10)
+    .some(h => getMediaTypes(h.text).length || isLightQualityQuestion(h.text));
+}
+async function sendCurrentMedia(senderId, preferredType) {
+  const product = resolveConversationTopic('', senderId).product;
+  if (!product) return false;
+  const types = preferredType ? [preferredType] : ['videos', 'images'];
+  const available = types.filter(t => getProductMediaUrls(product, t).length);
+  if (!available.length) return false;
+  const reply = getProductMediaReply(available[0] === 'videos' ? 'ভিডিও' : 'ছবি', senderId);
+  if (!reply) return false;
+  await sendFacebookMessage(senderId, limitToFiveLines(reply, 8));
+  markServed(senderId, product, available);
+  return true;
+}
+function alreadyServedMedia(senderId) {
+  const product = resolveConversationTopic('', senderId).product;
+  if (!product) return false;
+  const s = (db.customers[String(senderId)]?.servedMedia || {})[String(product.id)];
+  return Boolean(s && (s.videos || s.images));
+}
 
 // -----------------------------------------------------------------------------
 // Start and periodic tasks
