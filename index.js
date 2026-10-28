@@ -2,7 +2,7 @@
 
 /**
  * ImpoTech AI Messenger Bot & Admin Backend  (v2 - audited & fixed)
- * AI: OpenRouter Gemini 2.5 Flash-Lite (text, voice and vision)
+ * AI: OpenRouter xiaomi/mimo-v2.6-flash (single-call text, voice transcription and vision)
  * Storage: PostgreSQL (DATABASE_URL / POSTGRES_URL)
  * Catalog: admin app / GitHub catalog.json + local cache, AUTO-REFRESHED (no stale data)
  * Memory: last 20 messages + customer facts/preferences (20-day retention) + active product/category topic
@@ -46,8 +46,9 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v18.0';
 const REQUIRE_ADMIN_SECRET = process.env.REQUIRE_ADMIN_SECRET !== 'false';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const TEXT_MODEL = 'google/gemini-2.5-flash-lite';
-const VOICE_MODEL = process.env.VOICE_MODEL || TEXT_MODEL; // optional upgrade: google/gemini-2.5-flash
+const TEXT_MODEL = 'xiaomi/mimo-v2.6-flash';
+// All OpenRouter tasks use the same requested model; VOICE_MODEL env overrides are intentionally ignored.
+const VOICE_MODEL = TEXT_MODEL;
 const HELPLINE = process.env.HELPLINE || '+8809611042598';
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '01884332067';
 const MAX_PRODUCTS_TO_AI = 2;
@@ -644,6 +645,23 @@ function mergeCatalogData(current, incoming) {
   delete result.deleteProductIds; delete result.replaceAll; delete result.fullSync;
   return result;
 }
+function getCatalogQualityWarnings(catalogProducts = products, catalogFaqs = faqs) {
+  const warnings=[];
+  const ids=new Set();
+  for(const p of catalogProducts){
+    const id=String(p?.id??'').trim(), name=String(p?.name??'').trim();
+    if(!name)warnings.push({type:'missing_name',productId:id||null,message:'Product is missing name'});
+    if(!id)warnings.push({type:'missing_id',productName:name||null,message:'Product is missing ID'});
+    if(id&&ids.has(id))warnings.push({type:'duplicate_id',productId:id,message:'Duplicate product ID'});
+    if(id)ids.add(id);
+    if(p?.price===undefined||p?.price===null||String(p.price).trim()==='')warnings.push({type:'missing_price',productId:id||null,productName:name||null,message:'Product price is missing'});
+    const aliases=Array.isArray(p?.aliases)?p.aliases:[];
+    if(name&&aliases.some(a=>normalizeText(a)===normalizeText(name)))warnings.push({type:'redundant_alias',productId:id||null,message:'Alias duplicates product name'});
+    if(!p?.description&&!p?.shortDescription)warnings.push({type:'missing_description',productId:id||null,productName:name||null,message:'Product description is missing'});
+  }
+  for(const f of catalogFaqs){if(!String(f?.answer||'').trim())warnings.push({type:'missing_faq_answer',faq:String(f?.question||f?.q||f?.id||'').slice(0,100),message:'FAQ answer is missing'});}
+  return warnings.slice(0,500);
+}
 function applyCatalog(data, source = 'local') {
   validateCatalogShape(data);
   products = data.products.map(p => ({ ...p }));
@@ -651,6 +669,8 @@ function applyCatalog(data, source = 'local') {
   catalogExtras = { ...data };
   delete catalogExtras.products; delete catalogExtras.faqs; delete catalogExtras.version; delete catalogExtras.updatedAt;
   catalogMeta = { ...catalogMeta, version: data.version ?? null, updatedAt: data.updatedAt ?? null, source, lastSyncAt: new Date().toISOString(), lastSyncError: null };
+  const qualityWarnings=getCatalogQualityWarnings(products,faqs);
+  if(qualityWarnings.length) console.warn('[CATALOG QUALITY] Review recommended:', JSON.stringify({count:qualityWarnings.length,sample:qualityWarnings.slice(0,12)}));
 }
 function loadLocalCatalog() {
   try {
@@ -1070,8 +1090,11 @@ async function sendFacebookMessage(recipientId, text) {
     // Long texts are split into several messages instead of being silently dropped.
     for (const part of splitForMessenger(finalText, MAX_MESSENGER_TEXT_LENGTH - 100)) {
       const response=await axios.post(url,{recipient:{id:recipientId},message:{text:part},messaging_type:'RESPONSE'},{timeout:15000});
-      appendHistory(recipientId,'assistant',part);
-      addStoredMessage({id:'msg_bot_'+crypto.randomUUID(),senderId:recipientId,sender:'bot',text:part,timestamp:new Date().toISOString(),messageId:response.data?.message_id||null});
+      const isConfusion = /প্রশ্নটা বুঝতে সমস্যা|বুঝতে সমস্যা হচ্ছে|প্রশ্নটি বুঝতে পারিনি|কোন পণ্যের কথা হচ্ছে তা শনাক্ত করতে পারিনি|পণ্যের নাম\/মডেল বা ছবি পাঠান/i.test(String(part));
+      if (!isConfusion) {
+        appendHistory(recipientId,'assistant',part);
+        addStoredMessage({id:'msg_bot_'+crypto.randomUUID(),senderId:recipientId,sender:'bot',text:part,timestamp:new Date().toISOString(),messageId:response.data?.message_id||null});
+      }
     }
     saveStorage(); return true;
   } catch(err){console.error('[Messenger] Send error:',err.response?.data?.error?.message||err.message);return false;}
@@ -1421,10 +1444,10 @@ async function transcribeAudioOpenRouter(url) {
 }
 
 async function generateAIResponse(customerText,attachments=[],senderId) {
-  const query=customerText||'ছবিটি বা পাঠানো ফাইলটি দেখে সাহায্য করুন';let history=getHistory(senderId).slice();
+  const query=customerText||'গ্রাহক একটি ছবি/ফাইল পাঠিয়েছেন। ছবি দেখে পণ্য শনাক্ত করে সাহায্য করুন।';
+  let history=getHistory(senderId).slice();
   if(history.length&&history[history.length-1].role==='user'&&history[history.length-1].text===query)history.pop();
   const context=getRecentConversationText(senderId,query), memory=buildCustomerMemoryContext(senderId);
-  // Topic first (explicit product/category switch or the current active topic), fuzzy search only as a fallback.
   const topic = resolveConversationTopic(query, senderId);
   let relevantProducts = topic.product ? [topic.product]
     : topic.categoryProducts.length ? topic.categoryProducts.slice(0, MAX_PRODUCTS_TO_AI)
@@ -1435,38 +1458,70 @@ async function generateAIResponse(customerText,attachments=[],senderId) {
   const topicContext = topic.product
     ? `বর্তমান আলোচ্য পণ্য: ${topic.product.name} (ID: ${topic.product.id})${topic.category ? `; ক্যাটাগরি: ${getCategoryLabel(topic.category)}` : ''}`
     : topic.category ? `বর্তমান আলোচ্য ক্যাটাগরি: ${getCategoryLabel(topic.category)} (নির্দিষ্ট মডেল এখনো ঠিক হয়নি)` : 'নির্দিষ্ট কোনো পণ্য বা ক্যাটাগরি এখনো শনাক্ত হয়নি।';
-  const analysis = await analyzeCustomerMessage(query, senderId);
-  if (analysis && analysis.productId && analysis.confidence >= 0.7 && !topic.explicit) {
-    const analysedProduct = products.find(p => String(p.id) === analysis.productId);
-    if (analysedProduct) relevantProducts = [analysedProduct];
-  }
-  const system=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,topicContext,analysis);
+  const systemBase=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,topicContext,null);
   const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
-  const images = attachments.filter(x => x.type === 'image' && x.payload?.url).slice(0, 4);
-  if (images.length) {
-    try {
-      const imageParts = [];
-      for (let i = 0; i < images.length; i++) {
-        const image = images[i];
-        try {
-          const r = await axios.get(image.payload.url, { responseType: 'arraybuffer', timeout: 18000, maxContentLength: MAX_ATTACHMENT_BYTES });
-          const contentType = String(r.headers['content-type'] || 'image/jpeg').split(';')[0].trim();
-          if (!contentType.startsWith('image/')) { console.warn('[VISION] Attachment is not an image', { index: i, contentType }); continue; }
-          const base64 = Buffer.from(r.data).toString('base64');
-          imageParts.push({ type: 'text', text: `গ্রাহকের ছবি ${i + 1}:` });
-          imageParts.push({ type: 'image_url', image_url: { url: `data:${contentType};base64,${base64}` } });
-        } catch (imageError) { console.error('[VISION] Failed to fetch image', { index: i, message: imageError.response?.status || imageError.message }); }
-      }
-      if (imageParts.some(part => part.type === 'image_url')) {
-        const visionPrompt = `${query || 'এই ছবিগুলো দেখে পণ্য শনাক্ত করুন'}
-একই মেসেজে একাধিক ছবি থাকলে সবগুলো মিলিয়ে বিশ্লেষণ করুন। ছবিতে দৃশ্যমান পণ্যের নাম, মডেল নম্বর, ব্র্যান্ড, প্যাকেটের লেখা এবং বৈশিষ্ট্য পড়ার চেষ্টা করুন। শনাক্তকৃত পণ্য ক্যাটালগের তথ্যের সঙ্গে মিলিয়ে দেখুন; প্রমাণ ছাড়া পণ্যের নাম বা দাম নিশ্চিত করবেন না। কাস্টমারকে ইতিমধ্যে দেওয়া তথ্য অকারণে আবার জিজ্ঞেস করবেন না। যানবাহনে হেডলাইট ফিটমেন্ট বা প্লাগ-ম্যাচিং নিজে নিশ্চিত করবেন না; এ বিষয়ে নির্দিষ্ট মানব-প্রতিনিধির বার্তাই ব্যবহার করুন। সংক্ষিপ্ত ও সরাসরি উত্তর দিন।`;
-        const response = await callOpenRouter([{ role: 'system', content: system }, ...prior, { role: 'user', content: [{ type: 'text', text: visionPrompt }, ...imageParts] }]);
-        return limitToFiveLines(response);
-      }
-      console.warn('[VISION] No image attachments could be fetched; falling back to text-only');
-    } catch (e) { console.error('[VISION] Failed:', e.response?.data?.error?.message || e.message); }
+  const images=attachments.filter(x=>x.type==='image'&&x.payload?.url).slice(0,4);
+  const imageParts=[];
+  for(let i=0;i<images.length;i++){
+    try{
+      const r=await axios.get(images[i].payload.url,{responseType:'arraybuffer',timeout:18000,maxContentLength:MAX_ATTACHMENT_BYTES});
+      const contentType=String(r.headers['content-type']||'image/jpeg').split(';')[0].trim();
+      if(!contentType.startsWith('image/')){console.warn('[VISION] Attachment is not an image',{index:i,contentType});continue;}
+      imageParts.push({type:'text',text:`গ্রাহকের ছবি ${i+1}:`});
+      imageParts.push({type:'image_url',image_url:{url:`data:${contentType};base64,${Buffer.from(r.data).toString('base64')}`}});
+    }catch(e){console.error('[VISION] Failed to fetch image',{index:i,message:e.response?.status||e.message});}
   }
-  return limitToFiveLines(await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:query}]));
+  const hasImages=imageParts.some(part=>part.type==='image_url');
+  const catalogChoices=products.map(p=>({id:String(p.id),name:String(p.name||''),category:String(p.category||''),model:String(p.model||''),aliases:Array.isArray(p.aliases)?p.aliases:[]}));
+  const outputContract=`\n\nআউটপুট ফরম্যাট বাধ্যতামূলক: বৈধ JSON object দিন, Markdown code fence নয়। ফিল্ড: "reply" (গ্রাহককে পাঠানোর সংক্ষিপ্ত উত্তর), "productId" (নিচের LIVE catalog product ID থেকে একটি string, না মিললে null), "imageDescription" (ছবিতে দৃশ্যমান বস্তু/রং/আকৃতি/লেখার সংক্ষিপ্ত বর্ণনা; ছবি না থাকলে খালি string), "confidence" (0 থেকে 1)। customer reply-তে JSON বা metadata দেখাবেন না। পণ্য নির্বাচন কেবল নিচের ক্যাটালগ থেকে করবেন; আন্দাজ করে ID বানাবেন না।\nLIVE catalog choices: ${JSON.stringify(catalogChoices).slice(0,14000)}\nবর্তমান পণ্য থাকলে সাধারণ follow-up-এ সেটিই রাখুন। গ্রাহক স্পষ্টভাবে নতুন পণ্যের নাম/ছবি দিলে এবং সেটি ক্যাটালগে মিলে গেলে নতুন পণ্য নির্বাচন করুন। ছবি থেকে পণ্য চেনা গেলে তার catalog ID দিন, ছবিতে নীল/অন্য রং দেখা গেলে সেটি imageDescription-এ লিখুন। গ্রাহক যদি শুধু রং জিজ্ঞেস করেন, বর্তমান পণ্য ধরে উত্তর দিন। ছবি বুঝতে না পারলে মিথ্যা শনাক্তকরণ করবেন না।`;
+  const system=systemBase+outputContract;
+  let userContent;
+  if(hasImages){
+    userContent=[{type:'text',text:`সর্বশেষ গ্রাহক বার্তা: ${query}\nছবিগুলো দেখুন, দৃশ্যমান লেখা/OCR যতটা সম্ভব পড়ুন, ক্যাটালগের পণ্যের সঙ্গে মিলান। আগের কথোপকথনে গ্রাহক যে পণ্যের ছবি দিয়েছেন সেটির প্রসঙ্গ মনে রাখুন।`},...imageParts];
+  }else userContent=query;
+  // One OpenRouter model call per AI response. No separate classification/analysis call.
+  const raw=await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:userContent}],TEXT_MODEL,{maxTokens:MAX_OUTPUT_TOKENS,temperature:0.2});
+  let parsed=null;
+  try{
+    const candidate=raw.match(/\{[\s\S]*\}/)?.[0];
+    if(candidate)parsed=JSON.parse(candidate);
+  }catch(e){console.warn('[AI] Structured output parse failed; using plain response.');}
+  const reply=String(parsed?.reply||raw).trim();
+  const imageDescription=String(parsed?.imageDescription||'').trim().slice(0,500);
+  const selectedId=parsed?.productId==null?'':String(parsed.productId);
+  const selectedProduct=selectedId?products.find(p=>String(p.id)===selectedId):null;
+  const confidence=Number(parsed?.confidence)||0;
+  // Code, not free-form model text, is the sole authority for active product memory.
+  if(selectedProduct && (confidence>=0.55 || hasImages || topic.explicit)) rememberActiveProduct(senderId,selectedProduct);
+  else {
+    const exact=findExactProduct(query);
+    if(exact)rememberActiveProduct(senderId,exact);
+  }
+  // Persist image understanding into both rolling history and durable message records.
+  if(hasImages && imageDescription){
+    const currentHistory=getHistory(senderId);
+    for(let i=currentHistory.length-1;i>=0;i--){
+      if(currentHistory[i].role==='user' && (currentHistory[i].text==='[Media File]'||currentHistory[i].text.includes('[ছবি'))){
+        currentHistory[i].text=`[ছবির বর্ণনা: ${imageDescription}]${selectedProduct?` [শনাক্ত পণ্য: ${selectedProduct.name} | ID: ${selectedProduct.id}]`:''}${query&&query!=='[Media File]'?` গ্রাহকের বার্তা: ${query}`:''}`;
+        break;
+      }
+    }
+    const latest=db.messages.slice().reverse().find(m=>String(m.senderId)===String(senderId)&&m.sender==='customer'&&String(m.text||'').startsWith('[Media:'));
+    if(latest){
+      latest.text=`[ছবির বর্ণনা: ${imageDescription}]${selectedProduct?` [শনাক্ত পণ্য: ${selectedProduct.name} | ID: ${selectedProduct.id}]`:''}${query&&query!=='[Media File]'?` গ্রাহকের বার্তা: ${query}`:''}`;
+      if(pool) pool.query('UPDATE impotech_messages SET text=$1 WHERE id=$2',[latest.text,latest.id]).catch(e=>console.error('[DB] Image-description history update failed:',e.message));
+    }
+    const customer=ensureCustomer(senderId);
+    customer.lastImageDescription=imageDescription;
+    customer.lastImageProductId=selectedProduct?String(selectedProduct.id):null;
+    customer.lastImageUpdatedAt=new Date().toISOString();
+    const mem=getCustomerMemory(senderId);
+    addUniqueMemoryItem(mem.facts,`সর্বশেষ ছবির বর্ণনা: ${imageDescription}`,15);
+    if(selectedProduct)addUniqueMemoryItem(mem.facts,`ছবিতে শনাক্ত পণ্য: ${selectedProduct.name} (ID: ${selectedProduct.id})`,15);
+    mem.updatedAt=new Date().toISOString();
+    saveStorage();
+  }
+  return limitToFiveLines(reply);
 }
 function isCriticalHandoverQuestion(text='') { return /প্রতারণা|fraud|scam|আইনগত ব্যবস্থা|legal action|মামলা|মারাত্মক দুর্ঘটনা|serious injury|আগুন লেগেছে|fire hazard|ব্যাটারি বিস্ফোরণ|battery exploded|চার্জে আগুন|payment deducted twice|দুইবার টাকা কাটা|ভুল পেমেন্ট|টাকা কেটে নিয়েছে/i.test(String(text || '').normalize('NFKC')); }
 function isConfusionReply(text='') { return /^(হ্যাঁ|হ্যা|জি|জ্বি|রাজি|সম্মতি|ঠিক আছে|yes|yeah|y|ok|okay|sure|না|no|nope|n)$/i.test(normalizeText(text)); }
@@ -1636,7 +1691,7 @@ async function handleIncomingMessage({ senderId, text: rawText, attachments, mes
     } catch (e) { console.error('[VOICE] Transcription failed:', e.response?.data?.error?.message || e.message); voiceFailed = true; }
   }
   const now = new Date().toISOString(), paused = getTakeoverState(senderId);
-  appendHistory(senderId, 'user', text || '[Media File]');
+  appendHistory(senderId, 'user', text || (attachments.some(a => a.type === 'image') ? '[ছবি পাঠানো হয়েছে; বর্ণনা অপেক্ষমাণ]' : '[Media File]'));
   addStoredMessage({ id: 'msg_' + crypto.randomUUID(), senderId, sender: 'customer', text: text ? (isVoice ? `🎤 ${text}` : text) : `[Media: ${attachments[0]?.type || 'file'}]`, timestamp: now, messageId: messageId || null });
   const c = ensureCustomer(senderId);
   c.messageCount = (c.messageCount || 0) + 1; c.lastActive = now; c.lastCustomerMessageAt = now; c.lastMessageId = messageId || null; c.lastMessageText = text || '[Media]';
@@ -1878,16 +1933,16 @@ app.get('/admin/campaign-tracking', (req,res) => {
 // -----------------------------------------------------------------------------
 app.get('/health',(req,res)=>res.status(200).json({success:true,status:'ok',storage:pool?'postgresql':'memory-only'}));
 app.get('/api/health',(req,res)=>res.status(200).json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',isGlobalPaused:!!db.isGlobalPaused}));
-app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,catalogSyncMode:CATALOG_SYNC_MODE,catalogAutoRefreshSeconds:Math.round(CATALOG_REFRESH_INTERVAL_MS/1000),catalogDirty,replyDelayMs:REPLY_DELAY_MS,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,voiceModel:VOICE_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
+app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogQualityWarnings:getCatalogQualityWarnings(),catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,catalogSyncMode:CATALOG_SYNC_MODE,catalogAutoRefreshSeconds:Math.round(CATALOG_REFRESH_INTERVAL_MS/1000),catalogDirty,replyDelayMs:REPLY_DELAY_MS,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,voiceModel:VOICE_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
 app.get('/api/catalog/media-status',(req,res)=>res.json({success:true,products:products.map(p=>({id:p.id,name:p.name,images:getProductMediaUrls(p,'images').length,videos:getProductMediaUrls(p,'videos').length}))}));
 
 // ============================================================================
-// v7 additions: separate message table, two-stage AI, sales & quality rules,
+// v7 additions: separate message table, single-call AI, catalog quality checks, sales & quality rules,
 // learned examples, draft (approval) mode, rollout control, failure log, audit log,
 // daily report, live conversation view, evaluation harness, optional STT (OpenAI Whisper),
 // optional Redis de-duplication, optional Sentry error reporting.
 // ============================================================================
-const TWO_STAGE_AI = process.env.TWO_STAGE_AI !== 'false';
+const TWO_STAGE_AI = false; // disabled: requirement is one AI call per response
 const STT_PROVIDER = String(process.env.STT_PROVIDER || 'openrouter').toLowerCase();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const REDIS_URL = process.env.REDIS_URL || '';
