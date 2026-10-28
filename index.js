@@ -484,13 +484,17 @@ function resolveConversationTopic(text, senderId) {
   }
   return out(findProductFromRecentContext(id), [], null);
 }
-// If we have no active product yet and a deterministic reply names exactly one product, remember it.
-function syncActiveProductFromReply(senderId, replyText) {
-  if (!senderId || findActiveProduct(senderId)) return;
+// A catalog-matched product explicitly named by the latest AI answer may switch the active topic.
+// Do not silently keep the old product simply because one is already active.
+// FAQ answers use allowSwitch:false because a general FAQ can mention another product incidentally.
+function syncActiveProductFromReply(senderId, replyText, options = {}) {
+  if (!senderId || !String(replyText || '').trim()) return;
   const named = findExactProduct(replyText);
   if (!named) return;
-  const topicCategory = getActiveCategory(senderId), namedCategory = getProductCategoryKey(named);
-  if (topicCategory && namedCategory && topicCategory !== namedCategory) return;
+  const active = findActiveProduct(senderId);
+  if (active && String(active.id) === String(named.id)) return;
+  if (active && options.allowSwitch === false) return;
+  // The product is chosen by code only after it is matched against the live catalog.
   rememberActiveProduct(senderId, named);
 }
 
@@ -1337,7 +1341,7 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
 ৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। নিচে দেওয়া “প্রাসঙ্গিক পণ্য” ও “FAQ” অংশই সর্বশেষ ও সঠিক তথ্য। কথোপকথনের ইতিহাসে বা মেমোরিতে আগে বলা দাম, স্টক, অফার, ওয়ারেন্টি বা বিবরণ নিচের ক্যাটালগের সাথে না মিললে ক্যাটালগের তথ্যই সঠিক; পুরোনো তথ্য কখনো পুনরাবৃত্তি করবে না। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। গ্রাহক আলো/কোয়ালিটি/দেখতে কেমন জানতে চাইলে ক্যাটালগে ভিডিও বা ছবির লিংক থাকলে আগে সেটি দেবে। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
-৬) মেমোরি ও প্রসঙ্গ (সবচেয়ে গুরুত্বপূর্ণ): নিচের “বর্তমান আলোচ্য বিষয়” হলো গ্রাহকের চলমান পণ্য/ক্যাটাগরি। গ্রাহক নতুন কোনো পণ্য বা ক্যাটাগরির (যেমন ফগ লাইট, হেডলাইট, অ্যাঞ্জেল উইংস) নাম স্পষ্টভাবে না বললে ছবি, ভিডিও, অডিও, দাম, ডেলিভারি, ওয়ারেন্টি, আলো কেমন—সব প্রশ্ন শুধু ওই পণ্যের জন্যই ধরবে এবং অন্য পণ্যের তথ্য মেশাবে না। নতুন পণ্য/ক্যাটাগরির নাম বললে বুঝবে গ্রাহক বিষয় পরিবর্তন করেছেন এবং তখন নতুন পণ্যের তথ্য দেবে। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে ইতিহাস ও মেমোরি থেকে পণ্য বুঝে নেবে; একই তথ্য অকারণে আবার চাইবে না।
+৬) মেমোরি ও প্রসঙ্গ (সবচেয়ে গুরুত্বপূর্ণ): সাধারণ text follow-up-এ নিচের “বর্তমান আলোচ্য বিষয়” ধরে উত্তর দেবে। গ্রাহক নতুন পণ্যের নাম লিখলে সেই পণ্য ধরবে। গ্রাহক নতুন ছবি পাঠালে ছবিটি বর্তমান পণ্যের পরিচয় যাচাই/পরিবর্তনের প্রধান উৎস; পুরোনো active product বা আগের বটের অনুমান দিয়ে নতুন ছবিকে শ্রেণিবদ্ধ করবে না। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে প্রয়োজনমতো ইতিহাস ও মেমোরি ব্যবহার করবে, কিন্তু নতুন সংযুক্ত ছবি পুরোনো প্রসঙ্গের চেয়ে অগ্রাধিকার পাবে। একই তথ্য অকারণে আবার চাইবে না।
 ৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
 ৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
 
@@ -1443,82 +1447,220 @@ async function transcribeAudioOpenRouter(url) {
   throw lastError || new Error('Voice transcription failed');
 }
 
-async function generateAIResponse(customerText,attachments=[],senderId) {
-  const query=customerText||'গ্রাহক একটি ছবি/ফাইল পাঠিয়েছেন। ছবি দেখে পণ্য শনাক্ত করে সাহায্য করুন।';
-  let history=getHistory(senderId).slice();
-  if(history.length&&history[history.length-1].role==='user'&&history[history.length-1].text===query)history.pop();
-  const context=getRecentConversationText(senderId,query), memory=buildCustomerMemoryContext(senderId);
-  const topic = resolveConversationTopic(query, senderId);
-  let relevantProducts = topic.product ? [topic.product]
-    : topic.categoryProducts.length ? topic.categoryProducts.slice(0, MAX_PRODUCTS_TO_AI)
-    : findRelevantProducts(query);
-  if (!relevantProducts.length) relevantProducts = findRelevantProducts(context);
+async function generateAIResponse(customerText, attachments = [], senderId, incomingMessageId = null) {
+  const query = customerText || 'গ্রাহক একটি ছবি/ফাইল পাঠিয়েছেন। ছবিকে নতুন ইনপুট হিসেবে দেখে পণ্য শনাক্ত করে সাহায্য করুন।';
+  const imageAttachments = attachments.filter(x => x.type === 'image' && x.payload?.url).slice(0, 4);
+  const hasIncomingImages = imageAttachments.length > 0;
+
+  // Download the current images before building topic context. A new customer image has
+  // priority over the previous active product; otherwise old context can bias vision.
+  const imageParts = [];
+  for (let i = 0; i < imageAttachments.length; i++) {
+    try {
+      const r = await axios.get(imageAttachments[i].payload.url, {
+        responseType: 'arraybuffer', timeout: 18000, maxContentLength: MAX_ATTACHMENT_BYTES
+      });
+      const contentType = String(r.headers['content-type'] || 'image/jpeg').split(';')[0].trim();
+      if (!contentType.startsWith('image/')) {
+        console.warn('[VISION] Attachment is not an image', { index: i, contentType });
+        continue;
+      }
+      imageParts.push({ type: 'text', text: `বর্তমান মেসেজের গ্রাহকের ছবি ${i + 1}:` });
+      imageParts.push({ type: 'image_url', image_url: { url: `data:${contentType};base64,${Buffer.from(r.data).toString('base64')}` } });
+    } catch (e) {
+      console.error('[VISION] Failed to fetch image', { index: i, message: e.response?.status || e.message });
+    }
+  }
+  const hasImages = imageParts.some(part => part.type === 'image_url');
+
+  let history = getHistory(senderId).slice();
+  if (history.length && history[history.length - 1].role === 'user' && history[history.length - 1].text === query) history.pop();
+  if (hasIncomingImages && history.length && history[history.length - 1].role === 'user' && /^\[(?:ছবি পাঠানো হয়েছে|Media File)/i.test(history[history.length - 1].text)) history.pop();
+  // If the incoming message contains an image, do not pass an old active-product claim as
+  // the selected topic. Keep useful customer context, but remove earlier assistant product
+  // claims so a previous visual misclassification cannot bias the new image.
+  const topic = hasImages
+    ? { product: null, categoryProducts: [], category: null, explicit: true }
+    : resolveConversationTopic(query, senderId);
+  let memory = buildCustomerMemoryContext(senderId);
+  if (hasImages) {
+    memory = memory
+      .replace(/^বর্তমান আলোচনার পণ্য:.*(?:\n|$)/gm, '')
+      .replace(/^বর্তমান আলোচনার ক্যাটাগরি:.*(?:\n|$)/gm, '')
+      .trim();
+  }
+  const context = getRecentConversationText(senderId, query);
+  let relevantProducts;
+  if (hasImages) {
+    // The prior product must not be the only product offered to vision. The complete compact
+    // catalog index below is used for visual matching instead.
+    relevantProducts = [];
+  } else {
+    relevantProducts = topic.product ? [topic.product]
+      : topic.categoryProducts.length ? topic.categoryProducts.slice(0, MAX_PRODUCTS_TO_AI)
+      : findRelevantProducts(query);
+    if (!relevantProducts.length) relevantProducts = findRelevantProducts(context);
+  }
   let relevantFaqs = findRelevantFaqs(query);
-  if (!relevantFaqs.length) relevantFaqs = findRelevantFaqs(context);
-  const topicContext = topic.product
-    ? `বর্তমান আলোচ্য পণ্য: ${topic.product.name} (ID: ${topic.product.id})${topic.category ? `; ক্যাটাগরি: ${getCategoryLabel(topic.category)}` : ''}`
-    : topic.category ? `বর্তমান আলোচ্য ক্যাটাগরি: ${getCategoryLabel(topic.category)} (নির্দিষ্ট মডেল এখনো ঠিক হয়নি)` : 'নির্দিষ্ট কোনো পণ্য বা ক্যাটাগরি এখনো শনাক্ত হয়নি।';
-  const systemBase=buildSystemPrompt(relevantProducts,relevantFaqs,history,memory,topicContext,null);
-  const prior=history.map(x=>({role:x.role==='assistant'?'assistant':'user',content:x.text}));
-  const images=attachments.filter(x=>x.type==='image'&&x.payload?.url).slice(0,4);
-  const imageParts=[];
-  for(let i=0;i<images.length;i++){
-    try{
-      const r=await axios.get(images[i].payload.url,{responseType:'arraybuffer',timeout:18000,maxContentLength:MAX_ATTACHMENT_BYTES});
-      const contentType=String(r.headers['content-type']||'image/jpeg').split(';')[0].trim();
-      if(!contentType.startsWith('image/')){console.warn('[VISION] Attachment is not an image',{index:i,contentType});continue;}
-      imageParts.push({type:'text',text:`গ্রাহকের ছবি ${i+1}:`});
-      imageParts.push({type:'image_url',image_url:{url:`data:${contentType};base64,${Buffer.from(r.data).toString('base64')}`}});
-    }catch(e){console.error('[VISION] Failed to fetch image',{index:i,message:e.response?.status||e.message});}
-  }
-  const hasImages=imageParts.some(part=>part.type==='image_url');
-  const catalogChoices=products.map(p=>({id:String(p.id),name:String(p.name||''),category:String(p.category||''),model:String(p.model||''),aliases:Array.isArray(p.aliases)?p.aliases:[]}));
-  const outputContract=`\n\nআউটপুট ফরম্যাট বাধ্যতামূলক: বৈধ JSON object দিন, Markdown code fence নয়। ফিল্ড: "reply" (গ্রাহককে পাঠানোর সংক্ষিপ্ত উত্তর), "productId" (নিচের LIVE catalog product ID থেকে একটি string, না মিললে null), "imageDescription" (ছবিতে দৃশ্যমান বস্তু/রং/আকৃতি/লেখার সংক্ষিপ্ত বর্ণনা; ছবি না থাকলে খালি string), "confidence" (0 থেকে 1)। customer reply-তে JSON বা metadata দেখাবেন না। পণ্য নির্বাচন কেবল নিচের ক্যাটালগ থেকে করবেন; আন্দাজ করে ID বানাবেন না।\nLIVE catalog choices: ${JSON.stringify(catalogChoices).slice(0,14000)}\nবর্তমান পণ্য থাকলে সাধারণ follow-up-এ সেটিই রাখুন। গ্রাহক স্পষ্টভাবে নতুন পণ্যের নাম/ছবি দিলে এবং সেটি ক্যাটালগে মিলে গেলে নতুন পণ্য নির্বাচন করুন। ছবি থেকে পণ্য চেনা গেলে তার catalog ID দিন, ছবিতে নীল/অন্য রং দেখা গেলে সেটি imageDescription-এ লিখুন। গ্রাহক যদি শুধু রং জিজ্ঞেস করেন, বর্তমান পণ্য ধরে উত্তর দিন। ছবি বুঝতে না পারলে মিথ্যা শনাক্তকরণ করবেন না।`;
-  const system=systemBase+outputContract;
+  if (!relevantFaqs.length && !hasImages) relevantFaqs = findRelevantFaqs(context);
+
+  const promptHistory = hasImages
+    ? history.filter(item => {
+        if (item.role !== 'assistant') return true;
+        const replyText = normalizeText(item.text);
+        return !products.some(p => {
+          const name = normalizeText(p.name || '');
+          return name.length >= 5 && replyText.includes(name);
+        });
+      })
+    : history;
+  const topicContext = hasImages
+    ? 'সর্বশেষ মেসেজে নতুন ছবি এসেছে। এই ছবিই বর্তমান পণ্য শনাক্তকরণের প্রধান উৎস; আগের active product বা আগের বটের অনুমানকে বর্তমান ছবির পরিচয় হিসেবে ধরবেন না।'
+    : topic.product
+      ? `বর্তমান আলোচ্য পণ্য: ${topic.product.name} (ID: ${topic.product.id})${topic.category ? `; ক্যাটাগরি: ${getCategoryLabel(topic.category)}` : ''}`
+      : topic.category
+        ? `বর্তমান আলোচ্য ক্যাটাগরি: ${getCategoryLabel(topic.category)} (নির্দিষ্ট মডেল এখনো ঠিক হয়নি)`
+        : 'নির্দিষ্ট কোনো পণ্য বা ক্যাটাগরি এখনো শনাক্ত হয়নি।';
+
+  // Keep the catalog JSON complete; slicing a JSON string at an arbitrary character can
+  // cut off later products or corrupt the candidate list. Descriptions are deliberately compact.
+  const catalogChoices = products.map(p => ({
+    id: String(p.id),
+    name: String(p.name || ''),
+    category: String(p.category || ''),
+    brand: String(p.brand || ''),
+    model: String(p.model || ''),
+    price: p.price ?? null,
+    aliases: Array.isArray(p.aliases) ? p.aliases.slice(0, 12) : [],
+    tags: Array.isArray(p.tags) ? p.tags.slice(0, 8) : [],
+    keywords: Array.isArray(p.keywords) ? p.keywords.slice(0, 12) : [],
+    description: String(p.shortDescription || p.description || '').slice(0, 180),
+    features: Array.isArray(p.features) ? p.features.slice(0, 5) : []
+  }));
+  const catalogChoicesText = JSON.stringify(catalogChoices);
+  const systemBase = buildSystemPrompt(relevantProducts, relevantFaqs, promptHistory, memory, topicContext, null);
+  const visualPriorityRule = hasImages ? `
+
+বিশেষ নিয়ম—সর্বশেষ ছবিকে অগ্রাধিকার:
+- এই মেসেজের ছবিই এখনকার পণ্য নির্ধারণের প্রধান প্রমাণ। আগের active product, আগের উত্তরে বলা পণ্য, বা আগের ছবির বর্ণনা দেখে বর্তমান ছবিকে পুরোনো পণ্য বলবেন না।
+- ছবিতে আগের পণ্যের চেয়ে অন্য পণ্য দেখা গেলে LIVE catalog থেকে নতুন পণ্যটির ID দিন; কোড সেটি যাচাই করে active product আপডেট করবে।
+- শুধু দেখতে বাইক-লাইটের মতো হলেই H4 LED Mini Projector/Headlight বলবেন না। ডান/বাম ডানা, feather/wing আকৃতি, রং, অবস্থান এবং পণ্যের দৃশ্যমান ধরন মিলিয়ে ক্যাটালগের সঙ্গে তুলনা করুন।
+- ছবি যদি Angel Wings Light-এর মতো ডানা-আকৃতির accessory দেখায়, শুধু আগের হেডলাইট প্রসঙ্গের কারণে সেটিকে হেডলাইট বলবেন না। একইভাবে ছবিতে যা নেই এমন Devil Eye/DRL/Projector feature অনুমান করবেন না।
+- "productId" হবে নিচের LIVE catalog থেকে মিল পাওয়া একটিমাত্র ID। নির্ভরযোগ্য মিল না পেলে null দিন; ভুল ID অনুমান করবেন না। "imageDescription"-এ ছবির দৃশ্যমান বস্তু/রং/আকৃতি লিখুন।
+- গ্রাহক শুধু “কি”, “এটা কী”, “এইটা কী আছে” বললেও ছবিটিকে বর্ণনা করে সঠিক ক্যাটালগ পণ্য শনাক্ত করুন; অকারণে আগের পণ্যের বর্ণনা পুনরাবৃত্তি বা অর্ডারের প্রশ্ন করবেন না।` : '';
+  const outputContract = `
+
+আউটপুট ফরম্যাট বাধ্যতামূলক: বৈধ JSON object দিন, Markdown code fence নয়। ফিল্ড: "reply" (গ্রাহককে পাঠানোর সংক্ষিপ্ত উত্তর), "productId" (নিচের LIVE catalog product ID থেকে একটি string, না মিললে null), "imageDescription" (ছবিতে দৃশ্যমান বস্তু/রং/আকৃতি/লেখার সংক্ষিপ্ত বর্ণনা; ছবি না থাকলে খালি string), "confidence" (0 থেকে 1)। customer reply-তে JSON বা metadata দেখাবেন না। পণ্য নির্বাচন কেবল নিচের ক্যাটালগ থেকে করবেন; আন্দাজ করে ID বানাবেন না।
+LIVE catalog choices: ${catalogChoicesText}
+বর্তমান পণ্য থাকলে সাধারণ text follow-up-এ সেটিই রাখুন। তবে নতুন ছবি এলে ছবিকে অগ্রাধিকার দিন: ছবিতে নতুন পণ্য ক্যাটালগে মিলে গেলে সেটিই নির্বাচন করুন এবং আগের পণ্যকে ধরে রাখবেন না। গ্রাহক যদি শুধু রং জিজ্ঞেস করেন এবং নতুন ছবি না থাকে, বর্তমান পণ্য ধরে উত্তর দিন। ছবি বুঝতে না পারলে মিথ্যা শনাক্তকরণ করবেন না।${visualPriorityRule}`;
+  const system = systemBase + outputContract;
+
+  const prior = promptHistory.map(x => ({ role: x.role === 'assistant' ? 'assistant' : 'user', content: x.text }));
   let userContent;
-  if(hasImages){
-    userContent=[{type:'text',text:`সর্বশেষ গ্রাহক বার্তা: ${query}\nছবিগুলো দেখুন, দৃশ্যমান লেখা/OCR যতটা সম্ভব পড়ুন, ক্যাটালগের পণ্যের সঙ্গে মিলান। আগের কথোপকথনে গ্রাহক যে পণ্যের ছবি দিয়েছেন সেটির প্রসঙ্গ মনে রাখুন।`},...imageParts];
-  }else userContent=query;
-  // One OpenRouter model call per AI response. No separate classification/analysis call.
-  const raw=await callOpenRouter([{role:'system',content:system},...prior,{role:'user',content:userContent}],TEXT_MODEL,{maxTokens:MAX_OUTPUT_TOKENS,temperature:0.2});
-  let parsed=null;
-  try{
-    const candidate=raw.match(/\{[\s\S]*\}/)?.[0];
-    if(candidate)parsed=JSON.parse(candidate);
-  }catch(e){console.warn('[AI] Structured output parse failed; using plain response.');}
-  const reply=String(parsed?.reply||raw).trim();
-  const imageDescription=String(parsed?.imageDescription||'').trim().slice(0,500);
-  const selectedId=parsed?.productId==null?'':String(parsed.productId);
-  const selectedProduct=selectedId?products.find(p=>String(p.id)===selectedId):null;
-  const confidence=Number(parsed?.confidence)||0;
-  // Code, not free-form model text, is the sole authority for active product memory.
-  if(selectedProduct && (confidence>=0.55 || hasImages || topic.explicit)) rememberActiveProduct(senderId,selectedProduct);
-  else {
-    const exact=findExactProduct(query);
-    if(exact)rememberActiveProduct(senderId,exact);
+  if (hasImages) {
+    userContent = [{
+      type: 'text',
+      text: `বর্তমান গ্রাহক বার্তা: ${query}\nএখন সংযুক্ত নতুন ছবিগুলো দেখুন। আগের ছবি বা আগের পণ্যের নামকে বর্তমান ছবির পরিচয় ধরে নেবেন না। ছবিতে দৃশ্যমান বস্তু/আকৃতি/রং এবং LIVE catalog choices মিলিয়ে পণ্য শনাক্ত করুন।`
+    }, ...imageParts];
+  } else {
+    userContent = query;
   }
-  // Persist image understanding into both rolling history and durable message records.
-  if(hasImages && imageDescription){
-    const currentHistory=getHistory(senderId);
-    for(let i=currentHistory.length-1;i>=0;i--){
-      if(currentHistory[i].role==='user' && (currentHistory[i].text==='[Media File]'||currentHistory[i].text.includes('[ছবি'))){
-        currentHistory[i].text=`[ছবির বর্ণনা: ${imageDescription}]${selectedProduct?` [শনাক্ত পণ্য: ${selectedProduct.name} | ID: ${selectedProduct.id}]`:''}${query&&query!=='[Media File]'?` গ্রাহকের বার্তা: ${query}`:''}`;
+
+  // One OpenRouter call per AI response; existing text, vision, and voice flows are retained.
+  const raw = await callOpenRouter(
+    [{ role: 'system', content: system }, ...prior, { role: 'user', content: userContent }],
+    TEXT_MODEL,
+    { maxTokens: MAX_OUTPUT_TOKENS, temperature: 0.1 }
+  );
+  let parsed = null;
+  try {
+    const trimmed = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    try { parsed = JSON.parse(trimmed); }
+    catch (_) {
+      const candidate = trimmed.match(/\{[\s\S]*\}/)?.[0];
+      if (candidate) parsed = JSON.parse(candidate);
+    }
+  } catch (e) {
+    console.warn('[AI] Structured output parse failed; using plain response.');
+  }
+
+  const reply = String(parsed?.reply || raw).trim();
+  const imageDescription = String(parsed?.imageDescription || '').trim().slice(0, 500);
+  const selectedId = parsed?.productId == null ? '' : String(parsed.productId);
+  let selectedProduct = selectedId ? products.find(p => String(p.id) === selectedId) : null;
+  const previousActive = findActiveProduct(senderId);
+
+  // Fallback only when the answer names one exact catalog product different from the old topic.
+  // This allows a clearly named new product to switch, but avoids syncing an old hallucinated name
+  // back over a different product selected from the current image.
+  if (hasImages && !selectedProduct) {
+    const mentioned = findExactProduct(reply);
+    if (mentioned && (!previousActive || String(mentioned.id) !== String(previousActive.id))) {
+      selectedProduct = mentioned;
+    }
+  }
+
+  if (selectedProduct) {
+    // A newly attached image is an explicit context boundary; catalog-validated selection wins
+    // even if a previous activeProductId already exists.
+    if (hasImages || !previousActive || String(previousActive.id) !== String(selectedProduct.id)) {
+      rememberActiveProduct(senderId, selectedProduct);
+    }
+  } else if (!hasImages) {
+    const exact = findExactProduct(query);
+    if (exact) rememberActiveProduct(senderId, exact);
+  } else {
+    // Do not let a stale product silently remain active after a new image failed to match.
+    // The visual description is still saved below so a later follow-up retains the image context.
+    clearActiveProduct(senderId);
+    const c = ensureCustomer(senderId);
+    delete c.activeCategory;
+    delete c.activeCategoryUpdatedAt;
+    saveStorage();
+  }
+
+  // Store image description + catalog match in the current user-history entry and durable DB
+  // record even when the customer attached a caption. The previous code only replaced entries
+  // whose text was exactly a media placeholder, so captioned images were not remembered.
+  if (hasImages) {
+    const selectedSummary = selectedProduct
+      ? `শনাক্ত পণ্য: ${selectedProduct.name} | ID: ${selectedProduct.id}`
+      : 'ক্যাটালগ পণ্য নিশ্চিতভাবে শনাক্ত হয়নি';
+    const persistedDescription = imageDescription || (selectedProduct
+      ? `ক্যাটালগে ${selectedProduct.name} পণ্যের সঙ্গে মিল পাওয়া গেছে; ছবির বিস্তারিত বর্ণনা পাওয়া যায়নি।`
+      : 'ছবি বিশ্লেষণ করা হয়েছে, কিন্তু ক্যাটালগে নির্ভরযোগ্য পণ্য-মিল পাওয়া যায়নি।');
+    const messageSummary = `[নতুন ছবির বর্ণনা: ${persistedDescription}] [${selectedSummary}]${query && query !== '[Media File]' ? ` [গ্রাহকের বার্তা: ${query}]` : ''}`;
+
+    const currentHistory = getHistory(senderId);
+    for (let i = currentHistory.length - 1; i >= 0; i--) {
+      if (currentHistory[i].role === 'user') {
+        currentHistory[i].text = messageSummary;
         break;
       }
     }
-    const latest=db.messages.slice().reverse().find(m=>String(m.senderId)===String(senderId)&&m.sender==='customer'&&String(m.text||'').startsWith('[Media:'));
-    if(latest){
-      latest.text=`[ছবির বর্ণনা: ${imageDescription}]${selectedProduct?` [শনাক্ত পণ্য: ${selectedProduct.name} | ID: ${selectedProduct.id}]`:''}${query&&query!=='[Media File]'?` গ্রাহকের বার্তা: ${query}`:''}`;
-      if(pool) pool.query('UPDATE impotech_messages SET text=$1 WHERE id=$2',[latest.text,latest.id]).catch(e=>console.error('[DB] Image-description history update failed:',e.message));
+
+    let latest = null;
+    if (incomingMessageId) {
+      latest = [...db.messages].reverse().find(m => String(m.senderId) === String(senderId) && m.sender === 'customer' && String(m.messageId || '') === String(incomingMessageId));
     }
-    const customer=ensureCustomer(senderId);
-    customer.lastImageDescription=imageDescription;
-    customer.lastImageProductId=selectedProduct?String(selectedProduct.id):null;
-    customer.lastImageUpdatedAt=new Date().toISOString();
-    const mem=getCustomerMemory(senderId);
-    addUniqueMemoryItem(mem.facts,`সর্বশেষ ছবির বর্ণনা: ${imageDescription}`,15);
-    if(selectedProduct)addUniqueMemoryItem(mem.facts,`ছবিতে শনাক্ত পণ্য: ${selectedProduct.name} (ID: ${selectedProduct.id})`,15);
-    mem.updatedAt=new Date().toISOString();
+    if (!latest) {
+      latest = [...db.messages].reverse().find(m => String(m.senderId) === String(senderId) && m.sender === 'customer' && Date.now() - new Date(m.timestamp || 0).getTime() < 120000);
+    }
+    if (latest) {
+      latest.text = messageSummary;
+      if (pool) pool.query('UPDATE impotech_messages SET text=$1 WHERE id=$2', [latest.text, latest.id])
+        .catch(e => console.error('[DB] Image-description history update failed:', e.message));
+    }
+
+    const customer = ensureCustomer(senderId);
+    customer.lastImageDescription = persistedDescription;
+    customer.lastImageProductId = selectedProduct ? String(selectedProduct.id) : null;
+    customer.lastImageUpdatedAt = new Date().toISOString();
+    const mem = getCustomerMemory(senderId);
+    addUniqueMemoryItem(mem.facts, `সর্বশেষ ছবির বর্ণনা: ${persistedDescription}`, 15);
+    if (selectedProduct) addUniqueMemoryItem(mem.facts, `সর্বশেষ ছবিতে শনাক্ত পণ্য: ${selectedProduct.name} (ID: ${selectedProduct.id})`, 15);
+    mem.updatedAt = new Date().toISOString();
+    customer.lastMemoryUpdatedAt = mem.updatedAt;
     saveStorage();
   }
   return limitToFiveLines(reply);
@@ -1561,12 +1703,13 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     const enteringOrderDetails = inDraft && Boolean(extractPhone(customerText) || extractAddress(customerText));
     if (!enteringOrderDetails) {
       // 1) Explicit photo / video request: always for the CURRENT product/category.
-      if (getMediaTypes(customerText).length) {
+      const hasIncomingImage = attachments.some(x => x.type === 'image' && x.payload?.url);
+      if (!hasIncomingImage && getMediaTypes(customerText).length) {
         const reply = getProductMediaReply(customerText, id);
         if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); markServed(id, resolveConversationTopic(customerText, id).product, getMediaTypes(customerText)); return; }
       }
       // 2) "লাইটের আলো কেমন হবে" / "ব্রাইট" / "দেখতে কেমন": show the video (else photo) of the current product.
-      if (isLightQualityQuestion(customerText) && !alreadyServedMedia(id)) {
+      if (!hasIncomingImage && isLightQualityQuestion(customerText) && !alreadyServedMedia(id)) {
         const imageFirst = /দেখতে\s*কেমন|কেমন\s*দেখ/.test(normalizeText(customerText));
         const reply = getProductMediaReply(customerText, id, { implicitTypes: imageFirst ? ['images', 'videos'] : ['videos', 'images'] });
         if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); markServed(id, resolveConversationTopic(customerText, id).product, ['videos','images']); return; }
@@ -1578,7 +1721,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         if (faqAnswer) {
           console.log(`[FAQ] Direct FAQ match for ${id}; category=${matchedFaq.category || 'unspecified'}`);
           await sendFacebookMessage(id, faqAnswer);
-          syncActiveProductFromReply(id, faqAnswer);
+          syncActiveProductFromReply(id, faqAnswer, { allowSwitch: false });
           return;
         }
       }
@@ -1658,7 +1801,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       const wantsVideo = /ভিডিও|video/i.test(lastBotText);
       if (await sendCurrentMedia(id, wantsVideo ? 'videos' : 'images')) return;
     }
-    let reply=await generateAIResponse(customerText,attachments,id);
+    let reply=await generateAIResponse(customerText,attachments,id,messageId);
     if(!reply)throw new Error('AI returned empty response');
     if (reply.split('\n').some(isMediaOfferLine)) {
       if (customerAskedMediaBefore(id) && !alreadyServedMedia(id) && await sendCurrentMedia(id)) return;
@@ -1672,7 +1815,12 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     }
     const previous=getPreviousAssistantReply(id,customerText);
     if(previous&&normalizeText(previous)===normalizeText(reply))reply='আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
-    if(!getTakeoverState(id)){await deliverAIReply(id,limitToFiveLines(reply));syncActiveProductFromReply(id,reply);}
+    if(!getTakeoverState(id)){
+      await deliverAIReply(id,limitToFiveLines(reply));
+      // The image classifier already writes the catalog-validated product ID. Do not let free-form
+      // reply text switch it back to an older product immediately after image analysis.
+      if (!attachments.some(x => x.type === 'image' && x.payload?.url)) syncActiveProductFromReply(id,reply,{allowSwitch:true});
+    }
   } catch(err) {
     reportError(err,{senderId:id,stage:'processCustomerMessage'});recordFailure(id,customerText,err.message);if(getTakeoverState(id))return;
     await sendFacebookMessage(id,'আমার প্রশ্নটা বুঝতে সমস্যা হচ্ছে, আমি কি আমাদের প্রতিনিধির কাছে প্রশ্নটা হস্তান্তর করবো? “হ্যাঁ” বা “না” লিখুন। সিদ্ধান্ত নিতে সমস্যা হলে সরাসরি কল করুন: '+HELPLINE+'। WhatsApp: '+WHATSAPP_NUMBER+'।'); db.pendingHandover[id]={reason:'AI failed to answer; awaiting customer consent',createdAt:new Date().toISOString()}; saveStorage();
