@@ -58,7 +58,7 @@ const VOICE_MODEL = TEXT_MODEL;
 const HELPLINE = process.env.HELPLINE || '+8809611042598';
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '01884332067';
 const MAX_PRODUCTS_TO_AI = 2;
-const MAX_FAQS_TO_AI = 3;
+const MAX_FAQS_TO_AI = 5;
 const MAX_OUTPUT_TOKENS = 400;
 const TRANSCRIPTION_MAX_TOKENS = 1000;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -288,8 +288,15 @@ function findRelevantProducts(query) {
   return products.map(product => ({ product, score: productScore(query, product) }))
     .filter(x => x.score >= 8).sort((a,b) => b.score-a.score).slice(0, MAX_PRODUCTS_TO_AI).map(x => x.product);
 }
-function findRelevantFaqs(query) {
-  return faqs.map(faq => ({ faq, score: scoreRecord(query, faq, ['question','q','answer','category','keywords']) }))
+function findRelevantFaqs(query, topic = null) {
+  return faqs.map(faq => {
+      let score = scoreRecord(query, faq, ['question','q','answer','category','keywords']);
+      // A FAQ explicitly linked to another product/category is never offered for the current topic.
+      if (topic && faqIsForOtherTopic(faq, topic)) return { faq, score: 0 };
+      // Among FAQs that already match the question, prefer the ones linked to the current product.
+      if (topic?.product && score >= 8 && faq?.productId && String(faq.productId) === String(topic.product.id)) score += 10;
+      return { faq, score };
+    })
     .filter(x => x.score >= 8).sort((a,b) => b.score-a.score).slice(0, MAX_FAQS_TO_AI).map(x => x.faq);
 }
 // Meta FAQ / automation intent: recognize common Bangla, English and Banglish question forms.
@@ -449,10 +456,25 @@ function getCurrentTopic(senderId) {
   const category = product ? getProductCategoryKey(product) : getActiveCategory(senderId);
   return { product, category: category || null };
 }
+// FAQ <-> product link (admin app saves faq.productId). A FAQ linked to a product that no longer exists is treated as a general FAQ.
+function faqLinkedProduct(faq) {
+  const pid = faq?.productId;
+  if (pid === undefined || pid === null || String(pid).trim() === '') return null;
+  return products.find(p => String(p.id) === String(pid)) || null;
+}
+// True when the FAQ is explicitly linked to a different product (or a different category) than the current topic.
+function faqIsForOtherTopic(faq, topic) {
+  const linked = faqLinkedProduct(faq);
+  if (!linked || !topic) return false;
+  if (topic.product) return String(linked.id) !== String(topic.product.id);
+  if (topic.category) { const key = getProductCategoryKey(linked); return Boolean(key) && key !== topic.category; }
+  return false;
+}
 // If a FAQ is about a different product/category than the customer is talking about, it must not be sent verbatim.
 function faqConflictsWithTopic(faq, senderId) {
   const topic = getCurrentTopic(senderId);
   if (!topic.product && !topic.category) return false;
+  if (faqIsForOtherTopic(faq, topic)) return true;
   const answer = String(faq?.answer || '');
   const faqText = [faq?.question, faq?.q, faq?.category, ...(Array.isArray(faq?.keywords) ? faq.keywords : [faq?.keywords]), answer].filter(Boolean).join(' ');
   const namedProduct = findExactProduct(answer);
@@ -1309,7 +1331,7 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
       ].join('\n')).join('\n\n')
     : 'কোনো প্রাসঙ্গিক পণ্য পাওয়া যায়নি।';
   const faqContext = relevantFaqs.length
-    ? relevantFaqs.map((f, i) => `[FAQ ${i + 1}] ${f.question || f.q || ''}\n${f.answer || ''}`).join('\n\n')
+    ? relevantFaqs.map((f, i) => { const lp = faqLinkedProduct(f); return `[FAQ ${i + 1}${lp ? ` | শুধু এই পণ্যের জন্য: ${lp.name}` : ''}] ${f.question || f.q || ''}\n${f.answer || ''}`; }).join('\n\n')
     : 'প্রাসঙ্গিক FAQ পাওয়া যায়নি।';
   const historyContext = history.length
     ? history.map(x => `${x.role === 'assistant' ? 'বট/প্রতিনিধি' : 'গ্রাহক'}: ${x.text}`).join('\n')
@@ -1484,8 +1506,8 @@ async function generateAIResponse(customerText, attachments = [], senderId, inco
       : findRelevantProducts(query);
     if (!relevantProducts.length) relevantProducts = findRelevantProducts(context);
   }
-  let relevantFaqs = findRelevantFaqs(query);
-  if (!relevantFaqs.length && !hasImages) relevantFaqs = findRelevantFaqs(context);
+  let relevantFaqs = findRelevantFaqs(query, topic);
+  if (!relevantFaqs.length && !hasImages) relevantFaqs = findRelevantFaqs(context, topic);
 
   const promptHistory = hasImages
     ? history.filter(item => {
@@ -2173,11 +2195,23 @@ function auditAppend(entry) {
 const FACT_SKIP = new Set(['id','name','media','aliases','keywords','tags','description','shortDescription','features','stockStatus','price','inStock','sku']);
 function productFacts(p) {
   const lines = [];
+  // Catalog "specifications" is an array, so the generic loop below would skip it; add it explicitly.
+  if (Array.isArray(p?.specifications) && p.specifications.length) {
+    lines.push('স্পেসিফিকেশন:');
+    for (const s of p.specifications.slice(0, 25)) {
+      const text = (s && typeof s === 'object') ? Object.entries(s).map(([k, v]) => `${k}: ${v}`).join(', ') : String(s ?? '').trim();
+      if (text) lines.push(`- ${text}`);
+    }
+  }
+  // The prompt shows shortDescription when present, so also pass the full description (compactly) if it differs.
+  if (p?.shortDescription && p?.description && String(p.description).trim() !== String(p.shortDescription).trim()) {
+    lines.push(`বিস্তারিত বিবরণ: ${String(p.description).replace(/\s+/g, ' ').trim().slice(0, 600)}`);
+  }
   for (const [k, v] of Object.entries(p || {})) {
-    if (FACT_SKIP.has(k) || v === null || v === undefined || v === '' || typeof v === 'object') continue;
+    if (FACT_SKIP.has(k) || k === 'specifications' || v === null || v === undefined || v === '' || typeof v === 'object') continue;
     lines.push(`${k}: ${v}`);
   }
-  return lines.slice(0, 25).join('\n') || 'অতিরিক্ত স্পেসিফিকেশন ক্যাটালগে নেই';
+  return lines.slice(0, 45).join('\n') || 'অতিরিক্ত স্পেসিফিকেশন ক্যাটালগে নেই';
 }
 async function analyzeCustomerMessage(text, senderId) {
   if (!TWO_STAGE_AI || !OPENROUTER_API_KEY || !products.length) return null;
