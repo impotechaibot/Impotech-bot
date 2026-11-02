@@ -1,8 +1,17 @@
 /*
- * ImpoTech Messenger Bot — manual-order-loop fix + contextual emoji support.
- * Base: ImpoTech_MainCode_v10_image_context_fix.txt
- * Existing integrations and unrelated features are retained. Order intake is now manual-review only:
- * no repeated phone/address prompts and no automatic order creation/confirmation.
+ * ImpoTech Messenger Bot — v13
+ * Base: ImpoTech_MainCode_v12_FAQ_ProductLink (your current index.js).
+ * v13 changes:
+ *  1) Only the product the customer asked about is answered/priced: price questions no longer fire an unrelated
+ *     product FAQ, FAQs linked to another product are blocked, AI replies mentioning other products are trimmed,
+ *     and new images are matched to ONE catalog product (with safe fallbacks).
+ *  2) Order flow restored: when a customer wants to order (Bangla / English / Banglish, or asks "how to order")
+ *     the bot asks for full address + mobile number once (no loops), then creates the order and hands over to a human.
+ *  3) Campaign-tracking feature removed completely.
+ *  4) Human takeover: automatic pause when a human replies from Page Inbox / Meta Business Suite (timed auto-resume),
+ *     immediate transfer when the customer asks for a human, bot echoes are never mistaken for humans.
+ *  5) Messenger plain-text cleanup (no ** markdown), free-delivery products respected in bills/orders.
+ * Every other service from the previous version is unchanged.
  */
 'use strict';
 
@@ -79,6 +88,17 @@ const REPLY_DELAY_MS = (() => {
 })();
 // true  = phone number alone also starts human takeover. false (default) = phone AND address are both required.
 const AUTO_HANDOVER_ON_PHONE_ONLY = process.env.AUTO_HANDOVER_ON_PHONE_ONLY === 'true';
+// Human takeover: when a human replies from Page Inbox / Meta Business Suite the bot pauses for that customer.
+// HUMAN_REPLY_PAUSE_MINUTES (default 720 = 12 h; 0 = until an admin sends .ai). AUTO_TAKEOVER_ON_ADMIN_REPLY=false turns it off.
+const AUTO_TAKEOVER_ON_ADMIN_REPLY = process.env.AUTO_TAKEOVER_ON_ADMIN_REPLY !== 'false';
+const HUMAN_REPLY_PAUSE_MS = (() => {
+  const n = Number(process.env.HUMAN_REPLY_PAUSE_MINUTES);
+  return process.env.HUMAN_REPLY_PAUSE_MINUTES !== undefined && Number.isFinite(n) ? Math.max(0, n) * 60000 : 12 * 60 * 60 * 1000;
+})();
+const HUMAN_ECHO_IGNORE_NEW_MS = 45 * 1000; // Page automations (welcome greeting) answer a brand-new customer within seconds
+const HUMAN_ECHO_IGNORE_RE = (() => { try { return new RegExp(process.env.HUMAN_ECHO_IGNORE_REGEX || 'আসসালামু আলাইকুম[\\s\\S]{0,60}স্বাগতম', 'i'); } catch (_) { return null; } })();
+const BOT_ECHO_METADATA = 'IMPOTECH_BOT_V13';     // every message this server sends carries this marker in its echo
+const ADMIN_ECHO_METADATA = 'IMPOTECH_ADMIN_APP';
 // 'replace' (default): the admin app is the source of truth, FAQs/products you save fully replace the old ones.
 // 'merge': legacy behaviour, old products/FAQs are always retained.
 const CATALOG_SYNC_MODE = String(process.env.CATALOG_SYNC_MODE || 'replace').toLowerCase() === 'merge' ? 'merge' : 'replace';
@@ -122,10 +142,11 @@ let catalogSyncInProgress = false;
 let catalogDirty = false; // true when an admin change could not be pushed to GitHub yet
 let db = {
   isGlobalPaused: false, takeovers: {}, customers: {}, messages: [], orders: [],
-  customerMemory: {}, scheduledFollowups: {}, pendingHandover: {}, orderDrafts: {}, campaignAttribution: {}
+  customerMemory: {}, scheduledFollowups: {}, pendingHandover: {}, orderDrafts: {}
 };
 const customerHistory = new Map();
 const processedMessageIds = new Map();
+const botSentMids = new Map(); // message ids sent by this server (used to tell bot echoes from human replies)
 const customerQueues = new Map();
 const followupTimers = new Map();
 let persistChain = Promise.resolve();
@@ -134,7 +155,8 @@ let persistQueued = false;
 function ensureStorageShape() {
   if (!db || typeof db !== 'object' || Array.isArray(db)) db = {};
   if (typeof db.isGlobalPaused !== 'boolean') db.isGlobalPaused = false;
-  for (const key of ['takeovers', 'customers', 'customerMemory', 'scheduledFollowups', 'pendingHandover', 'orderDrafts', 'campaignAttribution']) {
+  delete db.campaignAttribution; // campaign tracking feature was removed
+  for (const key of ['takeovers', 'customers', 'customerMemory', 'scheduledFollowups', 'pendingHandover', 'orderDrafts']) {
     if (!db[key] || typeof db[key] !== 'object' || Array.isArray(db[key])) db[key] = {};
   }
   if (!Array.isArray(db.messages)) db.messages = [];
@@ -224,7 +246,7 @@ function addStoredMessage(message) {
 }
 function ensureCustomer(senderId) {
   const id = String(senderId || '');
-  if (!db.customers[id]) db.customers[id] = { id, name: `Customer ${id.slice(-4)}`, messageCount: 0 };
+  if (!db.customers[id]) db.customers[id] = { id, name: `Customer ${id.slice(-4)}`, messageCount: 0, firstContactAt: Date.now() };
   return db.customers[id];
 }
 function isFreshTimestamp(iso) {
@@ -338,10 +360,23 @@ function findBestFaqMatch(query, senderId) {
       return { faq, base, boost, score: base + boost };
     })
     .sort((a, b) => b.score - a.score);
+  const topicNow = senderId ? getCurrentTopic(senderId) : { product: null, category: null };
+  const namedNow = findExactProduct(query);
+  const categoriesNow = detectCategoryKeys(query);
   for (const c of candidates) {
-    const confident = c.boost > 0 ? c.score >= 30 : c.base >= 24;
+    // An intent boost alone is never enough: the FAQ must also share real words with the customer's question.
+    const confident = c.boost > 0 ? (c.score >= 30 && c.base >= 8) : c.base >= 24;
     if (!confident) continue;
     if (senderId && faqConflictsWithTopic(c.faq, senderId)) continue;
+    // A FAQ linked to one product is sent only when that product is the current topic (or the customer named it).
+    const linkedProduct = faqLinkedProduct(c.faq);
+    if (linkedProduct) {
+      const linkedCat = getProductCategoryKey(linkedProduct);
+      const allowed = (topicNow.product && String(topicNow.product.id) === String(linkedProduct.id))
+        || (namedNow && String(namedNow.id) === String(linkedProduct.id))
+        || (!topicNow.product && linkedCat && (topicNow.category === linkedCat || categoriesNow.includes(linkedCat)));
+      if (!allowed) continue;
+    }
     if (intent === 'price') {
       const topicProduct = getCurrentTopic(senderId).product || findExactProduct(query);
       if (faqPriceLooksStale(c.faq, topicProduct)) continue;
@@ -354,7 +389,7 @@ function findBestFaqMatch(query, senderId) {
 function faqPriceLooksStale(faq, product) {
   if (!product || product.price === undefined || product.price === null || String(product.price).trim() === '') return false;
   const answerRaw = String(faq?.answer || '');
-  const named = findExactProduct(answerRaw);
+  const named = findExactProduct(answerRaw, false);
   if (!named || String(named.id) !== String(product.id)) return false;
   const answer = bnToEnDigits(answerRaw).replace(/,/g, '');
   const price = bnToEnDigits(String(product.price)).replace(/,/g, '').trim();
@@ -388,7 +423,7 @@ function catalogProductForUrl(url) {
 //  - Only an explicit product name or category name (Fog Light, Headlight, Angel Wings) switches the topic.
 // -----------------------------------------------------------------------------
 const PRODUCT_CATEGORY_RULES = [
-  { key: 'angelwings', label: 'Angel Wings', pattern: /(?:angel\s*wings?|angle\s*wings?|এঞ্জেল\s*উইংস?|এঙ্গেল\s*উইংস?|অ্যাঞ্জেল\s*উইংস?|এঞ্জেলউইং)/i },
+  { key: 'angelwings', label: 'Angel Wings', pattern: /(?:angel\s*(?:s\s*)?wings?|angle\s*wings?|এঞ্জেল\s*উইংস?|এঙ্গেল\s*উইংস?|অ্যাঞ্জেল\s*উইংস?|এঞ্জেলউইং)/i },
   { key: 'foglight', label: 'Fog Light', pattern: /(?:fog\s*(?:lights?|lamps?)|foglights?|foglamps?|ফগ\s*(?:লাইট|ল্যাম্প)|ফগলাইট)/i },
   { key: 'headlight', label: 'Headlight', pattern: /(?:head\s*(?:lights?|lamps?)|headlights?|headlamps?|হেড\s*(?:লাইট|ল্যাম্প)|হেডলাইট)/i }
 ];
@@ -477,7 +512,7 @@ function faqConflictsWithTopic(faq, senderId) {
   if (faqIsForOtherTopic(faq, topic)) return true;
   const answer = String(faq?.answer || '');
   const faqText = [faq?.question, faq?.q, faq?.category, ...(Array.isArray(faq?.keywords) ? faq.keywords : [faq?.keywords]), answer].filter(Boolean).join(' ');
-  const namedProduct = findExactProduct(answer);
+  const namedProduct = findExactProduct(answer, false);
   if (topic.product && namedProduct && String(namedProduct.id) !== String(topic.product.id)) return true;
   const faqCategories = detectCategoryKeys(faqText);
   if (topic.category && faqCategories.length && !faqCategories.includes(topic.category)) return true;
@@ -517,7 +552,7 @@ function resolveConversationTopic(text, senderId) {
 // FAQ answers use allowSwitch:false because a general FAQ can mention another product incidentally.
 function syncActiveProductFromReply(senderId, replyText, options = {}) {
   if (!senderId || !String(replyText || '').trim()) return;
-  const named = findExactProduct(replyText);
+  const named = findExactProduct(replyText, false);
   if (!named) return;
   const active = findActiveProduct(senderId);
   if (active && String(active.id) === String(named.id)) return;
@@ -759,13 +794,53 @@ const GENERIC_PRODUCT_IDENTIFIERS = new Set([
   'bulb','led','projector','angel wings','angle wings','picture','pic','photo','image','video','reel',
   'লাইট','হেডলাইট','হেড লাইট','বাল্ব','প্রজেক্টর','ফগ লাইট','ছবি','ফটো','ভিডিও','দাম','price'
 ].map(normalizeText));
-function getProductIdentifiers(p) {
+function getProductIdentifiers(p, useAuto = false) {
   const aliases = (Array.isArray(p.aliases) ? p.aliases : []).filter(alias => !GENERIC_PRODUCT_IDENTIFIERS.has(normalizeText(alias)));
-  return [p.name,p.id,p.sku,p.model,...aliases].filter(Boolean).map(normalizeText).filter(Boolean);
+  const list = [p.name,p.id,p.sku,p.model,...aliases];
+  if (useAuto) list.push(...getAutoAliases(p));
+  return list.filter(Boolean).map(normalizeText).filter(Boolean);
 }
-function findExactProduct(query) {
+// Short customer-style names generated from the catalog itself ("১২ লেন্স", "ডানা লাইট", "devil eye"...).
+// An auto alias is used only if it belongs to exactly ONE product and is not made of generic words only.
+const AUTO_ALIAS_NOISE = new Set(['বাইক','ও','কার','এবং','and','for','motorcycle','bike','car','led','এলইডি','light','lights','লাইট','ফোগ','fog','spotlight','স্পটলাইট','projector','প্রজেক্টর','headlight','হেডলাইট','with','উইথ','এর','the','a','of','universal','mini','মিনি','বাইকের','গাড়ির'].map(normalizeText));
+let autoAliasCache = { key: null, map: new Map() };
+function autoAliasUseful(alias) {
+  if (!alias || alias.length < 4 || alias.length > 60 || GENERIC_PRODUCT_IDENTIFIERS.has(alias)) return false;
+  const rest = alias.split(' ').filter(w => w && !AUTO_ALIAS_NOISE.has(w));
+  return rest.join('').length >= 3;
+}
+function rebuildAutoAliases(key) {
+  const perProduct = new Map(), counts = new Map();
+  for (const p of products) {
+    const set = new Set(), add = value => { const a = normalizeText(value); if (autoAliasUseful(a)) set.add(a); };
+    const name = String(p.name || '');
+    for (const seg of name.split(/[,()\/]/)) add(seg);
+    const lens = bnToEnDigits(name).match(/(\d{1,2})\s*(?:লেন্স|lens)/i);
+    if (lens) {
+      const en = lens[1], bn = String(en).replace(/\d/g, d => '০১২৩৪৫৬৭৮৯'[Number(d)]);
+      for (const a of [`${en} lens`, `${en} লেন্স`, `${bn} লেন্স`, `${bn} lens`]) set.add(normalizeText(a));
+    }
+    for (const kw of [...(Array.isArray(p.keywords) ? p.keywords : []), ...(Array.isArray(p.tags) ? p.tags : [])]) {
+      const a = normalizeText(String(kw).replace(/_/g, ' '));
+      if (a.includes(' ') && a.length >= 8) add(a);
+    }
+    perProduct.set(String(p.id), set);
+    for (const a of set) counts.set(a, (counts.get(a) || 0) + 1);
+  }
+  const map = new Map();
+  for (const [id, set] of perProduct) map.set(id, [...set].filter(a => counts.get(a) === 1));
+  autoAliasCache = { key, map };
+}
+function getAutoAliases(p) {
+  const key = `${catalogMeta.lastSyncAt}|${products.length}`;
+  if (autoAliasCache.key !== key) rebuildAutoAliases(key);
+  return autoAliasCache.map.get(String(p.id)) || [];
+}
+// useAuto=true (default) is for the CUSTOMER's own words. Use false for bot/FAQ text, so a casual mention
+// such as "12/5 Lens Fog Lights" in an answer can never change the active product.
+function findExactProduct(query, useAuto = true) {
   const q = normalizeText(query); if (!q) return null;
-  const matches = products.filter(p => getProductIdentifiers(p).some(name => name.length >= 3 && (` ${q} `).includes(` ${name} `)));
+  const matches = products.filter(p => getProductIdentifiers(p, useAuto).some(name => name.length >= 3 && (` ${q} `).includes(` ${name} `)));
   return matches.length === 1 ? matches[0] : null;
 }
 function findProductFromRecentContext(senderId) {
@@ -803,7 +878,7 @@ function buildSmartBillReply(product, quantity, deliveryFee) {
   if(!product || !Number.isFinite(unit) || unit<0 || String(product.price??'').trim()==='')return `দুঃখিত, ${product?.name||'এই পণ্য'}-এর নির্ভরযোগ্য মূল্য ক্যাটালগে নেই, তাই সঠিক বিল হিসাব করা যাচ্ছে না।`;
   const subtotal=unit*quantity;
   if(deliveryFee===null)return `${product.name} × ${quantity} = ${subtotal} টাকা। ডেলিভারি চার্জ ও সর্বমোট হিসাব করতে আপনার ডেলিভারি এলাকা/জেলার নাম বলুন।`;
-  return `স্মার্ট বিল\nপণ্য: ${product.name}\nএকক মূল্য: ${unit} টাকা × ${quantity} = ${subtotal} টাকা\nডেলিভারি: ${deliveryFee} টাকা\nসর্বমোট: ${subtotal+deliveryFee} টাকা`;
+  return `স্মার্ট বিল\nপণ্য: ${product.name}\nএকক মূল্য: ${unit} টাকা × ${quantity} = ${subtotal} টাকা\nডেলিভারি: ${deliveryFee === 0 ? 'ফ্রি' : deliveryFee + ' টাকা'}\nসর্বমোট: ${subtotal+deliveryFee} টাকা`;
 }
 function isFacebookLink(url) { try { const u = new URL(url); return u.protocol === 'https:' && (u.hostname === 'facebook.com' || u.hostname.endsWith('.facebook.com') || u.hostname === 'fb.watch'); } catch (_) { return false; } }
 function getProductMediaUrls(p, type) { const media = p?.media; return media && Array.isArray(media[type]) ? media[type].filter(url => typeof url === 'string' && isFacebookLink(url)) : []; }
@@ -1011,10 +1086,11 @@ function isVehicleHeadlightFitmentInquiry(currentText='', recentContext='') {
 // -----------------------------------------------------------------------------
 function isExplicitOrderIntent(text='') {
   const t = normalizeText(text);
+  if (/\b(?:korbo|nibo|nebo|kinbo|dibo)\s*na\b|\bna\s*(?:korbo|nibo|nebo)\b/i.test(t)) return false;
   if (/(?:করব|করবো|কিনব|কিনবো|নেব|নিব|নিতে)\s*না|অর্ডার\s*(?:করব|করবো)?\s*না|not\s+(?:buy|order)|don't\s+(?:buy|order)|do not\s+(?:buy|order)/i.test(t)) return false;
   // "কিভাবে অর্ডার করব?" / "where can I buy" are questions, not an order.
   if (/কিভাবে|কীভাবে|কোথায়|কোথা\s*থেকে|how\s+(?:to|can|do)|where\s+(?:can|to|do)/i.test(t) && !/(?:করতে\s*চাই|করে\s*দিন|কনফার্ম|পাঠিয়ে\s*দিন)/i.test(t)) return false;
-  return /\b(i want to order|place my order|order this|i will buy|i want to buy|confirm my order|i want this|send it to me)\b|অর্ডার\s*করতে\s*চাই|অর্ডার\s*করব|অর্ডার\s*করবো|অর্ডার\s*দিন|পাঠিয়ে\s*দিন|অর্ডার\s*করে\s*দিন|অর্ডার\s*দিতে\s*চাই|অর্ডার\s*কনফার্ম|কিনতে\s*চাই|কিনব|কিনবো|নিতে\s*চাই|নিব|নেব|কিনে\s*নেব|কিনে\s*নিব/i.test(t);
+  return BANGLISH_ORDER_RE.test(t) || /\b(i want to order|place my order|order this|i will buy|i want to buy|confirm my order|i want this|send it to me)\b|অর্ডার\s*করতে\s*চাই|অর্ডার\s*করব|অর্ডার\s*করবো|অর্ডার\s*দিন|পাঠিয়ে\s*দিন|অর্ডার\s*করে\s*দিন|অর্ডার\s*দিতে\s*চাই|অর্ডার\s*কনফার্ম|কিনতে\s*চাই|কিনব|কিনবো|নিতে\s*চাই|নিব|নেব|কিনে\s*নেব|কিনে\s*নিব/i.test(t);
 }
 function isYes(text='') { return /^(?:জি\s*)?(?:হ্যাঁ|হ্যা|হা|জি|জ্বি|রাজি|সম্মতি|সম্মতি দিচ্ছি|ঠিক আছে|করুন|দেন|অবশ্যই|yes|yeah|yep|y|ok|okay|sure|i agree|agree)(?:\s*(?:জি|ভাই|করুন|দেন|please))?$/i.test(simpleReply(text)); }
 function isNo(text='') { return /^(?:না|nah|nope|no|n|থাক|রাজি নই|সম্মতি নেই|করবেন না|করব না|করবো না|নিবো না|নেব না|কিনব না|কিনবো না|অর্ডার করব না|অর্ডার করবো না|লাগবে না|দরকার নেই|no thanks|not now|don't|do not)(?:\s|$)/i.test(simpleReply(text)); }
@@ -1045,7 +1121,11 @@ const BD_PLACES_BN = ['ঢাকা','গাজীপুর','নারায়
 const BD_PLACES_EN = ['dhaka','gazipur','narayanganj','narsingdi','tangail','chattogram','chittagong','sylhet','rajshahi','khulna','barisal','barishal','rangpur','mymensingh','comilla','cumilla','bogra','bogura','jessore','jashore','cox\'s bazar'];
 const BD_PLACE_RE = new RegExp(`${BD_PLACES_BN.join('|')}|\\b(?:${BD_PLACES_EN.join('|')})\\b`, 'i');
 const ADDRESS_LANDMARK_RE = /(উপজেলা|থানা|গ্রাম|রোড|\broad\b|বাসা|বাড়ি|বাড়ী|ওয়ার্ড|\bward\b|লেন|\blane\b|মহল্লা|বাজার|হাউজ|\bhouse\b|ব্লক|\bblock\b|সেক্টর|\bsector\b|পোস্ট\s*অফিস|ইউনিয়ন|\bunion\b|ডাকঘর|মোড়|পাড়া|সড়ক|এভিনিউ|\bavenue\b|ফ্ল্যাট|\bflat\b|এলাকা)/i;
-function cleanAddress(value) { return String(value || '').trim().replace(/[।.!?]+$/, '').trim().slice(0, 220); }
+function cleanAddress(value) {
+  return String(value || '').trim()
+    .replace(/[\s,،:;-]*(?:মোবাইল(?:\s*(?:নম্বর|নাম্বার|নং))?|ফোন(?:\s*(?:নম্বর|নাম্বার|নং))?|নম্বর|নাম্বার|mobile(?:\s*(?:number|no\.?))?|phone(?:\s*(?:number|no\.?))?|number|cell)[\s:：-]*$/i, '')
+    .replace(/[।.!?,]+$/, '').trim().slice(0, 220);
+}
 // Works when the phone number is in the SAME message (the phone is removed first), accepts Bangla digits,
 // and ignores questions such as "রাজশাহীতে মোট বিল কত".
 function extractAddress(text='') {
@@ -1077,13 +1157,23 @@ function customerHasOrder(senderId) { const id=String(senderId||''); return db.o
 function cancelFollowup(senderId) { const id=String(senderId||''); const timer=followupTimers.get(id); if(timer)clearTimeout(timer); followupTimers.delete(id); if(db.scheduledFollowups[id]){delete db.scheduledFollowups[id];saveStorage();} }
 function getTakeoverState(customerId) {
   if(!customerId)return !!db.isGlobalPaused; const id=String(customerId).trim(); if(db.isGlobalPaused)return true;
-  if(db.takeovers[id]&&typeof db.takeovers[id].isPaused==='boolean')return db.takeovers[id].isPaused;
+  const t=db.takeovers[id];
+  if(t&&typeof t.isPaused==='boolean'){
+    if(t.isPaused&&t.expiresAt&&Date.now()>Number(t.expiresAt)){ // a timed pause (a human replied from Page Inbox) has ended: the AI resumes by itself
+      const stamp=new Date().toISOString();
+      db.takeovers[id]={isPaused:false,reason:'Auto-resume: human-reply pause ended',timestamp:stamp};
+      if(db.customers[id])Object.assign(db.customers[id],{isPaused:false,takeover:false,takeoverUpdatedAt:stamp});
+      saveStorage(); return false;
+    }
+    return t.isPaused;
+  }
   if(db.customers[id]&&typeof db.customers[id].takeover==='boolean')return db.customers[id].takeover;
   return false;
 }
-async function setTakeoverState(customerId, enabled, reasonStr) {
+async function setTakeoverState(customerId, enabled, reasonStr, options = {}) {
   if(!customerId)return false; const id=String(customerId).trim(), on=Boolean(enabled), timestamp=new Date().toISOString();
-  db.takeovers[id]={isPaused:on,reason:reasonStr||(on?'Human takeover':'Admin resumed AI'),timestamp};
+  const expiresAt=on&&Number(options?.expiresInMs)>0?Date.now()+Number(options.expiresInMs):null;
+  db.takeovers[id]={isPaused:on,reason:reasonStr||(on?'Human takeover':'Admin resumed AI'),timestamp,...(expiresAt?{expiresAt}:{})};
   ensureCustomer(id);
   Object.assign(db.customers[id],{isPaused:on,takeover:on,takeoverUpdatedAt:timestamp});
   if(on)cancelFollowup(id); saveStorage(); return on;
@@ -1101,8 +1191,21 @@ function splitForMessenger(text, limit) {
 }
 // Messenger sends plain text, so Markdown links are converted before delivery (kept from v5).
 // [https://x.com](https://x.com) -> https://x.com ; [Watch](https://x.com/v) -> Watch: https://x.com/v
-function normalizeMessengerLinks(text = '') {
+function stripMessengerMarkdown(text = '') {
   return String(text || '')
+    .replace(/\*\*([^*\n]+?)\*\*/g, '$1')
+    .replace(/(^|\s)__([^_\n]+?)__(?=\s|$|[.,!?।])/g, '$1$2')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/\*\*/g, '');
+}
+function rememberSentMid(mid) {
+  if (!mid) return;
+  botSentMids.set(String(mid), Date.now());
+  if (botSentMids.size > 3000) { const cutoff = Date.now() - 3600000; for (const [k, v] of botSentMids) if (v < cutoff) botSentMids.delete(k); }
+}
+function normalizeMessengerLinks(text = '') {
+  return stripMessengerMarkdown(String(text || ''))
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gi, (match, label, url) => {
       const cleanLabel = String(label || '').trim(), cleanUrl = String(url || '').trim();
       if (!cleanLabel || cleanLabel === cleanUrl) return cleanUrl;
@@ -1113,7 +1216,7 @@ function normalizeMessengerLinks(text = '') {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
-async function sendFacebookMessage(recipientId, text) {
+async function sendFacebookMessage(recipientId, text, opts = {}) {
   if (evalCapture) { evalCapture.push({ to: recipientId, text: normalizeMessengerLinks(text) }); return true; }
   if(!PAGE_ACCESS_TOKEN){console.error('[Messenger] PAGE_ACCESS_TOKEN missing');return false;}
   const finalText=normalizeMessengerLinks(text); if(!finalText)return false;
@@ -1121,7 +1224,8 @@ async function sendFacebookMessage(recipientId, text) {
     const url=`https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
     // Long texts are split into several messages instead of being silently dropped.
     for (const part of splitForMessenger(finalText, MAX_MESSENGER_TEXT_LENGTH - 100)) {
-      const response=await axios.post(url,{recipient:{id:recipientId},message:{text:part},messaging_type:'RESPONSE'},{timeout:15000});
+      const response=await axios.post(url,{recipient:{id:recipientId},message:{text:part,metadata:opts.metadata||BOT_ECHO_METADATA},messaging_type:'RESPONSE'},{timeout:15000});
+      rememberSentMid(response.data?.message_id);
       const isConfusion = /প্রশ্নটা বুঝতে সমস্যা|বুঝতে সমস্যা হচ্ছে|প্রশ্নটি বুঝতে পারিনি|কোন পণ্যের কথা হচ্ছে তা শনাক্ত করতে পারিনি|পণ্যের নাম\/মডেল বা ছবি পাঠান/i.test(String(part));
       if (!isConfusion) {
         appendHistory(recipientId,'assistant',part);
@@ -1169,31 +1273,142 @@ function createMessengerOrder(senderId, draft, messageId) {
   const id=String(senderId||'').trim(); if(!id)throw new Error('Customer sender ID is required');
   if(messageId){const existing=db.orders.find(o=>o.sourceMessageId===messageId);if(existing)return {order:existing,created:false};}
   const customer=db.customers[id]||{}, product=draft.product;
-  const quantity=Math.max(1,Number(draft.quantity)||1), unitPrice=Number(product?.price), hasPrice=product?.price!==undefined&&product?.price!==null&&String(product.price).trim()!==''&&Number.isFinite(unitPrice)&&unitPrice>=0, subtotal=hasPrice?unitPrice*quantity:null, deliveryFee=getDeliveryFee(draft.address||customer.address||''), total=subtotal!==null&&deliveryFee!==null?subtotal+deliveryFee:null;
+  const quantity=Math.max(1,Number(draft.quantity)||1), unitPrice=Number(product?.price), hasPrice=product?.price!==undefined&&product?.price!==null&&String(product.price).trim()!==''&&Number.isFinite(unitPrice)&&unitPrice>=0, subtotal=hasPrice?unitPrice*quantity:null, deliveryFee=isFreeDeliveryProduct(product)?0:getDeliveryFee(draft.address||customer.address||''), total=subtotal!==null&&deliveryFee!==null?subtotal+deliveryFee:null;
   const order={id:'order_'+crypto.randomUUID(),senderId:id,customerId:id,customerName:customer.name||`Customer ${id.slice(-4)}`,customerPhone:draft.phone||customer.phone||null,customerAddress:draft.address||customer.address||null,productId:product?.id||null,productName:product?.name||null,productPrice:product?.price??null,quantity,subtotal,deliveryFee,total,billingCurrency:'BDT',customerMessage:draft.customerMessage||'',source:'MESSENGER',sourceMessageId:messageId||null,status:'PENDING_CONFIRMATION',humanTakeover:true,createdAt:new Date().toISOString()};
   db.orders.push(order); ensureCustomer(id);
   db.customers[id].lastOrderId=order.id;db.customers[id].lastOrderAt=order.createdAt;db.customers[id].phone=order.customerPhone;db.customers[id].address=order.customerAddress;cancelFollowup(id);saveStorage();return {order,created:true};
 }
-async function handleOrderFlow(senderId, text, messageId) {
-  // MANUAL ORDER REVIEW MODE:
-  // Never collect phone/address, never create an order automatically, and never hand over automatically.
-  // Clear legacy drafts from older deployments so stale drafts cannot re-trigger the old prompt loop.
-  const id = String(senderId || '');
-  if (!id) return false;
-  delete db.orderDrafts[id];
-  delete db.pendingHandover[id];
-  cancelFollowup(id);
-  saveStorage();
-
-  const customerText = String(text || '').trim();
-  const product = identifyOrderedProduct(id, customerText) || findActiveProduct(id);
-  const productName = product?.name ? `\u201c${product.name}\u201d` : 'আপনার পছন্দের পণ্যটি';
-  await sendFacebookMessage(
-    id,
-    `ধন্যবাদ! 😊 ${productName} অর্ডার করার আগ্রহটি জানানো হয়েছে। অর্ডারটি আমি স্বয়ংক্রিয়ভাবে জমা দিচ্ছি না—আমরা ম্যানুয়ালি পণ্য, দাম ও স্টক যাচাই করব। আপাতত এখানে ফোন নম্বর বা ঠিকানা দেওয়ার প্রয়োজন নেই। 🏍️`
-  );
+// ---- v13 order flow --------------------------------------------------------------------------------
+// When a customer wants to order (or asks how to order) the bot asks, ONCE and in plain words, for the full address
+// and a mobile number (exactly what the FAQ tells customers). No repeated prompts: reminders only list what is still
+// missing and stop after a few tries. When both are received the order is saved and a human takes over.
+const ORDER_DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
+const BANGLISH_ORDER_RE = /\border\s*(?:korte|korbo|kori|dibo|dite|nibo|nite|chai|cai|cacchi|chacchi|chacci|chaichi|korchi|dilam)\b|\b(?:nibo|nebo|kinbo|kinte\s*chai|kinte\s*cai|nite\s*chai|nite\s*cai|nite\s*cacchi|kinte\s*cacchi)\b|অর্ডার\s*(?:করতে\s*)?(?:চাচ্ছি|চাইছি)|(?:নিতে|কিনতে)\s*(?:চাচ্ছি|চাইছি)|অর্ডার\s*(?:দিব|দিবো|দেব|দিচ্ছি)/i;
+const HOWTO_WORDS_RE = /(?:কিভাবে|কীভাবে|কিভাবেই|কোথায়|কোথা\s*থেকে|kivabe|kibhabe|ki\s*vabe|kemne|kemon\s*kore|how\s+(?:to|can|do|should)|where\s+(?:can|to|do))/i;
+const ORDER_WORDS_RE = /(?:অর্ডার|order|ordar|কিনতে|কিনব|কিনবো|কিনি|কেনা|kinbo|kinte|নিতে|নিব|নিবো|buy|purchase)/i;
+function isHowToOrderQuestion(text = '') {
+  const t = normalizeText(text);
+  return HOWTO_WORDS_RE.test(t) && ORDER_WORDS_RE.test(t);
+}
+function getOrderDraft(senderId) {
+  const id = String(senderId || ''), d = db.orderDrafts[id];
+  if (!d) return null;
+  if (!d.stage || Date.now() - Number(d.updatedAt || d.startedAt || 0) > ORDER_DRAFT_TTL_MS) { delete db.orderDrafts[id]; return null; } // legacy/expired drafts are dropped
+  return d;
+}
+function shortProductName(p) {
+  const n = String(p?.name || '').replace(/[\u200b-\u200d\u2060\ufeff]/g, '').trim();
+  const first = n.split(/[,(\/]/)[0].trim();
+  return first.length >= 3 ? first : n;
+}
+function productNeedsVariantChoice(p) {
+  const text = [p?.shortDescription, p?.description, ...(Array.isArray(p?.features) ? p.features : []), ...(Array.isArray(p?.specifications) ? p.specifications : [])].join(' ');
+  return /কালার|রং|color|colour|ভ্যারিয়েন্ট|variant/i.test(text);
+}
+function paymentNote() {
+  const pay = catalogExtras?.payment;
+  if (pay && String(pay.method || '').toUpperCase() === 'CASH_ON_DELIVERY' && pay.advanceRequired === false) return 'পেমেন্ট ক্যাশ অন ডেলিভারি—অগ্রিম কোনো টাকা লাগবে না।';
+  return '';
+}
+// A product is delivered free when the catalog says so (freeDelivery:true) or a FAQ linked to that product says free delivery.
+function isFreeDeliveryProduct(p) {
+  if (!p) return false;
+  if (p.freeDelivery === true || String(p.freeDelivery).toLowerCase() === 'true') return true;
+  return faqs.some(f => String(f?.productId ?? '') === String(p.id)
+    && /ডেলিভারি|delivery/i.test(String(f.question || f.q || ''))
+    && /ফ্রি|ফ্রী|free/i.test(String(f.answer || ''))
+    && !/^\s*(?:না|no)\b/i.test(String(f.answer || '')));
+}
+async function finalizeOrder(id, draft, product, text, messageId) {
+  const customer = ensureCustomer(id);
+  if (draft.phone) customer.phone = draft.phone;
+  if (draft.address) customer.address = draft.address;
+  rememberActiveProduct(id, product);
+  const { order, created } = createMessengerOrder(id, {
+    product, quantity: draft.quantity || 1, phone: draft.phone, address: draft.address,
+    customerMessage: (draft.notes || []).join(' | ') || text
+  }, messageId);
+  delete db.orderDrafts[id]; delete db.pendingHandover[id];
+  await setTakeoverState(id, true, 'Order details received (address + mobile number)');
+  if (!created) return true; // same webhook message processed twice: never confirm twice
+  const fee = order.deliveryFee === 0 ? 'ফ্রি' : (order.deliveryFee === null || order.deliveryFee === undefined ? 'ঠিকানা অনুযায়ী' : `${order.deliveryFee} টাকা`);
+  const lines = ['ধন্যবাদ! আপনার অর্ডারের তথ্য পেয়েছি। ✅', `পণ্য: ${shortProductName(product)} × ${order.quantity}`];
+  if (order.subtotal !== null && order.subtotal !== undefined) lines.push(`মূল্য: ${order.subtotal} টাকা | ডেলিভারি: ${fee}${order.total !== null && order.total !== undefined ? ` | সর্বমোট: ${order.total} টাকা` : ''}`);
+  lines.push(`ঠিকানা: ${order.customerAddress}`, `মোবাইল: ${order.customerPhone}`, `আমাদের প্রতিনিধি শীঘ্রই যোগাযোগ করে অর্ডারটি নিশ্চিত করবেন। প্রয়োজনে কল করুন: ${HELPLINE}`);
+  await sendFacebookMessage(id, lines.join('\n'));
   return true;
 }
+async function handleOrderFlow(senderId, text, messageId) {
+  const id = String(senderId || '');
+  if (!id) return false;
+  const customerText = String(text || '').normalize('NFKC').trim();
+  const c = ensureCustomer(id), now = Date.now();
+  c.lastOrderIntentAt = new Date(now).toISOString();
+  delete db.pendingHandover[id];
+  cancelFollowup(id);
+  let draft = getOrderDraft(id);
+  if (!draft) draft = db.orderDrafts[id] = { stage: 'choose_product', startedAt: now, updatedAt: now, productId: null, quantity: null, phone: null, address: null, notes: [], prompts: 0, lastPromptAt: 0 };
+  draft.updatedAt = now;
+  const phoneBefore = Boolean(draft.phone);
+
+  // 1) Which product? The code decides from the live catalog (explicit name > current topic); it never guesses.
+  const topic = resolveConversationTopic(customerText, id);
+  const product = topic.product || identifyOrderedProduct(id, customerText) || findActiveProduct(id);
+  if (!product) {
+    draft.stage = 'choose_product';
+    if (draft.prompts >= 3) {
+      if (!draft.escalated) { draft.escalated = true; saveStorage(); await askHandoverConsent(id, 'Customer wants to order but the product is unclear'); }
+      return true;
+    }
+    draft.prompts += 1; draft.lastPromptAt = now; saveStorage();
+    const choices = (topic.categoryProducts && topic.categoryProducts.length ? topic.categoryProducts : products).slice(0, 6);
+    const list = choices.map((p, i) => `${toBnDigitsSafe(i + 1)}) ${shortProductName(p)}`).join('\n');
+    await sendFacebookMessage(id, `ধন্যবাদ! 😊 কোন পণ্যটি অর্ডার করতে চান? পণ্যের নাম লিখুন বা পণ্যের ছবি পাঠান:\n${list}`);
+    return true;
+  }
+
+  // 2) Collect what the customer sent in this message.
+  draft.productId = String(product.id); draft.stage = 'awaiting_details';
+  const qty = extractQuantity(customerText); if (qty) draft.quantity = qty;
+  const phone = extractPhone(customerText); if (phone) draft.phone = phone;
+  let address = extractAddress(customerText);
+  if (!address && phoneBefore && !phone) { // we already asked for the address: accept a plain address line
+    const free = stripPhones(customerText);
+    if (free.length >= 8 && !looksLikeQuestion(free) && !isNo(free) && !isExplicitOrderIntent(free) && !isHowToOrderQuestion(free)) address = cleanAddress(free);
+  }
+  if (address) draft.address = address;
+  if (customerText && customerText.length <= 300) draft.notes = [...(draft.notes || []), customerText.slice(0, 300)].slice(-5);
+  saveStorage();
+  if (draft.phone && draft.address) return finalizeOrder(id, draft, product, customerText, messageId);
+
+  // 3) Ask for what is still missing (anti-loop: first full prompt, then short reminders, then hand over to a person).
+  if (draft.prompts >= 4) {
+    if (!draft.escalated) { draft.escalated = true; saveStorage(); await askHandoverConsent(id, 'Order details still incomplete'); }
+    return true;
+  }
+  const first = draft.prompts === 0;
+  draft.prompts += 1; draft.lastPromptAt = now; saveStorage();
+  const needAddress = !draft.address, needPhone = !draft.phone;
+  if (!first) {
+    const need = [needAddress ? 'সম্পূর্ণ ঠিকানা' : '', needPhone ? 'সচল মোবাইল নম্বর' : ''].filter(Boolean).join(' ও ');
+    await sendFacebookMessage(id, `ঠিক আছে! অর্ডারটি সম্পন্ন করতে এখন শুধু ${need} পাঠান। 😊`);
+    return true;
+  }
+  const hasPrice = product.price !== undefined && product.price !== null && String(product.price).trim() !== '';
+  const items = [];
+  if (needAddress) items.push('সম্পূর্ণ ঠিকানা (জেলা ও থানা/উপজেলাসহ)');
+  if (needPhone) items.push('সচল মোবাইল নম্বর');
+  if (!draft.quantity) items.push(`কতটি নেবেন${productNeedsVariantChoice(product) ? ' এবং পছন্দের কালার/ভ্যারিয়েন্ট' : ''} (না জানালে ১টি ধরা হবে)`);
+  const lines = [
+    `ধন্যবাদ! 😊 আপনি “${shortProductName(product)}”${hasPrice ? ` (দাম ${product.price} টাকা)` : ''} অর্ডার করতে চাচ্ছেন।`,
+    'অর্ডার নিশ্চিত করতে এই তথ্যগুলো এক মেসেজে পাঠান:',
+    ...items.map((x, i) => `${toBnDigitsSafe(i + 1)}) ${x}`)
+  ];
+  const pay = paymentNote(); if (pay) lines.push(pay);
+  await sendFacebookMessage(id, lines.join('\n'));
+  return true;
+}
+function toBnDigitsSafe(n) { return String(n).replace(/\d/g, d => '০১২৩৪৫৬৭৮৯'[Number(d)]); }
 
 // -----------------------------------------------------------------------------
 // Follow-up scheduler
@@ -1338,11 +1553,11 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
     : 'পূর্ববর্তী কথোপকথন নেই।';
   return `আপনি ImpoTech BD ফেসবুক পেজের অত্যন্ত পেশাদার, স্মার্ট ও সাহায্যকারী কাস্টমার সাপোর্ট এজেন্ট।
 হেল্পলাইন: ${HELPLINE}; WhatsApp: ${WHATSAPP_NUMBER}; ঠিকানা: ভাওয়াল গড়, ভবানীপুর, জয়দেবপুর, গাজীপুর।
-ডেলিভারি চার্জ: গাজীপুরের ভেতরে ৫০ টাকা, গাজীপুরের বাইরে ১০০ টাকা।
+ডেলিভারি চার্জ: গাজীপুরের ভেতরে ৫০ টাকা, গাজীপুরের বাইরে ১০০ টাকা (যে পণ্যের FAQ/ক্যাটালগে ফ্রি ডেলিভারি লেখা আছে সেটি ব্যতিক্রম)।
 
 কঠোর কনভার্সেশনাল নিয়ম:
 ১) প্রশ্ন বনাম অর্ডার: গ্রাহক স্পষ্টভাবে অর্ডার করার ইচ্ছা না জানানো পর্যন্ত কখনো ফোন নম্বর, ডেলিভারি ঠিকানা বা ব্যক্তিগত তথ্য চাইবে না। পণ্যের বিবরণ, দাম, স্টক, ছবি/ভিডিও, বাইকের মডেল, ফিটমেন্ট বা ডেলিভারি চার্জের প্রশ্নের সরাসরি উত্তর দেবে। শুধু “দাম কত”, “ফিট হবে?”, “ছবি দিন” বা “ডেলিভারি চার্জ কত” বললে অর্ডার শুরু করবে না।
-২) অর্ডার (ম্যানুয়াল যাচাই): গ্রাহক “অর্ডার করতে চাই”, “পাঠিয়ে দিন”, “কিনব/নেব” বা সমার্থক স্পষ্ট ইচ্ছা জানালে সংক্ষিপ্তভাবে ধন্যবাদ জানাবে এবং বলবে যে ImpoTech টিম পণ্য, দাম ও স্টক ম্যানুয়ালি যাচাই করবে। ফোন নম্বর/ঠিকানা চাইবে না, অর্ডার draft তৈরি করবে না, অর্ডার নিজে থেকে জমা/কনফার্ম করবে না, এবং একই অর্ডার-বার্তা বারবার পাঠাবে না। পুরোনো সংরক্ষিত orderDraft থাকলে সেটি মুছে দিয়ে এই নতুন নিয়মে ফিরবে। গ্রাহক নিজে তথ্য দিলে স্বাভাবিক কথোপকথনে উত্তর দেবে; সেই কারণে অর্ডার-লুপ শুরু করবে না।
+২) অর্ডার: গ্রাহক “অর্ডার করতে চাই”, “Order korte cacchi”, “কিনব/নেব” বা “কিভাবে অর্ডার করব” জানালে সিস্টেম নিজেই (কোড) পণ্য নিশ্চিত করে ঠিকানা ও সচল মোবাইল নম্বর চেয়ে নেয় এবং অর্ডার সংরক্ষণ করে। আপনার কাছে এমন বার্তা এলে FAQ/ক্যাটালগের নির্দেশনা (ঠিকানা ও সচল মোবাইল নম্বর পাঠাতে বলা; ক্যাশ অন ডেলিভারি) অনুসরণ করবেন—“ম্যানুয়ালি যাচাই করে যোগাযোগ করবে” বলে শেষ করবেন না। কোন পণ্য অর্ডার হবে অস্পষ্ট হলে আগে পণ্যটি জিজ্ঞেস করবেন। অর্ডার নিজে কনফার্ম/জমা দেবেন না। একই তথ্য বারবার চাইবেন না।
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
 ৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। নিচে দেওয়া “প্রাসঙ্গিক পণ্য” ও “FAQ” অংশই সর্বশেষ ও সঠিক তথ্য। কথোপকথনের ইতিহাসে বা মেমোরিতে আগে বলা দাম, স্টক, অফার, ওয়ারেন্টি বা বিবরণ নিচের ক্যাটালগের সাথে না মিললে ক্যাটালগের তথ্যই সঠিক; পুরোনো তথ্য কখনো পুনরাবৃত্তি করবে না। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। গ্রাহক আলো/কোয়ালিটি/দেখতে কেমন জানতে চাইলে ক্যাটালগে ভিডিও বা ছবির লিংক থাকলে আগে সেটি দেবে। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
@@ -1555,7 +1770,7 @@ async function generateAIResponse(customerText, attachments = [], senderId, inco
 - গ্রাহক শুধু “কি”, “এটা কী”, “এইটা কী আছে” বললেও ছবিটিকে বর্ণনা করে সঠিক ক্যাটালগ পণ্য শনাক্ত করুন; অকারণে আগের পণ্যের বর্ণনা পুনরাবৃত্তি বা অর্ডারের প্রশ্ন করবেন না।` : '';
   const outputContract = `
 
-আউটপুট ফরম্যাট বাধ্যতামূলক: বৈধ JSON object দিন, Markdown code fence নয়। ফিল্ড: "reply" (গ্রাহককে পাঠানোর সংক্ষিপ্ত উত্তর), "productId" (নিচের LIVE catalog product ID থেকে একটি string, না মিললে null), "imageDescription" (ছবিতে দৃশ্যমান বস্তু/রং/আকৃতি/লেখার সংক্ষিপ্ত বর্ণনা; ছবি না থাকলে খালি string), "confidence" (0 থেকে 1)। customer reply-তে JSON বা metadata দেখাবেন না। পণ্য নির্বাচন কেবল নিচের ক্যাটালগ থেকে করবেন; আন্দাজ করে ID বানাবেন না।
+আউটপুট ফরম্যাট বাধ্যতামূলক: বৈধ JSON object দিন, Markdown code fence নয়। ফিল্ড: "reply" (গ্রাহককে পাঠানোর সংক্ষিপ্ত উত্তর), "productId" (নিচের LIVE catalog product ID থেকে একটি string, না মিললে null), "imageDescription" (ছবিতে দৃশ্যমান বস্তু/রং/আকৃতি/লেখার সংক্ষিপ্ত বর্ণনা; ছবি না থাকলে খালি string), "confidence" (0 থেকে 1)। customer reply-তে JSON বা metadata দেখাবেন না। আউটপুট শুধু একটি JSON object হবে (আগে/পরে কোনো লেখা নয়)। "reply"-তে Markdown চিহ্ন (** বা #) ব্যবহার করবেন না—শুধু সাধারণ টেক্সট ও ইমোজি। "reply"-তে শুধু গ্রাহকের জিজ্ঞাসা করা/ছবিতে শনাক্ত একটি পণ্যের তথ্য ও দাম দেবেন, অন্য পণ্যের দাম বা তথ্য মেশাবেন না। পণ্য নির্বাচন কেবল নিচের ক্যাটালগ থেকে করবেন; আন্দাজ করে ID বানাবেন না।
 LIVE catalog choices: ${catalogChoicesText}
 বর্তমান পণ্য থাকলে সাধারণ text follow-up-এ সেটিই রাখুন। তবে নতুন ছবি এলে ছবিকে অগ্রাধিকার দিন: ছবিতে নতুন পণ্য ক্যাটালগে মিলে গেলে সেটিই নির্বাচন করুন এবং আগের পণ্যকে ধরে রাখবেন না। গ্রাহক যদি শুধু রং জিজ্ঞেস করেন এবং নতুন ছবি না থাকে, বর্তমান পণ্য ধরে উত্তর দিন। ছবি বুঝতে না পারলে মিথ্যা শনাক্তকরণ করবেন না।${visualPriorityRule}`;
   const system = systemBase + outputContract;
@@ -1589,7 +1804,8 @@ LIVE catalog choices: ${catalogChoicesText}
     console.warn('[AI] Structured output parse failed; using plain response.');
   }
 
-  const reply = String(parsed?.reply || raw).trim();
+  if (!parsed) parsed = salvageStructuredFields(raw);
+  const reply = stripMessengerMarkdown(String(parsed?.reply || raw).trim());
   const imageDescription = String(parsed?.imageDescription || '').trim().slice(0, 500);
   const selectedId = parsed?.productId == null ? '' : String(parsed.productId);
   let selectedProduct = selectedId ? products.find(p => String(p.id) === selectedId) : null;
@@ -1599,16 +1815,32 @@ LIVE catalog choices: ${catalogChoicesText}
   // This allows a clearly named new product to switch, but avoids syncing an old hallucinated name
   // back over a different product selected from the current image.
   if (hasImages && !selectedProduct) {
-    const mentioned = findExactProduct(reply);
+    const mentioned = findExactProduct(reply, false);
     if (mentioned && (!previousActive || String(mentioned.id) !== String(previousActive.id))) {
       selectedProduct = mentioned;
+    }
+  }
+  // Safe fallback when the model gave no usable productId: the picture/answer names ONE category that has ONE product
+  // (or a lens count such as "12 lens" that singles out one product). Never guesses between several products.
+  if (hasImages && !selectedProduct) {
+    const hint = `${imageDescription} ${reply}`;
+    const cats = detectCategoryKeys(hint);
+    if (cats.length === 1) {
+      const inCategory = getProductsByExplicitCategory(cats[0]);
+      if (inCategory.length === 1) selectedProduct = inCategory[0];
+      else if (inCategory.length > 1) {
+        const lens = bnToEnDigits(hint).match(/(\d{1,2})\s*(?:লেন্স|lens)/i);
+        const byLens = lens ? inCategory.filter(p => new RegExp(`(?:^|\\D)${lens[1]}\\s*(?:লেন্স|lens)`, 'i').test(bnToEnDigits(String(p.name || '')))) : [];
+        if (byLens.length === 1) selectedProduct = byLens[0];
+      }
     }
   }
 
   if (selectedProduct) {
     // A newly attached image is an explicit context boundary; catalog-validated selection wins
     // even if a previous activeProductId already exists.
-    if (hasImages || !previousActive || String(previousActive.id) !== String(selectedProduct.id)) {
+    // On text-only turns the model may only fill an EMPTY topic; switching products is done by the code from the customer's own words.
+    if (hasImages || !previousActive) {
       rememberActiveProduct(senderId, selectedProduct);
     }
   } else if (!hasImages) {
@@ -1622,6 +1854,8 @@ LIVE catalog choices: ${catalogChoicesText}
     delete c.activeCategory;
     delete c.activeCategoryUpdatedAt;
     saveStorage();
+    const hintCategories = detectCategoryKeys(`${imageDescription} ${reply}`);
+    if (hintCategories.length === 1) setActiveCategory(senderId, hintCategories[0]);
   }
 
   // Store image description + catalog match in the current user-history entry and durable DB
@@ -1696,16 +1930,21 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       console.log(`[Handover] Cleared stale consent prompt for ${id}; processing new message normally`);
     }
     // Explicit refusal during an order draft cancels it and stops all detail requests.
-    if (db.orderDrafts[id] && isNo(customerText)) {
+    if (getOrderDraft(id) && isNo(customerText)) {
       delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
       await sendFacebookMessage(id, 'ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।');
       return;
     }
     if(isCriticalHandoverQuestion(customerText)){await askHandoverConsent(id,'Critical customer issue');return;}
 
-    const inDraft = Boolean(db.orderDrafts[id]);
-    const orderIntent = isExplicitOrderIntent(customerText);
-    const enteringOrderDetails = inDraft && Boolean(extractPhone(customerText) || extractAddress(customerText));
+    const orderDraft = getOrderDraft(id);
+    const inDraft = Boolean(orderDraft);
+    // "Order korte cacchi", "অর্ডার করতে চাই" and also "কিভাবে অর্ডার করব?" all start the same address + phone request.
+    const orderIntent = isExplicitOrderIntent(customerText) || isHowToOrderQuestion(customerText);
+    const draftWantsAddressLine = Boolean(orderDraft && orderDraft.stage === 'awaiting_details' && orderDraft.phone && !orderDraft.address
+      && !looksLikeQuestion(customerText) && stripPhones(customerText).length >= 8 && !isNo(customerText));
+    const enteringOrderDetails = inDraft && (Boolean(extractPhone(customerText) || extractAddress(customerText)) || draftWantsAddressLine);
+    const pickingDraftProduct = Boolean(orderDraft && orderDraft.stage === 'choose_product' && findActiveProduct(id));
     if (!enteringOrderDetails) {
       // 1) Explicit photo / video request: always for the CURRENT product/category.
       const hasIncomingImage = attachments.some(x => x.type === 'image' && x.payload?.url);
@@ -1720,12 +1959,16 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); markServed(id, resolveConversationTopic(customerText, id).product, ['videos','images']); return; }
       }
       // 3) FAQ: sent verbatim only if it clearly matches and does not belong to another product/category.
-      const matchedFaq = orderIntent ? null : findBestFaqMatch(customerText, id);
+      // A pure price question is answered from the live catalog (next step), never from a FAQ; a message with a new image is answered by image analysis.
+      const pureCatalogPriceQuestion = isPriceQuestion(customerText) && !/ফিচার|বৈশিষ্ট্য|বিবরণ|স্পেস|পাওয়ার|ওয়াট|লুমেন|ওয়ারেন্টি|গ্যারান্টি|ডেলিভারি|feature|spec|detail|warranty|power|lumen|delivery/i.test(customerText);
+      const matchedFaq = (orderIntent || hasIncomingImage || pureCatalogPriceQuestion) ? null : findBestFaqMatch(customerText, id);
       if (matchedFaq) {
         const faqAnswer = String(matchedFaq.answer || '').trim();
         if (faqAnswer) {
           console.log(`[FAQ] Direct FAQ match for ${id}; category=${matchedFaq.category || 'unspecified'}`);
           await sendFacebookMessage(id, faqAnswer);
+          const faqProduct = faqLinkedProduct(matchedFaq);
+          if (faqProduct && !findActiveProduct(id)) rememberActiveProduct(id, faqProduct); // the FAQ was about this product: remember it
           syncActiveProductFromReply(id, faqAnswer, { allowSwitch: false });
           return;
         }
@@ -1751,14 +1994,14 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         return;
       }
       // 6) Smart billing from live catalog prices.
-      if (isBillingQuestion(customerText)) {
+      if (!hasIncomingImage && isBillingQuestion(customerText)) {
         const context = getRecentConversationText(id, customerText), draft = db.orderDrafts[id] || {};
         const topic = resolveConversationTopic(customerText, id);
-        const p = topic.product || draft.product || findExactProduct(context);
+        const p = topic.product || draft.product || findExactProduct(context, false);
         if (p) {
           const quantity = extractQuantity(customerText) || Number(draft.quantity) || extractQuantity(context) || 1;
           const area = extractAddress(customerText) || (BD_PLACE_RE.test(customerText) ? customerText : '') || draft.address || db.customers[id]?.address || extractAddress(context) || '';
-          await sendFacebookMessage(id, limitToFiveLines(buildSmartBillReply(p, quantity, getDeliveryFee(area))));
+          await sendFacebookMessage(id, limitToFiveLines(buildSmartBillReply(p, quantity, isFreeDeliveryProduct(p) ? 0 : getDeliveryFee(area))));
           return;
         }
         const list = topic.categoryProducts.length ? '\n' + topic.categoryProducts.map((x, i) => `${i + 1}. ${x.name}`).join('\n') : '';
@@ -1766,7 +2009,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         return;
       }
       // 7) Price from the live catalog for the current product/category.
-      if (!orderIntent && isPriceQuestion(customerText)) {
+      if (!orderIntent && !hasIncomingImage && isPriceQuestion(customerText)) {
         const topic = resolveConversationTopic(customerText, id);
         if (topic.product) {
           await sendFacebookMessage(id, getPriceReply(topic.product) || `দুঃখিত, ${topic.product.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই।`);
@@ -1781,8 +2024,8 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         return;
       }
     }
-    // Manual-only order mode: clear any legacy draft and give one non-repeating acknowledgement.
-    if (db.orderDrafts[id] || orderIntent) {
+    // Order flow: ask for address + mobile number once, then save the order (see handleOrderFlow).
+    if (orderIntent || enteringOrderDetails || pickingDraftProduct) {
       await handleOrderFlow(id, customerText, messageId);
       return;
     }
@@ -1793,6 +2036,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
     }
     let reply=await generateAIResponse(customerText,attachments,id,messageId);
     if(!reply)throw new Error('AI returned empty response');
+    reply = guardSingleProductReply(reply, customerText, id); // never mix in another product's details/price
     if (reply.split('\n').some(isMediaOfferLine)) {
       if (customerAskedMediaBefore(id) && !alreadyServedMedia(id) && await sendCurrentMedia(id)) return;
       reply = reply.split('\n').filter(l => !isMediaOfferLine(l)).join('\n').trim()
@@ -1868,8 +2112,16 @@ async function handleIncomingMessage({ senderId, text: rawText, attachments, mes
   if (!c.introSent) { c.introSent = true; saveStorage(); await sendFacebookMessage(senderId, FIRST_CONTACT_INTRO); }
 
   // Automatic human takeover: phone + full address are known (they may arrive in separate messages, in any order).
-  if (!db.orderDrafts[senderId] && ((c.phone && completeAddress && (phone || address)) || (AUTO_HANDOVER_ON_PHONE_ONLY && phone))) {
+  if (!getOrderDraft(senderId) && ((c.phone && completeAddress && (phone || address)) || (AUTO_HANDOVER_ON_PHONE_ONLY && phone))) {
     const both = Boolean(c.phone && completeAddress);
+    // The customer is giving contact details after asking to order (e.g. after the FAQ "send address + mobile"): save the order too.
+    const intentFresh = c.lastOrderIntentAt && Date.now() - new Date(c.lastOrderIntentAt).getTime() < ORDER_DRAFT_TTL_MS;
+    const recentOrder = c.lastOrderAt && Date.now() - new Date(c.lastOrderAt).getTime() < 10 * 60 * 1000;
+    const topicProduct = findActiveProduct(senderId);
+    if (both && intentFresh && topicProduct && !recentOrder) {
+      await finalizeOrder(senderId, { phone: c.phone, address: c.address, quantity: extractQuantity(text) || 1, notes: [text] }, topicProduct, text, messageId || null);
+      return;
+    }
     await setTakeoverState(senderId, true, both ? 'Customer provided phone number and full address' : 'Customer provided phone number');
     await sendFacebookMessage(senderId, `আপনার ফোন নম্বর ${both ? 'ও সম্পূর্ণ ঠিকানা ' : ''}পেয়েছি। বিষয়টি আমাদের প্রতিনিধি টিমের কাছে হস্তান্তর করা হয়েছে। প্রয়োজনে কল করুন: ${HELPLINE}`);
     return;
@@ -1885,9 +2137,9 @@ async function handleIncomingMessage({ senderId, text: rawText, attachments, mes
     await sendFacebookMessage(senderId, `আপনার জন্য Human takeover চালু করা হয়েছে। দ্রুত সহায়তার জন্য সরাসরি কল করুন: ${HELPLINE}`);
     return;
   }
-  const humanRequest = normalizeText(text);
-  if (/^(?:প্রতিনিধি|human|agent|human agent|কাস্টমার কেয়ার|customer care)$/.test(humanRequest) || /প্রতিনিধির\s*সাথে|প্রতিনিধির\s*সঙ্গে|talk\s*to\s*(?:a\s*)?(?:human|agent|person)|real\s*person/.test(humanRequest)) {
-    await askHandoverConsent(senderId, 'Customer requested representative'); return;
+  if (isHumanRequest(normalizeText(text))) {
+    // The customer explicitly asked for a person: no extra consent question, hand over right away.
+    await transferToHuman(senderId, 'Customer asked for a human representative'); return;
   }
   await processCustomerMessage(senderId, text, attachments, messageId || null);
 }
@@ -1903,6 +2155,61 @@ function verifyMetaSignature(req) {
   const a = Buffer.from(sig), b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+// ---- v13: human takeover helpers ---------------------------------------------------------------
+const HUMAN_REQUEST_ONLY_RE = /^(?:প্রতিনিধি|human|agent|human agent|কাস্টমার কেয়ার|customer care|real person)$/i;
+const HUMAN_REQUEST_RE = /প্রতিনিধি(?:র|কে)?\s*(?:সাথে|সঙ্গে)?\s*(?:কথা|যোগাযোগ)|প্রতিনিধি\s*(?:চাই|দিন|দেন|লাগবে)|(?:মানুষ|এজেন্ট|হিউম্যান)(?:ের|এর)?\s*(?:সাথে|সঙ্গে)\s*কথা|(?:talk|speak|connect|chat)\s*(?:to|with)\s*(?:a\s*|an\s*|the\s*|your\s*)?(?:human|agent|person|representative|someone|manager)|real\s*person|human\s*agent|customer\s*care\s*(?:er\s*)?(?:sathe|shathe)?|(?:manush|agent|representative)\s*(?:er|r)?\s*(?:sathe|shathe)\s*kotha/i;
+function isHumanRequest(normalized = '') { return HUMAN_REQUEST_ONLY_RE.test(normalized) || HUMAN_REQUEST_RE.test(normalized); }
+async function handlePageEcho(event, message) {
+  try {
+    const customerId = String(event?.recipient?.id || '');
+    if (!customerId || !message) return;
+    const meta = String(message.metadata || '');
+    if (meta.startsWith('IMPOTECH_')) return;                         // sent by this server (bot or admin app)
+    if (message.mid && botSentMids.has(String(message.mid))) return;  // sent by this server
+    const text = String(message.text || '').normalize('NFKC').trim();
+    const command = normalizeText(text).replace(/\s+/g, '');
+    if (['.human','.stop','.pause'].includes(command)) { await setTakeoverState(customerId, true, `Admin chat command ${command}`); console.log(`[Takeover] Admin enabled human takeover for ${customerId} via ${command}`); return; }
+    if (['.ai','.resume'].includes(command)) { delete db.pendingHandover[customerId]; await setTakeoverState(customerId, false, `Admin chat command ${command}`); console.log(`[Takeover] Admin resumed AI for ${customerId} via ${command}`); return; }
+    if (!AUTO_TAKEOVER_ON_ADMIN_REPLY || db.isGlobalPaused) return;
+    if (text && HUMAN_ECHO_IGNORE_RE && HUMAN_ECHO_IGNORE_RE.test(text)) return;  // Page automation (welcome greeting), not a person
+    const c = db.customers[customerId];
+    if (c?.firstContactAt && Date.now() - Number(c.firstContactAt) < HUMAN_ECHO_IGNORE_NEW_MS) return; // instant greeting for a brand-new customer
+    const existing = db.takeovers[customerId];
+    if (existing?.isPaused && !existing.expiresAt && getTakeoverState(customerId)) return; // already paused until an admin resumes
+    await setTakeoverState(customerId, true, 'Human agent replied from Page Inbox', { expiresInMs: HUMAN_REPLY_PAUSE_MS });
+    console.log(`[Takeover] Human reply detected for ${customerId}; AI paused${HUMAN_REPLY_PAUSE_MS ? ` for ${Math.round(HUMAN_REPLY_PAUSE_MS / 60000)} min` : ' until .ai'}`);
+  } catch (err) { console.error('[Takeover] Echo handling failed:', err.message); }
+}
+// ---- v13: keep the answer about ONE product ----------------------------------------------------
+const COMPARISON_RE = /তুলনা|compare|কোনটা\s*ভালো|কোনটি\s*ভালো|কোনটা\s*নিব|অন্য\s*(?:কোন|কি|কী)|আর\s*(?:কি|কী)|কী\s*কী\s*(?:পণ্য|আইটেম|লাইট)|কি\s*কি\s*(?:পণ্য|আইটেম|লাইট)|সব\s*(?:পণ্য|আইটেম|লাইট)|পণ্যের\s*তালিকা|product\s*list|all\s*products|options|অপশন|বিকল্প/i;
+function guardSingleProductReply(reply, customerText, senderId) {
+  try {
+    const keep = getCurrentTopic(senderId).product;
+    if (!keep || !reply || COMPARISON_RE.test(String(customerText || ''))) return reply;
+    const idsOf = p => getProductIdentifiers(p, true).filter(x => x.length >= 4);
+    const keepIds = idsOf(keep), others = products.filter(p => String(p.id) !== String(keep.id)).map(idsOf);
+    const kept = String(reply).split('\n').filter(line => {
+      const n = ` ${normalizeText(line)} `;
+      const mentionsKeep = keepIds.some(x => n.includes(` ${x} `));
+      const mentionsOther = others.some(ids => ids.some(x => n.includes(` ${x} `)));
+      return !(mentionsOther && !mentionsKeep); // drop lines that talk only about another product
+    });
+    return kept.join('\n').trim() || reply;
+  } catch (_) { return reply; }
+}
+// The model sometimes answers in plain text instead of JSON: recover reply/productId when a JSON-like fragment exists.
+function salvageStructuredFields(raw) {
+  const s = String(raw || '');
+  const grab = key => {
+    const m = s.match(new RegExp('"' + key + '"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*"|null|[0-9.]+)', 'i'));
+    if (!m) return undefined;
+    try { return JSON.parse(m[1]); } catch (_) { return undefined; }
+  };
+  const reply = grab('reply'), productId = grab('productId'), imageDescription = grab('imageDescription'), confidence = grab('confidence');
+  if (reply === undefined && productId === undefined) return null;
+  return { reply, productId, imageDescription, confidence };
+}
+
 app.get('/webhook',(req,res)=>{const mode=req.query['hub.mode'],token=req.query['hub.verify_token'],challenge=req.query['hub.challenge'];if(mode==='subscribe'&&VERIFY_TOKEN&&token===VERIFY_TOKEN)return res.status(200).send(challenge);return res.sendStatus(403);});
 app.post('/webhook',async(req,res)=>{
   if (!verifyMetaSignature(req)) { console.warn('[Webhook] Invalid signature; request rejected'); return res.sendStatus(403); }
@@ -1926,48 +2233,8 @@ app.post('/webhook',async(req,res)=>{
     if(req.body?.object!=='page')return;
     for(const entry of req.body.entry||[])for(const event of entry.messaging||[]) {
       const senderId=event.sender?.id,message=event.message,messageId=message?.mid,receivedAt=Date.now();
-      // Meta Click-to-Messenger attribution can arrive on the first message, postback, or referral event.
-      // Preserve the first known paid-ad attribution; later messages without referral must not erase it.
-      if (senderId) {
-        const referral = message?.referral || event.referral || event.postback?.referral || event.referral?.referral || null;
-        const adContext = referral?.ads_context_data || {};
-        const adId = referral?.ad_id || adContext?.ad_id || null;
-        const refCode = referral?.ref || null;
-        if (referral && (adId || refCode || adContext?.ad_title || adContext?.photo_url)) {
-          const id = String(senderId), previous = db.campaignAttribution[id] || {};
-          const attribution = {
-            senderId: id,
-            source: referral.source || previous.source || 'UNKNOWN',
-            type: referral.type || previous.type || null,
-            adId: adId ? String(adId) : (previous.adId || null),
-            ref: refCode || previous.ref || null,
-            adTitle: adContext.ad_title || previous.adTitle || null,
-            photoUrl: adContext.photo_url || previous.photoUrl || null,
-            firstCapturedAt: previous.firstCapturedAt || new Date().toISOString(),
-            lastCapturedAt: new Date().toISOString(),
-            campaignName: previous.campaignName || null,
-            attributionStatus: adId ? 'AD_ID_CAPTURED' : 'REFERRAL_CAPTURED'
-          };
-          db.campaignAttribution[id] = attribution;
-          if (db.customers[id]) db.customers[id].campaignAttribution = attribution;
-          saveStorage();
-          console.log(`[Attribution] Messenger referral captured for ${id}; adId=${attribution.adId || 'unknown'}`);
-        }
-      }
-      // Admin/page message echoes can control takeover for the customer thread.
-      if (message?.is_echo && message?.text && event.recipient?.id) {
-        const echoCommand = normalizeText(message.text).replace(/\s+/g, '');
-        const targetCustomerId = String(event.recipient.id);
-        if (['.human','.stop','.pause'].includes(echoCommand)) {
-          await setTakeoverState(targetCustomerId, true, `Admin chat command ${echoCommand}`);
-          console.log(`[Takeover] Admin enabled human takeover for ${targetCustomerId} via ${echoCommand}`);
-        } else if (['.ai','.resume'].includes(echoCommand)) {
-          delete db.pendingHandover[targetCustomerId];
-          await setTakeoverState(targetCustomerId, false, `Admin chat command ${echoCommand}`);
-          console.log(`[Takeover] Admin resumed AI for ${targetCustomerId} via ${echoCommand}`);
-        }
-        continue;
-      }
+      // Page echoes: this server's own messages are ignored; a human reply from Page Inbox / Business Suite pauses the bot.
+      if (message?.is_echo) { await handlePageEcho(event, message); continue; }
       if(event.call && senderId) {
         await setTakeoverState(senderId,true,'Incoming Messenger call event'); // takeover is immediate, the reply follows the delay
         enqueueCustomerTask(senderId, async () => {
@@ -2031,19 +2298,6 @@ app.get('/api/customers/:senderId/status',(req,res)=>{const id=String(req.params
 app.post('/api/customers/:senderId/takeover/enable',async(req,res)=>{await setTakeoverState(req.params.senderId,true,req.body?.reason||'Enabled from admin chat');res.json({success:true,senderId:req.params.senderId,takeover:true,isPaused:true});});
 app.post('/api/customers/:senderId/takeover/disable',async(req,res)=>{await setTakeoverState(req.params.senderId,false,req.body?.reason||'Disabled from admin chat');res.json({success:true,senderId:req.params.senderId,takeover:false,isPaused:false});});
 app.get('/api/customers',(req,res)=>{const list=Object.values(db.customers).map(c=>({senderId:c.id,displayName:c.name||`Customer ${String(c.id).slice(-4)}`,phone:c.phone||null,address:c.address||null,lastMessageText:c.lastMessageText||null,lastMessageAt:c.lastActive||null,messageCount:c.messageCount||0,lastOrderId:c.lastOrderId||null,lastOrderAt:c.lastOrderAt||null,takeover:getTakeoverState(c.id),isPaused:getTakeoverState(c.id),takeoverReason:db.takeovers[c.id]?.reason||null,takeoverUpdatedAt:db.takeovers[c.id]?.timestamp||null,memoryUpdatedAt:c.lastMemoryUpdatedAt||null,activeProductName:findActiveProduct(c.id)?.name||null,activeCategory:getActiveCategory(c.id)}));res.json({success:true,total:list.length,data:list});});
-app.get('/api/campaign-attribution', (req,res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
-  const rows = Object.values(db.campaignAttribution || {}).map(a => {
-    const c = db.customers[String(a.senderId)] || {};
-    return { ...a, displayName: c.name || `Customer ${String(a.senderId).slice(-4)}`, lastMessageText: c.lastMessageText || null, lastActive: c.lastActive || null, messageCount: c.messageCount || 0, takeover: getTakeoverState(a.senderId) };
-  }).sort((a,b) => new Date(b.lastCapturedAt || b.firstCapturedAt || 0) - new Date(a.lastCapturedAt || a.firstCapturedAt || 0)).slice(0,limit);
-  res.json({success:true,total:Object.keys(db.campaignAttribution || {}).length,data:rows, note:'Meta webhook referral data may not include campaign name; adId can be mapped to campaign via Meta Marketing API if permissions are configured.'});
-});
-app.get('/api/campaign-attribution/:senderId', (req,res) => {
-  const id = String(req.params.senderId), attribution = (db.campaignAttribution || {})[id];
-  if (!attribution) return res.status(404).json({success:false,message:'No campaign referral data captured for this customer'});
-  res.json({success:true,attribution,customer:db.customers[id] || null});
-});
 app.get('/api/customers/:senderId/memory',(req,res)=>res.json({success:true,senderId:String(req.params.senderId),memory:db.customerMemory[String(req.params.senderId)]||null}));
 app.put('/api/customers/:senderId/memory',(req,res)=>{const id=String(req.params.senderId),body=req.body||{},m=getCustomerMemory(id);if(Array.isArray(body.facts))m.facts=body.facts.filter(x=>typeof x==='string').map(x=>x.trim()).filter(Boolean).slice(-30);if(Array.isArray(body.preferences))m.preferences=body.preferences.filter(x=>typeof x==='string').map(x=>x.trim()).filter(Boolean).slice(-20);if(typeof body.summary==='string')m.summary=body.summary.slice(0,3000);m.updatedAt=new Date().toISOString();saveStorage();res.json({success:true,senderId:id,memory:m});});
 app.get('/api/messages',(req,res)=>{const id=req.query.senderId?String(req.query.senderId):null,limit=Math.min(Math.max(Number(req.query.limit)||100,1),1000);let list=db.messages;if(id)list=list.filter(m=>String(m.senderId)===id);res.json({success:true,total:list.length,data:list.slice(-limit)});});
@@ -2052,19 +2306,7 @@ app.post('/api/orders',(req,res)=>{const o=req.body||{},id=String(o.senderId||o.
 app.get('/api/orders/:orderId',(req,res)=>{const o=db.orders.find(x=>String(x.id)===String(req.params.orderId));if(!o)return res.status(404).json({success:false,message:'Order not found'});res.json({success:true,order:o});});
 app.put('/api/orders/:orderId',(req,res)=>{const i=db.orders.findIndex(x=>String(x.id)===String(req.params.orderId));if(i<0)return res.status(404).json({success:false,message:'Order not found'});const old=db.orders[i];db.orders[i]={...old,...req.body,id:old.id,updatedAt:new Date().toISOString()};saveStorage();if(customerHasOrder(old.senderId||old.customerId))cancelFollowup(old.senderId||old.customerId);res.json({success:true,order:db.orders[i]});});
 app.delete('/api/orders/:orderId',(req,res)=>{const i=db.orders.findIndex(x=>String(x.id)===String(req.params.orderId));if(i<0)return res.status(404).json({success:false,message:'Order not found'});const o=db.orders.splice(i,1)[0];saveStorage();res.json({success:true,deleted:o.id});});
-app.post('/api/customers/:senderId/send',async(req,res)=>{const text=String(req.body?.text||'').trim();if(!text)return res.status(400).json({success:false,message:'Text required'});const sent=await sendFacebookMessage(req.params.senderId,text);if(!sent)return res.status(500).json({success:false,message:'Message sending failed'});res.json({success:true,message:'Message sent'});});
-
-app.get('/admin/campaign-tracking', (req,res) => {
-  res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ImpoTech Campaign Leads</title><style>
-  body{font:14px system-ui,Arial;margin:0;background:#f4f6fa;color:#172033}.wrap{max-width:1100px;margin:auto;padding:20px}h1{font-size:22px}.top{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.muted{color:#64748b}.pill{background:#e0f2fe;padding:4px 8px;border-radius:12px}.card{background:white;border-radius:12px;padding:14px;margin:12px 0;box-shadow:0 2px 12px #0f172a0d}.row{display:grid;grid-template-columns:1.2fr 1fr 1fr 1.5fr;gap:12px;align-items:start;border-top:1px solid #e5e7eb;padding:12px 0}.row:first-child{border-top:0}button{padding:9px 12px;border:0;border-radius:8px;background:#1d4ed8;color:white;cursor:pointer}.alert{position:fixed;right:20px;bottom:20px;background:#111827;color:white;padding:16px 18px;border-radius:12px;max-width:340px;box-shadow:0 8px 32px #0003;display:none}.alert button{background:#374151;margin-left:8px}@media(max-width:700px){.row{grid-template-columns:1fr 1fr}.wrap{padding:12px}}
-  </style></head><body><div class="wrap"><div class="top"><div><h1>ImpoTech Ad Campaign Leads</h1><div class="muted">Facebook Messenger referral attribution • auto-refresh every 15 seconds</div></div><div style="margin-left:auto"><button id="refresh">Refresh now</button> <button id="key">Set admin key</button></div></div><div class="card"><b id="total">Loading leads...</b><p class="muted">Campaign name is shown only when Meta supplies it or you map the captured Ad ID. Missing attribution is never guessed.</p><div id="rows"></div></div></div><div id="popup" class="alert"><b>New ad lead captured</b><div id="popupText" style="margin-top:8px"></div><div style="margin-top:12px;text-align:right"><button id="dismiss">Dismiss</button></div></div><script>
-  let known=new Set(),firstLoad=true;const keyName='impotech_campaign_admin_secret';
-  function getKey(){return sessionStorage.getItem(keyName)||''}function setKey(){const k=prompt('Enter ADMIN_SECRET (sent only to your protected API):');if(k!==null){sessionStorage.setItem(keyName,k);load()}}
-  async function load(){try{let r=await fetch('/api/campaign-attribution?limit=200',{headers:{'x-admin-secret':getKey()}});if(r.status===401||r.status===503){document.getElementById('total').textContent='Admin authentication required. Click “Set admin key”.';return}if(!r.ok)throw Error('HTTP '+r.status);let j=await r.json();document.getElementById('total').textContent=String(j.total)+' attributed Messenger lead(s)';document.getElementById('rows').innerHTML=j.data.map(a=>{let id=String(a.senderId);let name=esc(a.displayName||('Customer '+id.slice(-4)));let campaign=esc(a.campaignName||'Campaign name unavailable');let ad=esc(a.adTitle||'Ad title unavailable');let adid=esc(a.adId||'Ad ID unavailable');let status=esc(a.attributionStatus||'REFERRAL_CAPTURED');if(!firstLoad&&!known.has(id)){document.getElementById('popupText').textContent=name+' • '+campaign+' • '+adid;document.getElementById('popup').style.display='block'}known.add(id);return '<div class="row"><div><b>'+name+'</b><div class="muted">PSID: '+esc(id)+'</div><div class="muted">'+esc(a.firstCapturedAt||'')+'</div></div><div><span class="pill">'+status+'</span><div>'+campaign+'</div><div class="muted">'+ad+'</div></div><div><b>Ad ID</b><div>'+adid+'</div><div class="muted">Source: '+esc(a.source||'unknown')+' / '+esc(a.type||'unknown')+'</div></div><div>'+esc(a.lastMessageText||'No message text')+'<div class="muted">Messages: '+(Number(a.messageCount)||0)+'</div></div></div>'}).join('')||'<p class="muted">No Messenger ad referrals captured yet.</p>';firstLoad=false}catch(e){document.getElementById('total').textContent='Could not load leads: '+e.message}}
-  function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-  document.getElementById('refresh').onclick=load;document.getElementById('key').onclick=setKey;document.getElementById('dismiss').onclick=()=>document.getElementById('popup').style.display='none';if(!getKey())setTimeout(setKey,100);load();setInterval(load,15000);
-</script></body></html>`);
-});
+app.post('/api/customers/:senderId/send',async(req,res)=>{const text=String(req.body?.text||'').trim();if(!text)return res.status(400).json({success:false,message:'Text required'});const sent=await sendFacebookMessage(req.params.senderId,text,{metadata:ADMIN_ECHO_METADATA});if(!sent)return res.status(500).json({success:false,message:'Message sending failed'});res.json({success:true,message:'Message sent'});});
 
 // -----------------------------------------------------------------------------
 // Health and diagnostics
@@ -2230,7 +2472,9 @@ const SALES_AND_QUALITY_RULES = `
 ১০) আপত্তি মোকাবিলা: দাম বেশি মনে হলে দামের সাথে সুবিধা ও ওয়ারেন্টি উল্লেখ করুন; ক্যাটালগের বাইরে কোনো ছাড় বা অফার বানাবেন না। বিশ্বাস নিয়ে সন্দেহ থাকলে ক্যাটালগের তথ্য ও ওয়ারেন্টির শর্ত বলুন।
 ১১) মেজাজ: গ্রাহক বিরক্ত বা রাগী হলে ছোট, শান্ত ও ক্ষমাপ্রার্থী ভাষায় উত্তর দিন। তাড়াহুড়ো থাকলে সংক্ষিপ্ত উত্তর দিন। ধন্যবাদ বললে সুন্দরভাবে উত্তর দিয়ে প্রয়োজনে অর্ডারের আমন্ত্রণ জানান।
 ১২) নিশ্চয়তা: ক্যাটালগ বা FAQ-এ না থাকা তথ্য অনুমান করবেন না। বলুন যে তথ্যটি নিশ্চিতভাবে জানা নেই, প্রতিনিধি নিশ্চিত করবেন, এবং প্রয়োজনে হস্তান্তরের প্রস্তাব দিন।
-১৩) উত্তরের গঠন: প্রথমে সরাসরি উত্তর, তারপর প্রয়োজনে একটি পরিষ্কার পরবর্তী পদক্ষেপ। অপ্রাসঙ্গিক তথ্য নয়।`;
+১৩) উত্তরের গঠন: প্রথমে সরাসরি উত্তর, তারপর প্রয়োজনে একটি পরিষ্কার পরবর্তী পদক্ষেপ। অপ্রাসঙ্গিক তথ্য নয়।
+১৫) একক-পণ্য নিয়ম: গ্রাহক যে পণ্য সম্পর্কে জিজ্ঞেস করছেন (বা যে ছবি পাঠিয়েছেন) শুধু সেই পণ্যের দাম/তথ্য দেবেন। গ্রাহক নিজে তুলনা বা সব পণ্যের তালিকা না চাইলে অন্য কোনো পণ্যের নাম বা দাম একই উত্তরে লিখবেন না। "FAQ n | শুধু এই পণ্যের জন্য: …" লেবেলের FAQ শুধু ওই পণ্যের আলোচনায় ব্যবহার করবেন।
+১৬) সাধারণ টেক্সট: Messenger-এ Markdown দেখায় না; ** বা # ব্যবহার করবেন না।`;
 function buildSystemPrompt(relevantProducts, relevantFaqs, history, memoryContext, topicContext, analysis = null) {
   const base = buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryContext, topicContext);
   const facts = relevantProducts.length ? '\n\nপণ্যের বিস্তারিত স্পেসিফিকেশন (ক্যাটালগ):\n' + relevantProducts.map(p => `[${p.name}]\n${productFacts(p)}`).join('\n\n') : '';
