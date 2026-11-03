@@ -1,6 +1,9 @@
 /*
- * ImpoTech Messenger Bot — v13
- * Base: ImpoTech_MainCode_v12_FAQ_ProductLink (your current index.js).
+ * ImpoTech Messenger Bot — v14
+ * Base: ImpoTech_MainCode_v13_Order_Takeover_NoCampaign (+ the sslmode URL fix that was already in v13_SSL_Warning_Fix).
+ * v14 fixes: (a) bills no longer read "৬৫০ টাকা" as quantity 650 and take quantity/delivery area only from the customer's
+ *   own words; colloquial billing questions ("ডেলিভারি চার্জ মিলাই দাম কত") are handled as bills; (b) PostgreSQL SSL warning
+ *   removed for Neon/Render URLs + startup retry; (c) FAQ intent-boost needs real word overlap.
  * v13 changes:
  *  1) Only the product the customer asked about is answered/priced: price questions no longer fire an unrelated
  *     product FAQ, FAQs linked to another product are blocked, AI replies mentioning other products are trimmed,
@@ -120,9 +123,24 @@ const FIRST_CONTACT_INTRO = 'আমি ইমপোটেকের AI চ্য�
 if (!DATABASE_URL) {
   console.warn('[DB] DATABASE_URL/POSTGRES_URL is missing. PostgreSQL persistence is unavailable; server will use in-memory state only. Configure DATABASE_URL for durable storage.');
 }
+// Neon / Render URLs end with ?sslmode=require&channel_binding=require. node-postgres prints "SECURITY WARNING: The SSL modes
+// 'prefer', 'require', and 'verify-ca' are treated as aliases for 'verify-full'" for them (and would also override the ssl option
+// below), so those two URL parameters are removed and TLS is configured explicitly: the connection is always encrypted.
+// Set PG_SSL_REJECT_UNAUTHORIZED=true to also verify the server certificate (Neon certificates are valid).
+function sanitizePgUrl(url) {
+  const raw = String(url || '');
+  const q = raw.indexOf('?');
+  if (q < 0) return raw;
+  const kept = raw.slice(q + 1).split('&').filter(p => p && !/^(?:sslmode|channel_binding)=/i.test(p));
+  return kept.length ? `${raw.slice(0, q)}?${kept.join('&')}` : raw.slice(0, q);
+}
+const PG_URL_SSLMODE = (String(DATABASE_URL).match(/[?&]sslmode=([^&]+)/i) || [])[1] || '';
+const PG_SSL_OPTION = (process.env.PGSSLMODE === 'disable' || /^disable$/i.test(PG_URL_SSLMODE))
+  ? false
+  : { rejectUnauthorized: process.env.PG_SSL_REJECT_UNAUTHORIZED === 'true' };
 const pool = DATABASE_URL ? new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
+  connectionString: sanitizePgUrl(DATABASE_URL),
+  ssl: PG_SSL_OPTION,
   max: Number(process.env.PG_POOL_MAX) || 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000
@@ -228,7 +246,8 @@ function saveStorage() {
 function normalizeText(value = '') {
   return String(value ?? '').normalize('NFKC').toLowerCase()
     .replace(/[\u200b-\u200d\u2060\ufeff]/g, '')
-    .replace(/[^\p{L}\p{M}\p{N}\s৳$.-]/gu, ' ').replace(/\s+/g, ' ').trim();
+    .replace(/[^\p{L}\p{M}\p{N}\s৳$.-]/gu, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/ডিলিভারি/g, 'ডেলিভারি'); // common spelling variant: one form for every comparison
 }
 const STOPWORDS = new Set([
   'এর','এই','এটা','এটি','ওটা','ওই','সেই','কি','কী','কত','কতো','কেমন','কোন','কোনটা','কিভাবে','কীভাবে','হবে','হয়','হলে','আছে','নেই',
@@ -365,7 +384,7 @@ function findBestFaqMatch(query, senderId) {
   const categoriesNow = detectCategoryKeys(query);
   for (const c of candidates) {
     // An intent boost alone is never enough: the FAQ must also share real words with the customer's question.
-    const confident = c.boost > 0 ? (c.score >= 30 && c.base >= 8) : c.base >= 24;
+    const confident = c.boost > 0 ? (c.score >= 30 && c.base >= 16) : c.base >= 24;
     if (!confident) continue;
     if (senderId && faqConflictsWithTopic(c.faq, senderId)) continue;
     // A FAQ linked to one product is sent only when that product is the current topic (or the customer named it).
@@ -858,13 +877,27 @@ function getPriceReply(p) { return p && p.price !== undefined && p.price !== nul
 // Smart Billing: quote only from catalog prices and the published delivery rates.
 function isBillingQuestion(text='') {
   const t = normalizeText(bnToEnDigits(text));
-  return /মোট|সর্বমোট|বিল(?:িং)?(?:\s|$)|invoice|\bbill\b|\btotal\b|grand total|সব মিলিয়ে|quantity|পরিমাণ|কত\s*পড়বে|টি\s*কিনলে|(?:\d+|এক|দুই|তিন|চার|পাঁচ)\s*(?:পিস|টা|টি|pcs|pieces)\s*(?:নিলে|কিনলে|লাগলে)/i.test(t);
+  return /মোট|সর্বমোট|বিল(?:িং)?(?:\s|$)|invoice|\bbill\b|\btotal\b|grand total|সব মিলিয়ে|quantity|পরিমাণ|কত\s*পড়বে|টি\s*কিনলে|(?:\d+|এক|দুই|তিন|চার|পাঁচ)\s*(?:পিস|টা|টি|pcs|pieces)\s*(?:নিলে|কিনলে|লাগলে)|মিলাই|মিলিয়ে|মিলায়ে|(?:ডেলিভারি|কুরিয়ার)\s*(?:চার্জ|খরচ)?\s*(?:সহ|সাথে|যোগ|ধরে)|(?:সহ|সাথে)\s*(?:ডেলিভারি|কুরিয়ার)|delivery\s*(?:charge\s*)?(?:soho|shoho|include|included|including|with)/i.test(t);
 }
+// Quantity comes ONLY from what the customer typed. A number counts only when it is followed by a real unit word:
+// "২ পিস", "2 pcs", "৩টি", "২ জোড়া". "৬৫০ টাকা" is a price ("টা" is the start of "টাকা"), never a quantity.
+const MAX_ORDER_QTY = 50;
 function extractQuantity(text='') {
-  const t = bnToEnDigits(text);
-  const patterns=[/(?:পরিমাণ|quantity|qty|পিস|টি)\s*[:=]?\s*(\d{1,3})/i,/(\d{1,3})\s*(?:পিস|টি|টা|pcs|pieces)/i];
-  for(const re of patterns){const m=t.match(re);if(m){const n=Number(m[1]);if(Number.isInteger(n)&&n>=1&&n<=1000)return n;}}
+  const t = bnToEnDigits(String(text || '').normalize('NFKC'));
+  const unit = '(?:পিস|পিছ|টি|টা|খানা|জোড়া|জোড়|সেট|pcs?|pieces?|pairs?|sets?)(?![\\p{L}\\p{M}])';
+  const patterns = [
+    new RegExp('(?:পরিমাণ|quantity|qty)\\s*[:=]?\\s*(\\d{1,3})(?!\\d)'.normalize('NFKC'), 'iu'),
+    new RegExp(('(?<![\\d.,])(\\d{1,3})\\s*' + unit).normalize('NFKC'), 'iu')
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m) { const n = Number(m[1]); if (Number.isInteger(n) && n >= 1 && n <= 999) return n; }
+  }
   return null;
+}
+// Only the customer's own recent messages (never the bot's replies): used for billing quantity/area/product lookups.
+function getCustomerOnlyText(senderId, additionalText = '') {
+  return [...getHistory(senderId).filter(x => x.role === 'user').slice(-8).map(x => x.text), additionalText].filter(Boolean).join('\n');
 }
 function getDeliveryFee(addressOrText='') {
   const t=normalizeText(addressOrText);
@@ -873,12 +906,22 @@ function getDeliveryFee(addressOrText='') {
   // Published policy: Gazipur 50 BDT; any confirmed address outside Gazipur 100 BDT.
   return 100;
 }
-function buildSmartBillReply(product, quantity, deliveryFee) {
-  const unit=Number(product?.price);
-  if(!product || !Number.isFinite(unit) || unit<0 || String(product.price??'').trim()==='')return `দুঃখিত, ${product?.name||'এই পণ্য'}-এর নির্ভরযোগ্য মূল্য ক্যাটালগে নেই, তাই সঠিক বিল হিসাব করা যাচ্ছে না।`;
+function buildSmartBillReply(product, quantity, deliveryFee, opts = {}) {
+  const unit=Number(product?.price), name=shortProductName(product);
+  if(!product || !Number.isFinite(unit) || unit<0 || String(product.price??'').trim()==='')return `দুঃখিত, ${name||'এই পণ্য'}-এর নির্ভরযোগ্য মূল্য ক্যাটালগে নেই, তাই সঠিক বিল হিসাব করা যাচ্ছে না।`;
+  if(!Number.isInteger(quantity) || quantity<1 || quantity>MAX_ORDER_QTY)return `কতটি নিতে চান, সংখ্যাটি নিশ্চিত করে জানাবেন? (১ থেকে ${MAX_ORDER_QTY}-এর মধ্যে)`;
   const subtotal=unit*quantity;
-  if(deliveryFee===null)return `${product.name} × ${quantity} = ${subtotal} টাকা। ডেলিভারি চার্জ ও সর্বমোট হিসাব করতে আপনার ডেলিভারি এলাকা/জেলার নাম বলুন।`;
-  return `স্মার্ট বিল\nপণ্য: ${product.name}\nএকক মূল্য: ${unit} টাকা × ${quantity} = ${subtotal} টাকা\nডেলিভারি: ${deliveryFee === 0 ? 'ফ্রি' : deliveryFee + ' টাকা'}\nসর্বমোট: ${subtotal+deliveryFee} টাকা`;
+  const lines=['স্মার্ট বিল',`পণ্য: ${name}`,quantity===1?`মূল্য: ${unit} টাকা`:`মূল্য: ${unit} টাকা × ${quantity} = ${subtotal} টাকা`];
+  if(deliveryFee===null){ // area not known yet: show both published rates instead of guessing one
+    const inside=getDeliveryFee('গাজীপুর'), outside=getDeliveryFee('ঢাকা');
+    lines.push(`ডেলিভারি: গাজীপুরের ভেতরে ${inside} টাকা, বাইরে ${outside} টাকা`);
+    lines.push(`সর্বমোট: ${subtotal+inside} টাকা (গাজীপুরের ভেতরে) / ${subtotal+outside} টাকা (বাইরে)`);
+  } else {
+    lines.push(`ডেলিভারি: ${deliveryFee === 0 ? 'ফ্রি' : deliveryFee + ' টাকা'}`);
+    lines.push(`সর্বমোট: ${subtotal+deliveryFee} টাকা`);
+  }
+  if(opts.assumedQuantity)lines.push(`(পরিমাণ ${quantity}টি ধরা হয়েছে; বেশি নিলে জানান)`);
+  return lines.join('\n');
 }
 function isFacebookLink(url) { try { const u = new URL(url); return u.protocol === 'https:' && (u.hostname === 'facebook.com' || u.hostname.endsWith('.facebook.com') || u.hostname === 'fb.watch'); } catch (_) { return false; } }
 function getProductMediaUrls(p, type) { const media = p?.media; return media && Array.isArray(media[type]) ? media[type].filter(url => typeof url === 'string' && isFacebookLink(url)) : []; }
@@ -1273,7 +1316,7 @@ function createMessengerOrder(senderId, draft, messageId) {
   const id=String(senderId||'').trim(); if(!id)throw new Error('Customer sender ID is required');
   if(messageId){const existing=db.orders.find(o=>o.sourceMessageId===messageId);if(existing)return {order:existing,created:false};}
   const customer=db.customers[id]||{}, product=draft.product;
-  const quantity=Math.max(1,Number(draft.quantity)||1), unitPrice=Number(product?.price), hasPrice=product?.price!==undefined&&product?.price!==null&&String(product.price).trim()!==''&&Number.isFinite(unitPrice)&&unitPrice>=0, subtotal=hasPrice?unitPrice*quantity:null, deliveryFee=isFreeDeliveryProduct(product)?0:getDeliveryFee(draft.address||customer.address||''), total=subtotal!==null&&deliveryFee!==null?subtotal+deliveryFee:null;
+  const quantity=Math.min(MAX_ORDER_QTY,Math.max(1,Number(draft.quantity)||1)), unitPrice=Number(product?.price), hasPrice=product?.price!==undefined&&product?.price!==null&&String(product.price).trim()!==''&&Number.isFinite(unitPrice)&&unitPrice>=0, subtotal=hasPrice?unitPrice*quantity:null, deliveryFee=isFreeDeliveryProduct(product)?0:getDeliveryFee(draft.address||customer.address||''), total=subtotal!==null&&deliveryFee!==null?subtotal+deliveryFee:null;
   const order={id:'order_'+crypto.randomUUID(),senderId:id,customerId:id,customerName:customer.name||`Customer ${id.slice(-4)}`,customerPhone:draft.phone||customer.phone||null,customerAddress:draft.address||customer.address||null,productId:product?.id||null,productName:product?.name||null,productPrice:product?.price??null,quantity,subtotal,deliveryFee,total,billingCurrency:'BDT',customerMessage:draft.customerMessage||'',source:'MESSENGER',sourceMessageId:messageId||null,status:'PENDING_CONFIRMATION',humanTakeover:true,createdAt:new Date().toISOString()};
   db.orders.push(order); ensureCustomer(id);
   db.customers[id].lastOrderId=order.id;db.customers[id].lastOrderAt=order.createdAt;db.customers[id].phone=order.customerPhone;db.customers[id].address=order.customerAddress;cancelFollowup(id);saveStorage();return {order,created:true};
@@ -1369,7 +1412,9 @@ async function handleOrderFlow(senderId, text, messageId) {
 
   // 2) Collect what the customer sent in this message.
   draft.productId = String(product.id); draft.stage = 'awaiting_details';
-  const qty = extractQuantity(customerText); if (qty) draft.quantity = qty;
+  const qty = extractQuantity(customerText);
+  if (qty && qty > MAX_ORDER_QTY) { saveStorage(); await sendFacebookMessage(id, `আপনি ${qty}টি লিখেছেন—সংখ্যাটি ঠিক আছে কি? কতটি নিতে চান নিশ্চিত করে জানাবেন (১ থেকে ${MAX_ORDER_QTY}-এর মধ্যে)।`); return true; }
+  if (qty) draft.quantity = qty;
   const phone = extractPhone(customerText); if (phone) draft.phone = phone;
   let address = extractAddress(customerText);
   if (!address && phoneBefore && !phone) { // we already asked for the address: accept a plain address line
@@ -1961,7 +2006,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       // 3) FAQ: sent verbatim only if it clearly matches and does not belong to another product/category.
       // A pure price question is answered from the live catalog (next step), never from a FAQ; a message with a new image is answered by image analysis.
       const pureCatalogPriceQuestion = isPriceQuestion(customerText) && !/ফিচার|বৈশিষ্ট্য|বিবরণ|স্পেস|পাওয়ার|ওয়াট|লুমেন|ওয়ারেন্টি|গ্যারান্টি|ডেলিভারি|feature|spec|detail|warranty|power|lumen|delivery/i.test(customerText);
-      const matchedFaq = (orderIntent || hasIncomingImage || pureCatalogPriceQuestion) ? null : findBestFaqMatch(customerText, id);
+      const matchedFaq = (orderIntent || hasIncomingImage || pureCatalogPriceQuestion || isBillingQuestion(customerText)) ? null : findBestFaqMatch(customerText, id);
       if (matchedFaq) {
         const faqAnswer = String(matchedFaq.answer || '').trim();
         if (faqAnswer) {
@@ -1986,22 +2031,25 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         return;
       }
       // 5) Delivery-charge questions are informational, not order intent; never request address/phone for them.
-      if (/(?:ডেলিভারি|কুরিয়ার)\s*(?:চার্জ|খরচ)|delivery\s*charge|courier\s*(?:fee|charge)/i.test(customerText) && !/(?:সর্বমোট|মোট বিল|grand total|total bill|invoice)/i.test(customerText)) {
+      if (/(?:ডেলিভারি|ডিলিভারি|কুরিয়ার)\s*(?:চার্জ|খরচ)|delivery\s*charge|courier\s*(?:fee|charge)/i.test(customerText) && !/(?:সর্বমোট|মোট বিল|grand total|total bill|invoice)/i.test(customerText) && !isBillingQuestion(customerText)) {
         const place = normalizeText(customerText);
         if (/গাজীপুরের\s*(?:ভেতরে|মধ্যে|ভিতরে)|inside\s*gazipur|within\s*gazipur/i.test(place)) await sendFacebookMessage(id, 'গাজীপুরের ভেতরে ডেলিভারি চার্জ ৫০ টাকা।');
         else if (/গাজীপুরের\s*(?:বাইরে)|outside\s*gazipur|outside\s*of\s*gazipur/i.test(place)) await sendFacebookMessage(id, 'গাজীপুরের বাইরে ডেলিভারি চার্জ ১০০ টাকা।');
         else await sendFacebookMessage(id, 'ডেলিভারি চার্জ গাজীপুরের ভেতরে ৫০ টাকা এবং গাজীপুরের বাইরে ১০০ টাকা।');
         return;
       }
-      // 6) Smart billing from live catalog prices.
+      // 6) Smart billing from live catalog prices. Quantity and delivery area come ONLY from the customer's own words
+      //    (never from bot text such as "৬৫০ টাকা"); an unspecified quantity is 1 and says so; an unknown area shows both rates.
       if (!hasIncomingImage && isBillingQuestion(customerText)) {
-        const context = getRecentConversationText(id, customerText), draft = db.orderDrafts[id] || {};
+        const customerContext = getCustomerOnlyText(id, customerText), draft = getOrderDraft(id) || {};
         const topic = resolveConversationTopic(customerText, id);
-        const p = topic.product || draft.product || findExactProduct(context, false);
+        const p = topic.product || findExactProduct(customerContext);
         if (p) {
-          const quantity = extractQuantity(customerText) || Number(draft.quantity) || extractQuantity(context) || 1;
-          const area = extractAddress(customerText) || (BD_PLACE_RE.test(customerText) ? customerText : '') || draft.address || db.customers[id]?.address || extractAddress(context) || '';
-          await sendFacebookMessage(id, limitToFiveLines(buildSmartBillReply(p, quantity, isFreeDeliveryProduct(p) ? 0 : getDeliveryFee(area))));
+          const askedQuantity = extractQuantity(customerText);
+          const quantity = askedQuantity || Number(draft.quantity) || 1;
+          const area = extractAddress(customerText) || (BD_PLACE_RE.test(customerText) ? customerText : '') || draft.address || db.customers[id]?.address || '';
+          const fee = isFreeDeliveryProduct(p) ? 0 : getDeliveryFee(area);
+          await sendFacebookMessage(id, limitToFiveLines(buildSmartBillReply(p, quantity, fee, { assumedQuantity: !askedQuantity && !draft.quantity }), 8));
           return;
         }
         const list = topic.categoryProducts.length ? '\n' + topic.categoryProducts.map((x, i) => `${i + 1}. ${x.name}`).join('\n') : '';
@@ -2119,7 +2167,7 @@ async function handleIncomingMessage({ senderId, text: rawText, attachments, mes
     const recentOrder = c.lastOrderAt && Date.now() - new Date(c.lastOrderAt).getTime() < 10 * 60 * 1000;
     const topicProduct = findActiveProduct(senderId);
     if (both && intentFresh && topicProduct && !recentOrder) {
-      await finalizeOrder(senderId, { phone: c.phone, address: c.address, quantity: extractQuantity(text) || 1, notes: [text] }, topicProduct, text, messageId || null);
+      await finalizeOrder(senderId, { phone: c.phone, address: c.address, quantity: (extractQuantity(text) && extractQuantity(text) <= MAX_ORDER_QTY) ? extractQuantity(text) : 1, notes: [text] }, topicProduct, text, messageId || null);
       return;
     }
     await setTakeoverState(senderId, true, both ? 'Customer provided phone number and full address' : 'Customer provided phone number');
@@ -2712,8 +2760,19 @@ function alreadyServedMedia(senderId) {
 // -----------------------------------------------------------------------------
 // Start and periodic tasks
 // -----------------------------------------------------------------------------
+// A sleeping serverless database (Neon free plan) can need a few seconds to wake up: try the first connection 3 times.
+async function initDatabaseWithRetry() {
+  for (let attempt = 1; ; attempt++) {
+    try { await initDatabase(); return; }
+    catch (err) {
+      console.error(`[DB] Connection attempt ${attempt}/3 failed: ${err.message}`);
+      if (attempt >= 3) throw err;
+      await sleep(3000 * attempt);
+    }
+  }
+}
 async function startServer() {
-  await initDatabase();
+  await initDatabaseWithRetry();
   await initOptionalServices();
   loadLocalCatalog();
   await pullCatalogFromGitHub(true);
