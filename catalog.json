@@ -799,7 +799,9 @@
         "high brightness fog light"
       ],
       "media": {
-        "images": [],
+        "images": [
+          "https://www.facebook.com/61580138349610/posts/pfbid02oqhhWLkdAZthRnDehD4CMwZdXK7rgFqtk1JporQTRjdHdLKZm3bnSNrtWkwuB6Wbl/"
+        ],
         "videos": [
           "https://www.facebook.com/share/r/1CVbwRVKQa/"
         ]
@@ -830,6 +832,6 @@
       ]
     }
   ],
-  "updatedAt": "2026-11-06T10:59:59Z",
-  "version": 42
+  "updatedAt": "2026-11-06T11:00:16Z",
+  "version": 43
 }
