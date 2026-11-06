@@ -800,7 +800,9 @@
       ],
       "media": {
         "images": [],
-        "videos": []
+        "videos": [
+          "https://www.facebook.com/share/r/1CVbwRVKQa/"
+        ]
       },
       "name": "১২ লেন্স ফগ  এলইডি  স্পটলাইট / বাইক ও কার ফোগ লাইট (12 Lens LED Spotlight)",
       "price": 750.0,
@@ -828,6 +830,6 @@
       ]
     }
   ],
-  "updatedAt": "2026-11-01T04:18:04Z",
-  "version": 41
+  "updatedAt": "2026-11-06T10:59:59Z",
+  "version": 42
 }
