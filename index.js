@@ -1,5 +1,8 @@
 /*
- * ImpoTech Messenger Bot — v14
+ * ImpoTech Messenger Bot — v15 (Website Order Routing)
+ * v15: all order/how-to-order intents now go to https://www.impotech.shop.
+ * The website handles product selection, quantity, checkout and order details.
+ * Existing product/FAQ/media/vehicle-fitment/AI/human-support services remain unchanged.
  * Base: ImpoTech_MainCode_v13_Order_Takeover_NoCampaign (+ the sslmode URL fix that was already in v13_SSL_Warning_Fix).
  * v14 fixes: (a) bills no longer read "৬৫০ টাকা" as quantity 650 and take quantity/delivery area only from the customer's
  *   own words; colloquial billing questions ("ডেলিভারি চার্জ মিলাই দাম কত") are handled as bills; (b) PostgreSQL SSL warning
@@ -118,6 +121,12 @@ const LEGACY_DATA_FILE = path.join(__dirname, 'storage_data.json');
 const HANDOVER_MARKER = '[HANDOVER_REQUIRED]';
 const ORDER_CONFIRMATION = 'আপনার অর্ডারের তথ্য সংরক্ষণ করা হয়েছে। আমাদের প্রতিনিধি আপনার সঙ্গে যোগাযোগ করে অর্ডারটি নিশ্চিত করবেন।';
 const FOLLOWUP_MESSAGE = 'আপনি কি পণ্যটি সম্পর্কে আরও কিছু জানতে চান? কোনো প্রশ্ন থাকলে জানাবেন, আমরা সাহায্য করতে প্রস্তুত।';
+const IMPOTECH_WEBSITE_URL = 'https://www.impotech.shop';
+const WEBSITE_ORDER_REPLY = `ধন্যবাদ! 😊 অর্ডার করতে আমাদের ওয়েবসাইটে যান: ${IMPOTECH_WEBSITE_URL}
+
+সেখানে আপনার প্রয়োজনীয় পণ্যটি নির্বাচন করুন, কতটি নিতে চান তা নির্ধারণ করুন এবং Checkout/Place Order থেকে অর্ডারটি সম্পন্ন করুন।
+
+আপনার অর্ডার ও অর্ডার-সংক্রান্ত যাবতীয় তথ্য ওয়েবসাইট থেকেই পরিচালিত হবে। পণ্য বা অন্য কোনো বিষয়ে জানতে চাইলে আমি এখানেই আগের মতো সাহায্য করব।`;
 const FIRST_CONTACT_INTRO = 'আমি ইমপোটেকের AI চ্যাটবট। পণ্য ও সেবা সম্পর্কে আপনাকে সাহায্য করব। কোনো সমস্যা হলে আমাদের প্রতিনিধির সঙ্গে কথা বলতে পারেন।';
 
 if (!DATABASE_URL) {
@@ -1974,6 +1983,18 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       delete db.pendingHandover[id]; saveStorage();
       console.log(`[Handover] Cleared stale consent prompt for ${id}; processing new message normally`);
     }
+    // v15: The website is the ONLY order/checkout channel.
+    // Do not collect address, phone, quantity, or create Messenger orders here.
+    // Clear any legacy draft left by an older deployment so it cannot restart the old flow.
+    const websiteOrderIntent = isExplicitOrderIntent(customerText) || isHowToOrderQuestion(customerText);
+    if (websiteOrderIntent || getOrderDraft(id)) {
+      if (db.orderDrafts[id]) delete db.orderDrafts[id];
+      if (db.pendingHandover[id]?.orderDraft) delete db.pendingHandover[id];
+      saveStorage();
+      await sendFacebookMessage(id, WEBSITE_ORDER_REPLY);
+      return;
+    }
+
     // Explicit refusal during an order draft cancels it and stops all detail requests.
     if (getOrderDraft(id) && isNo(customerText)) {
       delete db.orderDrafts[id]; delete db.pendingHandover[id]; saveStorage();
@@ -2072,7 +2093,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         return;
       }
     }
-    // Order flow: ask for address + mobile number once, then save the order (see handleOrderFlow).
+    // Legacy order-flow branch retained for backward compatibility; v15 website routing returns before reaching it.
     if (orderIntent || enteringOrderDetails || pickingDraftProduct) {
       await handleOrderFlow(id, customerText, messageId);
       return;
