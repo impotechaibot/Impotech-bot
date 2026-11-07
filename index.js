@@ -1,4 +1,15 @@
 /*
+ * ImpoTech Messenger Bot — v16 (Salesman Mode + New Vehicle Fitment + Chat Control)
+ * v16 changes (everything from v15 is kept; nothing was removed):
+ *  1) Vehicle fitment table: Hero Splendor iSmart 110 (i3S), Hero Splendor (Plus / Pro / xTec), Bajaj Pulsar 150 / 180 / 220
+ *     (All Models / 2021 / 2023), Pulsar 150 V1 (Dual / Single Disc), Hero Honda Hunk (2010), Hero Hunk, Yamaha FZS V2, TVS Metro Plus 110.
+ *     Existing rows keep their position (saved customer vehicle IDs stay valid); new rows are appended at the end.
+ *  2) Salesman mode: every reply ends with ONE relevant question about the item the customer is asking about
+ *     (bike model / version / year, bulb socket, which product, photo/video, order link) - never repeated, never after "no"/thanks.
+ *     Orders still go to the website only (no phone/address is requested in chat). Switch off with SALES_QUESTIONS=false.
+ *  3) Chat control: .ai / .human / .1off (+ .alloff / .allon / .list / .status / .help / .myid / .login) work from the Page Inbox thread
+ *     AND from a private admin chat (ADMIN_PSIDS or ADMIN_CHAT_PASSCODE). The old admin-panel endpoints are unchanged.
+ * ------------------------------------------------------------------------------------------------------------------
  * ImpoTech Messenger Bot — v15 (Website Order Routing)
  * v15: all order/how-to-order intents now go to https://www.impotech.shop.
  * The website handles product selection, quantity, checkout and order details.
@@ -105,6 +116,16 @@ const HUMAN_ECHO_IGNORE_NEW_MS = 45 * 1000; // Page automations (welcome greetin
 const HUMAN_ECHO_IGNORE_RE = (() => { try { return new RegExp(process.env.HUMAN_ECHO_IGNORE_REGEX || 'আসসালামু আলাইকুম[\\s\\S]{0,60}স্বাগতম', 'i'); } catch (_) { return null; } })();
 const BOT_ECHO_METADATA = 'IMPOTECH_BOT_V13';     // every message this server sends carries this marker in its echo
 const ADMIN_ECHO_METADATA = 'IMPOTECH_ADMIN_APP';
+// ---- v16: chat control + salesman mode settings ----
+// ADMIN_PSIDS: comma separated Messenger IDs of admins who control the AI from a private chat with the Page (send .myid to the Page to see yours).
+// ADMIN_CHAT_PASSCODE: optional; an admin sends ".login <passcode>" to the Page once and is registered without redeploying.
+// ONE_OFF_PAUSE_MINUTES: how long ".1off" keeps the AI off for ONE customer (default 60); ".1off 15" overrides it.
+const ADMIN_PSIDS = new Set(String(process.env.ADMIN_PSIDS || '').split(/[\s,;]+/).map(x => x.trim()).filter(Boolean));
+const ADMIN_CHAT_PASSCODE = String(process.env.ADMIN_CHAT_PASSCODE || '').trim();
+const ONE_OFF_PAUSE_MS = (() => { const n = Number(process.env.ONE_OFF_PAUSE_MINUTES); return process.env.ONE_OFF_PAUSE_MINUTES !== undefined && Number.isFinite(n) && n > 0 ? n * 60000 : 60 * 60000; })();
+const SALES_QUESTIONS_ENABLED = process.env.SALES_QUESTIONS !== 'false';
+const chatControlStats = { echoEvents: 0, lastEchoAt: null, commandsHandled: 0, lastCommand: null, lastCommandAt: null, lastCommandSource: null };
+const loginAttempts = new Map(); // psid -> { count, windowStart } (passcode brute-force guard)
 // 'replace' (default): the admin app is the source of truth, FAQs/products you save fully replace the old ones.
 // 'merge': legacy behaviour, old products/FAQs are always retained.
 const CATALOG_SYNC_MODE = String(process.env.CATALOG_SYNC_MODE || 'replace').toLowerCase() === 'merge' ? 'merge' : 'replace';
@@ -980,10 +1001,10 @@ function getProductMediaReply(text, senderId, opts = {}) {
 // Vehicle/headlight reference table (based on the user's supplied compatibility list).
 // Values are used as the configured business reference; they have not been independently verified.
 // -----------------------------------------------------------------------------
-const VEHICLE_FITMENT_DATA = String.raw`BAJAJ~Pulsar 150 (Single / Twin Disc / Neon / SD)~Pulsar 150;Pulsar 150 SD;Pulsar 150 Neon;Pulsar 150 Single Disc;Pulsar 150 Twin Disc;পালসার 150~2001-2026~149 CC~H4 / HS1~Direct Plug-and-Play (DC Conversion Required)
+const VEHICLE_FITMENT_DATA = String.raw`BAJAJ~Pulsar 150 (Single Disc / Twin-Dual Disc / Neon / SD / 2021 / 2023)~Pulsar 150;Bajaj Pulsar 150;Pulsar 150 SD;Pulsar 150 Neon;Pulsar 150 Single Disc;Pulsar 150 Twin Disc;Pulsar 150 Dual Disc;Pulsar 150 2021;Pulsar 150 2023;পালসার 150~2001-2026~149 CC~H4 / HS1~Direct Plug-and-Play (DC Conversion Required)~আপনার Pulsar 150-টি কি V1 (পুরোনো), Single Disc, Twin (Dual) Disc নাকি ২০২১/২০২৩ মডেল? সঠিক ভার্সনটা জানালে আরও নিশ্চিত হয়ে বলতে পারব~\b(?:v1|single|twin|dual|neon|sd|2021|2023)\b
 BAJAJ~Pulsar 125 / Pulsar NS125~Pulsar 125;Pulsar NS125;NS 125;পালসার 125~2019-2026~124.4 CC~H4 / HS1~Direct Plug-and-Play
 BAJAJ~Pulsar 135 LS~Pulsar 135;Pulsar 135 LS;পালসার 135~2010-2018~135 CC~H4~Direct Plug-and-Play
-BAJAJ~Pulsar 180 / 180 Neon / 220F (Halogen)~Pulsar 180;Pulsar 180 Neon;Pulsar 220F;220F Halogen;পালসার 180;পালসার 220~2002-2021~178.6-220 CC~H4~Direct Plug-and-Play
+BAJAJ~Pulsar 180 / 180 Neon / 220 / 220F (All Models / 2021 / 2023)~Pulsar 180;Bajaj Pulsar 180;Pulsar 180 Neon;Pulsar 220;Bajaj Pulsar 220;Pulsar 220F;220F Halogen;Pulsar 180 2021;Pulsar 180 2023;Pulsar 220 2021;Pulsar 220 2023;Pulsar 220F 2021;Pulsar 220F 2023;পালসার 180;পালসার 220~2002-2023~178.6-220 CC~H4~Direct Plug-and-Play~আপনার Pulsar-টি কত সালের মডেল — ২০২১, ২০২৩ নাকি অন্য কোনো সাল? সালটা জানালে ফিটমেন্ট আরও নিশ্চিত করে বলতে পারব~\b(?:19|20)\d\d\b
 BAJAJ~Discover 100 / 100M / 100T~Discover 100;Discover 100M;Discover 100T;ডিসকভার 100;ডিসকভার 100m;ডিসকভার 100t~2009-2020~94.3-102 CC~HS1 / H4~Direct Fit (DC Conversion Required)
 BAJAJ~Discover 110~Discover 110;ডিসকভার 110~2018-2022~115.5 CC~HS1 / H4~Direct Plug-and-Play
 BAJAJ~Discover 125 / 125 ST / Disc~Discover 125;Discover 125 ST;Discover 125 Disc;ডিসকভার 125~2004-2026~124.5 CC~HS1 / H4~Direct Plug-and-Play
@@ -995,7 +1016,7 @@ BAJAJ~CT 100 / CT 100 ES / CT 110~CT 100;CT 100 ES;CT 110;বাজাজ CT 100
 BAJAJ~Avenger 150 / 160 Street~Avenger 150;Avenger 160;Avenger 160 Street;অ্যাভেঞ্জার 150~2016-2026~150-160 CC~H4~Direct Plug-and-Play
 BAJAJ~V15 / V12~Bajaj V15;Bajaj V12;V15;V12~2016-2020~124.5-149.5 CC~H4~Direct Plug-and-Play
 YAMAHA~FZ V1 / FZ-S V1~Yamaha FZ V1;FZ V1;FZ-S V1;FZS V1;ইয়ামাহা FZ V1~2008-2015~153 CC~H4~Direct Plug-and-Play
-YAMAHA~FZ V2 / FZ-S V2 / FZER V2~Yamaha FZ V2;FZ V2;FZ-S V2;FZS V2;FZER V2;FZ ER V2;ইয়ামাহা FZ V2~2014-2021~149 CC~H4~Direct Plug-and-Play
+YAMAHA~FZ V2 / FZ-S V2 / FZS V2 / FZER V2~Yamaha FZ V2;Yamaha FZS V2;Yamaha FZ-S V2;FZ V2;FZ-S V2;FZS V2;FZS Version 2;FZ-S Version 2;FZER V2;FZ ER V2;ইয়ামাহা FZ V2;ইয়ামাহা FZS V2~2014-2021~149 CC~H4~Direct Plug-and-Play
 YAMAHA~FAZER V1 / FAZER V2~Yamaha Fazer V1;Fazer V1;Fazer V2;FAZER V1;FAZER V2;ফেজার V1;ফেজার V2~2009-2020~149-153 CC~H4 (Dual)~Direct Plug-and-Play
 YAMAHA~SZ-R 153 / SZ-RR V2~Yamaha SZ-R 153;SZ-R 153;SZ-RR V2;SZRR V2~2011-2021~149-153 CC~H4~Direct Plug-and-Play
 YAMAHA~Saluto 125 / Disc~Yamaha Saluto 125;Saluto 125;Saluto;Saluto Disc~2016-2022~125 CC~H4 / HS1~Direct Plug-and-Play
@@ -1007,7 +1028,7 @@ TVS~Apache RTR 160 2V (Single / Twin Disc)~TVS Apache RTR 160 2V;Apache RTR 160 
 TVS~Apache RTR 180 2V~TVS Apache RTR 180;Apache RTR 180 2V;Apache 180 2V~2011-2019~177.4 CC~H4~Direct Plug-and-Play
 TVS~Apache RTR 160 4V (Carb Halogen Trim)~Apache RTR 160 4V;TVS Apache 160 4V Carb;Apache 160 4V Halogen~2018-2020~159.7 CC~H4~Direct Fit
 TVS~Metro 100 / KLS / ELS~TVS Metro 100;Metro 100;Metro KLS;Metro ELS;TVS Metro~2009-2026~99.7 CC~HS1 / H4~Direct Fit (DC Conversion Required)
-TVS~Metro Plus 110 / RE~TVS Metro Plus 110;Metro Plus 110;Metro RE~2014-2026~109.7 CC~H4 / HS1~Direct Plug-and-Play
+TVS~Metro Plus 110 / RE~TVS Metro Plus 110;Metro Plus 110;TVS Metro Plus;Metro Plus;TVS Metro+ 110;Metro+ 110;Metro RE;মেট্রো প্লাস 110;টিভিএস মেট্রো প্লাস~2014-2026~109.7 CC~H4 / HS1~Direct Plug-and-Play
 TVS~Stryker 125~TVS Stryker 125;Stryker 125~2016-2022~124.53 CC~H4~Direct Plug-and-Play
 TVS~Radeon 110~TVS Radeon 110;Radeon 110~2019-2026~109.7 CC~H4~Direct Plug-and-Play
 TVS~Star City / Star City Plus~TVS Star City;Star City Plus;TVS Star City Plus~2005-2020~99.7-109.7 CC~HS1 / H4~Direct Fit (DC Conversion Required)
@@ -1027,10 +1048,10 @@ SUZUKI~GS150R~Suzuki GS150R;GS 150 R~2010-2016~149.5 CC~H4~Direct Plug-and-Play
 SUZUKI~Hayate 110 / Hayate EP~Suzuki Hayate 110;Hayate 110;Hayate EP~2015-2022~113 CC~H4~Direct Plug-and-Play
 SUZUKI~Slingshot 125~Suzuki Slingshot 125;Slingshot 125~2011-2015~124 CC~H4~Direct Plug-and-Play
 SUZUKI~Access 125 / Let’s 110~Suzuki Access 125;Access 125;Suzuki Lets 110;Suzuki Let’s 110;Lets 110;Let’s 110~2014-2020~112.8-124 CC~HS1 / H4~Direct Plug-and-Play
-HERO~Hunk 150 / Matt Edition / DD~Hero Hunk 150;Hunk 150;Hunk Matt Edition;Hunk DD~2008-2022~149.2 CC~H4~Direct Plug-and-Play
+HERO~Hero Hunk (150 / Matt Edition / DD)~Hero Hunk;Hunk;Hero Hunk 150;Hunk 150;Hunk Matt Edition;Hunk Matt;Hunk DD;হিরো হাঙ্ক;হিরো হান্ক;হাঙ্ক~2008-2022~149.2 CC~H4~Direct Plug-and-Play~আপনার Hunk-টি কি ২০১০ সালের Hero Honda Hunk, নাকি পরের মডেল (Hero Hunk 150 / Matt Edition / DD)?~\b(?:honda|2010|150|matt|dd)\b
 HERO~Glamour 125 / BS4 / i3S~Hero Glamour 125;Glamour 125;Glamour BS4;Glamour i3S~2006-2026~124.7 CC~H4 / HS1~Direct Plug-and-Play
 HERO~Passion Pro / Passion XPro / XTec~Hero Passion Pro;Passion Pro;Passion XPro;Passion XTec;Passion Xtec~2010-2026~97.2-109.1 CC~H4 / HS1~Direct Plug-and-Play
-HERO~Splendor Plus / Pro / iSmart 110~Hero Splendor Plus;Splendor Plus;Hero Splendor Pro;Splendor Pro;Hero iSmart 110;Splendor iSmart 110~2004-2026~97.2-109.1 CC~HS1 / H4~Direct Fit (DC Conversion Required)
+HERO~Hero Splendor (Plus / Pro / xTec)~Hero Splendor;Splendor;Hero Splendor Plus;Splendor Plus;Hero Splendor Pro;Splendor Pro;Hero Splendor xTec;Splendor xTec;Splendor Plus xTec;Hero Splendor Plus xTec;হিরো স্প্লেন্ডার;স্প্লেন্ডার~2004-2026~97.2-109.1 CC~HS1 / H4~Direct Fit (DC Conversion Required)~আপনার Splendor-টি কোনটি — Plus, Pro, xTec নাকি iSmart 110 (i3S)? আর কত সালের মডেল?~\b(?:plus|pro|xtec|ismart|i3s)\b
 HERO~HF Deluxe / Dawn~Hero HF Deluxe;HF Deluxe;Hero Dawn;Hero HF Dawn~2012-2026~97.2 CC~HS1 / H4~Direct Fit (DC Conversion Required)
 HERO~Xtreme 150 / Xtreme Sports~Hero Xtreme 150;Xtreme 150;Hero Xtreme Sports;Xtreme Sports~2011-2019~149.2 CC~H4~Direct Plug-and-Play
 HERO~Achiever 150~Hero Achiever 150;Achiever 150~2012-2019~149.1 CC~H4~Direct Plug-and-Play
@@ -1061,9 +1082,14 @@ SUZUKI~Swift (Halogen Trim)~Suzuki Swift;Swift;Swift Halogen~2005-2017~1200-1300
 HYUNDAI~Grand i10 / i10~Hyundai Grand i10;Grand i10;Hyundai i10;i10~2008-2020~1000-1200 CC~H4 Halogen~Direct Fit
 HYUNDAI~Eon~Hyundai Eon;Eon~2012-2019~800-1000 CC~H4 Halogen~Direct Fit
 NISSAN~Sunny / Sun FB15~Nissan Sunny;Sunny FB15;Nissan Sun FB15;Sun FB15~1998-2004~1300-1500 CC~H4 Halogen~Direct Fit
-NISSAN~AD Van / NV150 AD~Nissan AD Van;AD Van;Nissan NV150 AD;NV150 AD~2006-2021~1200-1500 CC~H4 Halogen~Direct Plug-and-Play`.trim().split(/\r?\n/).map((line, index) => {
-  const [brand, model, aliases, years, cc, socket, fitment] = line.split('~');
-  return { id: index + 1, brand, model, aliases: String(aliases || '').split(';').filter(Boolean), years, cc, socket, fitment };
+NISSAN~AD Van / NV150 AD~Nissan AD Van;AD Van;Nissan NV150 AD;NV150 AD~2006-2021~1200-1500 CC~H4 Halogen~Direct Plug-and-Play
+BAJAJ~Pulsar 150 V1 (Dual Disc / Single Disc)~Pulsar 150 V1;Bajaj Pulsar 150 V1;Pulsar V1;Pulsar 150 V1 Dual Disc;Pulsar 150 V1 Twin Disc;Pulsar 150 V1 Single Disc;Pulsar V1 Dual Disc;Pulsar V1 Single Disc;পালসার 150 V1;পালসার V1~~149 CC~H4 / HS1~Direct Plug-and-Play (DC Conversion Required)~~
+HERO~Hero Honda Hunk (2010 Model)~Hero Honda Hunk;Hero Honda Hunk 2010;Hero Honda Hunk 2010 Model;Honda Hunk;Hunk 2010;Hunk 2010 Model;হিরো হোন্ডা হাঙ্ক;হিরো হোন্ডা হান্ক~2010~149.2 CC~H4~Direct Plug-and-Play~~
+HERO~Hero Splendor iSmart 110 (i3S)~Hero Splendor iSmart 110;Splendor iSmart 110;Hero Splendor iSmart;Splendor iSmart;Hero iSmart 110;iSmart 110;Splendor i3S;Hero Splendor i3S;Splendor iSmart i3S;Splendor iSmart 110 i3S;হিরো স্প্লেন্ডার আইস্মার্ট;স্প্লেন্ডার আইস্মার্ট~2004-2026~97.2-109.1 CC~HS1 / H4~Direct Fit (DC Conversion Required)~~`.trim().split(/\r?\n/).map((line, index) => {
+  const [brand, model, aliases, years, cc, socket, fitment, ask, specific] = line.split('~');
+  let specificRe = null;
+  if (specific && specific.trim()) { try { specificRe = new RegExp(specific.trim(), 'i'); } catch (_) { specificRe = null; } }
+  return { id: index + 1, brand, model, aliases: String(aliases || '').split(';').filter(Boolean), years: String(years || '').trim(), cc: String(cc || '').trim(), socket: String(socket || '').trim(), fitment: String(fitment || '').trim(), ask: String(ask || '').trim(), specificRe };
 });
 function compactVehicleText(value = '') {
   return normalizeText(bnToEnDigits(value)).replace(/[^\p{L}\p{M}\p{N}]/gu, '');
@@ -1084,19 +1110,29 @@ function findVehicleCompatibility(text = '') {
   if (hits.length > 1 && hits[0].score === hits[1].score && hits[0].row.id !== hits[1].row.id) return null;
   return hits[0].row;
 }
-function rememberVehicleModel(senderId, text) {
-  const row = findVehicleCompatibility(text);
+function vehicleVariantSpecified(row, text) {
+  if (!row || !row.specificRe) return true; // rows without a variant question never need one
+  return row.specificRe.test(normalizeText(bnToEnDigits(String(text || ''))));
+}
+function saveVehicleRow(senderId, row, text = '') {
   if (!row || !senderId) return row;
   const id = String(senderId), customer = ensureCustomer(id);
+  const sameRow = Number(customer.vehicleModelId) === row.id;
+  const confirmed = vehicleVariantSpecified(row, text) || (sameRow && customer.vehicleVariantConfirmed === true);
   Object.assign(customer, {
     vehicleModelId: row.id, vehicleModelName: row.model, vehicleBrand: row.brand,
-    vehicleModelYears: row.years, vehicleModelUpdatedAt: new Date().toISOString()
+    vehicleModelYears: row.years, vehicleModelUpdatedAt: new Date().toISOString(), vehicleVariantConfirmed: confirmed
   });
   const memory = getCustomerMemory(id);
-  addUniqueMemoryItem(memory.facts, `গ্রাহকের যানবাহন: ${row.brand} ${row.model} (${row.years})`);
+  addUniqueMemoryItem(memory.facts, `গ্রাহকের যানবাহন: ${row.brand} ${row.model}${row.years ? ` (${row.years})` : ''}`);
   memory.updatedAt = new Date().toISOString();
   saveStorage();
   return row;
+}
+function rememberVehicleModel(senderId, text) {
+  const row = findVehicleCompatibility(text);
+  if (!row || !senderId) return row;
+  return saveVehicleRow(senderId, row, text);
 }
 function getKnownVehicleCompatibility(senderId, currentText = '', contextText = '') {
   const currentMatch = findVehicleCompatibility(currentText);
@@ -1109,15 +1145,20 @@ function getKnownVehicleCompatibility(senderId, currentText = '', contextText = 
   return findVehicleCompatibility(contextText);
 }
 const VEHICLE_FITMENT_HANDOFF_REPLY = 'আমাদের দেওয়া তালিকায় আপনার বাইক/গাড়ির নির্দিষ্ট মডেলটি নিশ্চিতভাবে মেলেনি। সঠিক ফিটমেন্ট নিশ্চিত করতে আমাদের প্রতিনিধি সাহায্য করবে।';
+function describeVehicle(row) {
+  const extra = [row.years, row.cc].filter(Boolean).join(', ');
+  return `${row.brand} ${row.model}${extra ? ` (${extra})` : ''}`;
+}
 function buildVehicleFitmentReply(row) {
   if (!row) return VEHICLE_FITMENT_HANDOFF_REPLY;
-  const socketText = `Socket: ${row.socket}`;
+  const name = describeVehicle(row);
+  const socket = row.socket ? `Socket: ${row.socket}` : '';
   if (/DC Conversion Required/i.test(row.fitment)) {
-    const connection = /Direct Plug-and-Play/i.test(row.fitment) ? 'কনভার্সনের পরে Direct Plug-and-Play; ' : 'Direct Fit; ';
-    return `আপনার ${row.brand} ${row.model} (${row.years}, ${row.cc}) সম্পর্কে দেওয়া তালিকা অনুযায়ী ${socketText}। ${connection}তবে হেডলাইট লাগানোর আগে বাইকের AC supply-কে DC-তে convert করতে হবে।`;
+    const connection = /Direct Plug-and-Play/i.test(row.fitment) ? 'কনভার্সনের পরে Direct Plug-and-Play' : 'Direct Fit';
+    return `✅ আপনার ${name}-এর জন্য আমাদের তালিকা অনুযায়ী ${socket ? socket + '; ' : ''}${connection}।\n⚠️ শুধু একটি বিষয়: হেডলাইট লাগানোর আগে বাইকের AC supply-কে DC-তে convert করতে হবে।`;
   }
-  if (/Direct Plug-and-Play/i.test(row.fitment)) return `আপনার ${row.brand} ${row.model} (${row.years}, ${row.cc}) সম্পর্কে দেওয়া তালিকা অনুযায়ী ${socketText} এবং fitment: Direct Plug-and-Play।`;
-  return `আপনার ${row.brand} ${row.model} (${row.years}, ${row.cc}) সম্পর্কে দেওয়া তালিকায় ${socketText} এবং fitment: ${row.fitment} উল্লেখ আছে।`;
+  if (/Direct Plug-and-Play/i.test(row.fitment)) return `✅ দারুণ! আপনার ${name}-এ আমাদের হেডলাইট সরাসরি ফিট হবে (${socket ? socket + ', ' : ''}fitment: Direct Plug-and-Play) 😊`;
+  return `আপনার ${name} সম্পর্কে আমাদের তালিকায় ${socket ? socket + ' এবং ' : ''}fitment: ${row.fitment} উল্লেখ আছে।`;
 }
 function isVehicleHeadlightFitmentInquiry(currentText='', recentContext='') {
   const current = String(currentText || '').normalize('NFKC').trim();
@@ -1131,6 +1172,110 @@ function isVehicleHeadlightFitmentInquiry(currentText='', recentContext='') {
   const headlightContext = /(?:হেড\s*লাইট|হেডলাইট|head\s*light|headlight|headlamp|head\s*lamp|বাল্ব|bulb|projector|প্রজেক্টর|plug|প্লাগ|socket|সকেট|h\s*-?\s*4|hs\s*-?\s*1|3\s*-?\s*pin|৩\s*পিন|তিন\s*পিন)/i.test(context);
   const knownModelInContext = Boolean(findVehicleCompatibility(current) || findVehicleCompatibility(context));
   return (vehicleMentioned || knownModelInContext) && (headlightContext || knownModelInContext) && (asksFitOrMatch || asksPlugMatch || genericFitmentFollowup);
+}
+
+// -----------------------------------------------------------------------------
+// v16: Salesman mode. Every reply ends with ONE relevant question about the item the customer is asking about
+// (which bike / version / year, bulb socket, which product, photo or video, order link). The question is chosen from
+// what is still unknown, is never repeated, and is skipped after "no" / thanks. Orders always go to the website.
+// -----------------------------------------------------------------------------
+const SALES_CLOSER_RE = /^(?:ধন্যবাদ|থ্যাংকস|থ্যাঙ্ক|thanks?|thank you|ok|okay|ঠিক আছে|আচ্ছা|bye|বাই|আল্লাহ হাফেজ)(?:\s|$)/i;
+const LIGHT_PRODUCT_RE = /লাইট|হেডলাইট|বাল্ব|প্রজেক্টর|ফগ|স্পট|light|lamp|headlight|bulb|projector|led|fog|spot|drl/i;
+const VEHICLE_FAMILY_HINTS = [
+  { key: 'pulsar', word: 'Pulsar', re: /pulsar|পালসার/i, ask: 'আপনার Pulsar-টি কোনটি — 125, 135, 150 (V1 / Single Disc / Twin Disc), 180 নাকি 220? আর কত সালের মডেল?' },
+  { key: 'splendor', word: 'Splendor', re: /splendor|স্প্লেন্ডার/i, ask: 'আপনার Splendor-টি কোনটি — Plus, Pro, xTec নাকি iSmart 110 (i3S)? আর কত সালের মডেল?' },
+  { key: 'hunk', word: 'Hunk', re: /hunk|হাঙ্ক|হান্ক/i, ask: 'আপনার Hunk-টি কি ২০১০ সালের Hero Honda Hunk, নাকি পরের মডেল (Hero Hunk 150 / Matt Edition / DD)?' },
+  { key: 'fz', word: 'FZ', re: /\bfz(?:s|er)?\b|fazer|ফেজার/i, ask: 'আপনার Yamaha FZ-টি কোনটি — FZ V1, FZ-S V2 (FZS V2) নাকি Fazer?' },
+  { key: 'metro', word: 'Metro', re: /metro|মেট্রো/i, ask: 'আপনার TVS Metro-টি কোনটি — Metro 100 নাকি Metro Plus 110?' }
+];
+function findVehicleFamilyHint(text = '') {
+  const t = String(text || '').normalize('NFKC');
+  return VEHICLE_FAMILY_HINTS.find(h => h.re.test(t)) || null;
+}
+function savedVehicleRow(customer) {
+  const rowId = Number(customer?.vehicleModelId);
+  return rowId ? (VEHICLE_FITMENT_DATA.find(row => row.id === rowId) || null) : null;
+}
+function salesAskedBefore(senderId, key) { const c = db.customers[String(senderId || '')]; return Boolean(c && Array.isArray(c.salesAsked) && c.salesAsked.includes(key)); }
+function markSalesAsked(senderId, key) {
+  const c = ensureCustomer(senderId);
+  c.salesAsked = [...(Array.isArray(c.salesAsked) ? c.salesAsked : []), key].slice(-12); // old questions become askable again later
+  c.lastSalesQuestionAt = new Date().toISOString();
+}
+function setPendingVehicleAsk(senderId, info) { ensureCustomer(senderId).pendingVehicleAsk = { ...info, at: Date.now() }; }
+// The customer answers our "which bike / version / year?" question: find the vehicle row from the short answer.
+function resolvePendingVehicleAnswer(senderId, text) {
+  const c = db.customers[String(senderId || '')], p = c && c.pendingVehicleAsk;
+  if (!p) return null;
+  if (Date.now() - Number(p.at) > 15 * 60 * 1000) { delete c.pendingVehicleAsk; return null; }
+  const t = String(text || '').trim();
+  if (!t || t.length > 80) return null;
+  let row = findVehicleCompatibility(t), used = t;
+  if (!row && p.word) { used = `${p.word} ${t}`; row = findVehicleCompatibility(used); }
+  if (!row && p.kind === 'variant') {
+    const base = VEHICLE_FITMENT_DATA.find(r => r.id === Number(p.rowId));
+    if (base && base.specificRe && t.length <= 40 && base.specificRe.test(normalizeText(bnToEnDigits(t)))) { row = base; used = t; }
+  }
+  if (!row) return null;
+  delete c.pendingVehicleAsk;
+  saveVehicleRow(senderId, row, used);
+  return row;
+}
+function productHasMedia(p) { return Boolean(p) && (getProductMediaUrls(p, 'videos').length > 0 || getProductMediaUrls(p, 'images').length > 0); }
+function pickSalesQuestion(senderId, opts = {}) {
+  if (!SALES_QUESTIONS_ENABLED || opts.skip) return null;
+  const c = ensureCustomer(senderId);
+  const text = String(opts.customerText || '').trim();
+  if (text && (isNo(text) || (text.length <= 25 && SALES_CLOSER_RE.test(normalizeText(text))))) return null;
+  const asked = Array.isArray(c.salesAsked) ? c.salesAsked : [];
+  const topic = getCurrentTopic(senderId), product = topic.product;
+  const row = opts.vehicleRow || savedVehicleRow(c);
+  const lightTopic = product ? LIGHT_PRODUCT_RE.test(`${product.name || ''} ${product.category || ''} ${topic.category || ''}`) : true;
+  const confirmed = row && c.vehicleVariantConfirmed === true && Number(c.vehicleModelId) === row.id;
+  const cands = [];
+  if (row && row.ask && !confirmed && !vehicleVariantSpecified(row, text)) {
+    const fam = findVehicleFamilyHint(row.model);
+    cands.push({ kind: 'variant', key: `variant:${row.id}`, text: row.ask, pending: { kind: 'variant', rowId: row.id, word: fam ? fam.word : '' } });
+  }
+  if (!product) cands.push({ kind: 'product', key: 'product', text: 'আপনি ঠিক কোন পণ্যটি দেখছেন? পণ্যের নাম বা ছবি পাঠালে আমি দাম, ফিটিং ও সব তথ্য এখনই জানিয়ে দিচ্ছি 📸' });
+  if (!row && lightTopic) cands.push({ kind: 'vehicle', key: 'vehicle', text: `আপনার বাইক বা গাড়ির মডেল ও সাল কত? জানালে আমি এখনই মিলিয়ে বলে দিচ্ছি ${product ? 'এই লাইটটি' : 'লাইটটি'} সরাসরি ফিট হবে কি না 🏍️`, pending: { kind: 'vehicle' } });
+  if (row && row.socket && lightTopic) cands.push({ kind: 'socket', key: `socket:${row.id}`, text: `আপনার বাইকের বর্তমান হেডলাইট বাল্বটি কি ${row.socket.split('/')[0].trim()}? জানা থাকলে বলুন, ফিটিং নিশ্চিত করে দেব 👍` });
+  if (product && productHasMedia(product) && !alreadyServedMedia(senderId)) cands.push({ kind: 'media', key: `media:${product.id}`, text: 'লাইটের আলো কেমন হয় তা ভিডিও বা ছবিতে দেখতে চান? 🎥' });
+  if (product) cands.push({ kind: 'order', key: `order:${product.id}`, repeatable: true, text: 'সব ঠিক থাকলে অর্ডার করতে চান? “অর্ডার করব” লিখুন, আমি ওয়েবসাইটের লিংক দিয়ে দিচ্ছি 🛒' });
+  cands.push({ kind: 'more', key: 'more', repeatable: true, text: 'আর কোনো মডেল বা পণ্যের তথ্য লাগলে বলুন, আমি এখনই জানিয়ে দিচ্ছি 😊' });
+  const allowed = x => (!opts.only || opts.only.includes(x.kind)) && !(opts.exclude || []).includes(x.kind);
+  const usable = cands.filter(allowed);
+  return usable.find(x => !asked.includes(x.key)) || usable.find(x => x.repeatable && asked[asked.length - 1] !== x.key) || null;
+}
+// Adds ONE relevant question to the end of a reply (unless the reply already asks something).
+function appendSalesQuestion(senderId, reply, opts = {}) {
+  try {
+    const base = String(reply || '').trim();
+    if (!base || !SALES_QUESTIONS_ENABLED || opts.skip) return reply;
+    if (/[?？]/.test(base.split('\n').slice(-2).join('\n'))) return reply;      // the reply already ends with a question
+    if (!opts.only && base.includes(IMPOTECH_WEBSITE_URL)) return reply;         // order link replies are not followed by more questions
+    const pick = pickSalesQuestion(senderId, opts);
+    if (!pick) return reply;
+    markSalesAsked(senderId, pick.key);
+    if (pick.pending) setPendingVehicleAsk(senderId, pick.pending);
+    return `${base}\n\n${pick.text}`;
+  } catch (err) { console.error('[Sales] question skipped:', err.message); return reply; }
+}
+// Fitment answer for a customer message: exact model -> fitment + next question; only a family name (e.g. "Pulsar") -> ask the version.
+function buildFitmentAnswerWithQuestion(senderId, customerText, fitmentContext) {
+  const unknownModelReply = `${VEHICLE_FITMENT_HANDOFF_REPLY}\nবাইকের পুরো নাম, সাল আর পারলে বর্তমান হেডলাইটের একটি ছবি পাঠান — আমরা দ্রুত নিশ্চিত করে জানাব 📸`;
+  const directRow = findVehicleCompatibility(customerText);
+  const family = directRow ? null : findVehicleFamilyHint(customerText);
+  if (family) {
+    const key = `family:${family.key}`;
+    if (salesAskedBefore(senderId, key)) return unknownModelReply; // asked once already: do not loop, hand over to a person
+    markSalesAsked(senderId, key);
+    setPendingVehicleAsk(senderId, { kind: 'family', word: family.word });
+    return `${family.ask}\nসঠিক মডেলটা জানালে আমি এখনই মিলিয়ে বলে দিচ্ছি লাইটটা আপনার বাইকে সরাসরি ফিট হবে কি না 🏍️`;
+  }
+  const row = directRow || getKnownVehicleCompatibility(senderId, customerText, fitmentContext);
+  if (!row) return unknownModelReply;
+  return appendSalesQuestion(senderId, buildVehicleFitmentReply(row), { customerText, vehicleRow: row });
 }
 
 // -----------------------------------------------------------------------------
@@ -1617,8 +1762,11 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
 ৬) মেমোরি ও প্রসঙ্গ (সবচেয়ে গুরুত্বপূর্ণ): সাধারণ text follow-up-এ নিচের “বর্তমান আলোচ্য বিষয়” ধরে উত্তর দেবে। গ্রাহক নতুন পণ্যের নাম লিখলে সেই পণ্য ধরবে। গ্রাহক নতুন ছবি পাঠালে ছবিটি বর্তমান পণ্যের পরিচয় যাচাই/পরিবর্তনের প্রধান উৎস; পুরোনো active product বা আগের বটের অনুমান দিয়ে নতুন ছবিকে শ্রেণিবদ্ধ করবে না। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে প্রয়োজনমতো ইতিহাস ও মেমোরি ব্যবহার করবে, কিন্তু নতুন সংযুক্ত ছবি পুরোনো প্রসঙ্গের চেয়ে অগ্রাধিকার পাবে। একই তথ্য অকারণে আবার চাইবে না।
 ৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
-৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। সর্বোচ্চ ৪–৫টি ছোট লাইন; অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
+৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। উত্তর সর্বোচ্চ ৪টি ছোট লাইনে, তার পরে শেষে ১টি প্রশ্নের লাইন (মোট ৫ লাইনের বেশি নয়); অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
 ৯) ইমোজি: উত্তরের সঙ্গে প্রসঙ্গ অনুযায়ী স্বাভাবিকভাবে ১–৩টি উপযুক্ত ইমোজি ব্যবহার করতে পারবে—যেমন পণ্যের জন্য 🏍️💡, ছবি/ভিডিওর জন্য 📸🎥, দাম/অফারের জন্য 💰, ডেলিভারির জন্য 🚚, ধন্যবাদের জন্য 😊। একই ইমোজি বারবার দেবে না, অপ্রয়োজনীয় ইমোজি দিয়ে উত্তর ভরাবে না, এবং গ্রাহক আনুষ্ঠানিক উত্তর চাইলে ইমোজি কমাবে।
+১০) সেলসম্যান মোড (সবচেয়ে গুরুত্বপূর্ণ): আপনি একজন অভিজ্ঞ, হাসিখুশি ও আন্তরিক দোকানদারের মতো কথা বলবেন—গ্রাহককে স্বাগত জানাবেন, তার প্রয়োজন বুঝবেন এবং কেনার আগ্রহ বাড়াবেন। প্রতিটি উত্তরে আগে গ্রাহকের প্রশ্নের সরাসরি উত্তর দিন, তারপর শেষ লাইনে ঠিক একটি প্রাসঙ্গিক প্রশ্ন করুন (এক বার্তায় একাধিক প্রশ্ন নয়)। গ্রাহক যে পণ্য বা বিষয় নিয়ে জানতে চাইছেন, প্রশ্ন সেটিকে ঘিরেই হবে—যেমন: কোন বাইক/গাড়ি ও কত সালের মডেল; মডেলের ভার্সন (Plus/Pro/xTec, V1/V2, Single/Twin Disc ইত্যাদি); বর্তমান হেডলাইটের বাল্ব/সকেট টাইপ (H4/HS1 ইত্যাদি) জানা আছে কি না; কোন পণ্যটি দেখছেন; আলো/ভিডিও/ছবি দেখতে চান কি না; অর্ডার করতে চান কি না। কথোপকথনে বা “গ্রাহক মেমোরি”-তে যে তথ্য আগেই পাওয়া গেছে (যেমন বাইকের মডেল) তা আবার জিজ্ঞেস করবেন না; আগের প্রশ্ন হুবহু পুনরাবৃত্তি করবেন না; একটি প্রশ্নের উত্তর পেলে পরের ধাপের প্রশ্নে যাবেন। গ্রাহক “না”/“লাগবে না”/ধন্যবাদ বা বিদায় জানালে নতুন প্রশ্ন করবেন না।
+১১) আকর্ষণীয় উপস্থাপনা: ক্যাটালগে যা আছে শুধু সেই সুবিধা (যেমন উজ্জ্বলতা, সহজ ফিটিং, ওয়ারেন্টি, ডেলিভারি, ফ্রি ডেলিভারি বা অফার থাকলে) ইতিবাচক ও উৎসাহব্যঞ্জক ভাষায় তুলে ধরবেন। ক্যাটালগে নেই এমন ছাড়, অফার, স্টক-সংকট, ওয়ারেন্টি বা বৈশিষ্ট্য কখনো বানিয়ে বলবেন না এবং ভুয়া তাড়াহুড়ো (fake urgency) দেখাবেন না।
+১২) অর্ডার: গ্রাহক কিনতে আগ্রহী হলে চ্যাটে ফোন নম্বর বা ঠিকানা চাইবেন না; অর্ডার শুধু ${IMPOTECH_WEBSITE_URL} ওয়েবসাইটের মাধ্যমে হয়—সিস্টেম নিজেই লিংক পাঠায়।
 বর্তমান আলোচ্য বিষয়:
 ${topicContext}
 
@@ -1991,7 +2139,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       if (db.orderDrafts[id]) delete db.orderDrafts[id];
       if (db.pendingHandover[id]?.orderDraft) delete db.pendingHandover[id];
       saveStorage();
-      await sendFacebookMessage(id, WEBSITE_ORDER_REPLY);
+      await sendFacebookMessage(id, appendSalesQuestion(id, WEBSITE_ORDER_REPLY, { customerText, only: ['variant', 'vehicle'] }));
       return;
     }
 
@@ -2016,13 +2164,21 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       const hasIncomingImage = attachments.some(x => x.type === 'image' && x.payload?.url);
       if (!hasIncomingImage && getMediaTypes(customerText).length) {
         const reply = getProductMediaReply(customerText, id);
-        if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); markServed(id, resolveConversationTopic(customerText, id).product, getMediaTypes(customerText)); return; }
+        if (reply) { await sendFacebookMessage(id, appendSalesQuestion(id, limitToFiveLines(reply, 8), { customerText, exclude: ['media'] })); markServed(id, resolveConversationTopic(customerText, id).product, getMediaTypes(customerText)); return; }
       }
       // 2) "লাইটের আলো কেমন হবে" / "ব্রাইট" / "দেখতে কেমন": show the video (else photo) of the current product.
       if (!hasIncomingImage && isLightQualityQuestion(customerText) && !alreadyServedMedia(id)) {
         const imageFirst = /দেখতে\s*কেমন|কেমন\s*দেখ/.test(normalizeText(customerText));
         const reply = getProductMediaReply(customerText, id, { implicitTypes: imageFirst ? ['images', 'videos'] : ['videos', 'images'] });
-        if (reply) { await sendFacebookMessage(id, limitToFiveLines(reply, 8)); markServed(id, resolveConversationTopic(customerText, id).product, ['videos','images']); return; }
+        if (reply) { await sendFacebookMessage(id, appendSalesQuestion(id, limitToFiveLines(reply, 8), { customerText, exclude: ['media'] })); markServed(id, resolveConversationTopic(customerText, id).product, ['videos','images']); return; }
+      }
+      // v16: the customer is answering our "which bike / version / year?" question: give the fitment answer right away.
+      if (!hasIncomingImage && !isPriceQuestion(customerText) && !isBillingQuestion(customerText) && !/(?:ডেলিভারি|ডিলিভারি|delivery|ওয়ারেন্টি|warranty)/i.test(customerText)) {
+        const answeredRow = resolvePendingVehicleAnswer(id, customerText);
+        if (answeredRow) {
+          await sendFacebookMessage(id, appendSalesQuestion(id, buildVehicleFitmentReply(answeredRow), { customerText, vehicleRow: answeredRow }));
+          return;
+        }
       }
       // 3) FAQ: sent verbatim only if it clearly matches and does not belong to another product/category.
       // A pure price question is answered from the live catalog (next step), never from a FAQ; a message with a new image is answered by image analysis.
@@ -2032,9 +2188,9 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
         const faqAnswer = String(matchedFaq.answer || '').trim();
         if (faqAnswer) {
           console.log(`[FAQ] Direct FAQ match for ${id}; category=${matchedFaq.category || 'unspecified'}`);
-          await sendFacebookMessage(id, faqAnswer);
           const faqProduct = faqLinkedProduct(matchedFaq);
           if (faqProduct && !findActiveProduct(id)) rememberActiveProduct(id, faqProduct); // the FAQ was about this product: remember it
+          await sendFacebookMessage(id, appendSalesQuestion(id, faqAnswer, { customerText }));
           syncActiveProductFromReply(id, faqAnswer, { allowSwitch: false });
           return;
         }
@@ -2047,16 +2203,15 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       // 4) Vehicle fitment from the customer-provided motorcycle/car reference table (never guessed).
       const fitmentContext = [getRecentConversationText(id, customerText), db.customers[id]?.vehicleModelName || '', db.customers[id]?.activeProductName || ''].filter(Boolean).join('\n');
       if (isVehicleHeadlightFitmentInquiry(customerText, fitmentContext)) {
-        const vehicle = getKnownVehicleCompatibility(id, customerText, fitmentContext);
-        await sendFacebookMessage(id, buildVehicleFitmentReply(vehicle));
+        await sendFacebookMessage(id, buildFitmentAnswerWithQuestion(id, customerText, fitmentContext));
         return;
       }
       // 5) Delivery-charge questions are informational, not order intent; never request address/phone for them.
       if (/(?:ডেলিভারি|ডিলিভারি|কুরিয়ার)\s*(?:চার্জ|খরচ)|delivery\s*charge|courier\s*(?:fee|charge)/i.test(customerText) && !/(?:সর্বমোট|মোট বিল|grand total|total bill|invoice)/i.test(customerText) && !isBillingQuestion(customerText)) {
         const place = normalizeText(customerText);
-        if (/গাজীপুরের\s*(?:ভেতরে|মধ্যে|ভিতরে)|inside\s*gazipur|within\s*gazipur/i.test(place)) await sendFacebookMessage(id, 'গাজীপুরের ভেতরে ডেলিভারি চার্জ ৫০ টাকা।');
-        else if (/গাজীপুরের\s*(?:বাইরে)|outside\s*gazipur|outside\s*of\s*gazipur/i.test(place)) await sendFacebookMessage(id, 'গাজীপুরের বাইরে ডেলিভারি চার্জ ১০০ টাকা।');
-        else await sendFacebookMessage(id, 'ডেলিভারি চার্জ গাজীপুরের ভেতরে ৫০ টাকা এবং গাজীপুরের বাইরে ১০০ টাকা।');
+        if (/গাজীপুরের\s*(?:ভেতরে|মধ্যে|ভিতরে)|inside\s*gazipur|within\s*gazipur/i.test(place)) await sendFacebookMessage(id, appendSalesQuestion(id, 'গাজীপুরের ভেতরে ডেলিভারি চার্জ ৫০ টাকা। 🚚', { customerText }));
+        else if (/গাজীপুরের\s*(?:বাইরে)|outside\s*gazipur|outside\s*of\s*gazipur/i.test(place)) await sendFacebookMessage(id, appendSalesQuestion(id, 'গাজীপুরের বাইরে ডেলিভারি চার্জ ১০০ টাকা। 🚚', { customerText }));
+        else await sendFacebookMessage(id, appendSalesQuestion(id, 'ডেলিভারি চার্জ গাজীপুরের ভেতরে ৫০ টাকা এবং গাজীপুরের বাইরে ১০০ টাকা। 🚚', { customerText }));
         return;
       }
       // 6) Smart billing from live catalog prices. Quantity and delivery area come ONLY from the customer's own words
@@ -2070,7 +2225,7 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
           const quantity = askedQuantity || Number(draft.quantity) || 1;
           const area = extractAddress(customerText) || (BD_PLACE_RE.test(customerText) ? customerText : '') || draft.address || db.customers[id]?.address || '';
           const fee = isFreeDeliveryProduct(p) ? 0 : getDeliveryFee(area);
-          await sendFacebookMessage(id, limitToFiveLines(buildSmartBillReply(p, quantity, fee, { assumedQuantity: !askedQuantity && !draft.quantity }), 8));
+          await sendFacebookMessage(id, appendSalesQuestion(id, limitToFiveLines(buildSmartBillReply(p, quantity, fee, { assumedQuantity: !askedQuantity && !draft.quantity }), 8), { customerText }));
           return;
         }
         const list = topic.categoryProducts.length ? '\n' + topic.categoryProducts.map((x, i) => `${i + 1}. ${x.name}`).join('\n') : '';
@@ -2081,12 +2236,12 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       if (!orderIntent && !hasIncomingImage && isPriceQuestion(customerText)) {
         const topic = resolveConversationTopic(customerText, id);
         if (topic.product) {
-          await sendFacebookMessage(id, getPriceReply(topic.product) || `দুঃখিত, ${topic.product.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই।`);
+          await sendFacebookMessage(id, appendSalesQuestion(id, getPriceReply(topic.product) || `দুঃখিত, ${topic.product.name}-এর দাম বর্তমানে ক্যাটালগে উল্লেখ নেই।`, { customerText }));
           return;
         }
         if (topic.categoryProducts.length) {
           const priceLines = topic.categoryProducts.slice(0, 3).map(item => getPriceReply(item) || `${item.name}-এর দাম ক্যাটালগে উল্লেখ নেই।`);
-          await sendFacebookMessage(id, priceLines.join('\n'));
+          await sendFacebookMessage(id, appendSalesQuestion(id, priceLines.join('\n'), { customerText }));
           return;
         }
         await sendFacebookMessage(id, topic.category ? 'এই ক্যাটাগরির নির্দিষ্ট পণ্য শনাক্ত করতে পারিনি। ক্যাটালগে একাধিক মডেল থাকলে পণ্যের ছবি বা মডেল পাঠান।' : 'কোন পণ্যের দাম জানতে চান? পণ্যের নাম/মডেল লিখুন বা পণ্যের ছবি পাঠান।');
@@ -2117,9 +2272,10 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
       db.pendingHandover[id]={reason:'AI could not understand customer question',createdAt:new Date().toISOString()};saveStorage();return;
     }
     const previous=getPreviousAssistantReply(id,customerText);
-    if(previous&&normalizeText(previous)===normalizeText(reply))reply='আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';
+    let salesSkip=false;
+    if(previous&&normalizeText(previous)===normalizeText(reply)){reply='আগের উত্তরে বিষয়টি জানিয়েছি। কোন অংশটি আরও পরিষ্কার করতে হবে বলুন, আমি সাহায্য করছি।';salesSkip=true;}
     if(!getTakeoverState(id)){
-      await deliverAIReply(id,limitToFiveLines(reply));
+      await deliverAIReply(id,appendSalesQuestion(id,limitToFiveLines(reply),{customerText,skip:salesSkip}));
       // The image classifier already writes the catalog-validated product ID. Do not let free-form
       // reply text switch it back to an older product immediately after image analysis.
       if (!attachments.some(x => x.type === 'image' && x.payload?.url)) syncActiveProductFromReply(id,reply,{allowSwitch:true});
@@ -2133,6 +2289,8 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
 // One incoming Messenger message: voice transcription, storage, memory, 5-second delay, auto handover, answer.
 async function handleIncomingMessage({ senderId, text: rawText, attachments, messageId, receivedAt }) {
   if (messageId && db.messages.some(m => m.messageId === messageId)) return;
+  // v16: private admin chat commands (.help .list .human .1off .ai .alloff .allon .status .myid .login) are answered instantly, never as a customer message.
+  if (rawText && !(attachments || []).length && /^\s*[.\/!#\u0964]/.test(String(rawText))) { try { if (await handleAdminChatCommand(senderId, rawText)) return; } catch (err) { console.error('[ChatControl] Admin command failed:', err.message); } }
   let text = rawText, isVoice = false, voiceFailed = false;
   const audio = attachments.find(a => a.type === 'audio' && a.payload?.url);
   if (audio && !text && !getTakeoverState(senderId)) {
@@ -2228,6 +2386,173 @@ function verifyMetaSignature(req) {
 const HUMAN_REQUEST_ONLY_RE = /^(?:প্রতিনিধি|human|agent|human agent|কাস্টমার কেয়ার|customer care|real person)$/i;
 const HUMAN_REQUEST_RE = /প্রতিনিধি(?:র|কে)?\s*(?:সাথে|সঙ্গে)?\s*(?:কথা|যোগাযোগ)|প্রতিনিধি\s*(?:চাই|দিন|দেন|লাগবে)|(?:মানুষ|এজেন্ট|হিউম্যান)(?:ের|এর)?\s*(?:সাথে|সঙ্গে)\s*কথা|(?:talk|speak|connect|chat)\s*(?:to|with)\s*(?:a\s*|an\s*|the\s*|your\s*)?(?:human|agent|person|representative|someone|manager)|real\s*person|human\s*agent|customer\s*care\s*(?:er\s*)?(?:sathe|shathe)?|(?:manush|agent|representative)\s*(?:er|r)?\s*(?:sathe|shathe)\s*kotha/i;
 function isHumanRequest(normalized = '') { return HUMAN_REQUEST_ONLY_RE.test(normalized) || HUMAN_REQUEST_RE.test(normalized); }
+// ---- v16: chat control (.ai / .human / .1off ...) -------------------------------------------------------
+// Two ways to control the AI from chat:
+//  A) Page Inbox / Business Suite: type the command inside the customer's thread (needs the webhook field "message_echoes").
+//  B) Private admin chat: an admin (ADMIN_PSIDS, or .login <ADMIN_CHAT_PASSCODE>) messages the Page and controls any customer.
+const CHAT_COMMAND_WORDS = {
+  off: ['human', 'stop', 'pause', 'off', 'hold', 'হিউম্যান', 'থামো', 'বন্ধ'],
+  oneoff: ['1off', '1-off', 'oneoff', 'one-off', 'once', 'একবার'],
+  on: ['ai', 'on', 'resume', 'start', 'auto', 'এআই', 'চালু'],
+  all_off: ['alloff', 'all-off', 'allstop', 'সবঅফ'],
+  all_on: ['allon', 'all-on', 'allstart', 'সবচালু'],
+  list: ['list', 'paused', 'লিস্ট'],
+  status: ['status', 'স্ট্যাটাস'],
+  help: ['help', 'commands', 'cmd', 'হেল্প'],
+  myid: ['myid', 'psid', 'id'],
+  login: ['login', 'admin'],
+  logout: ['logout']
+};
+function parseChatCommand(rawText) {
+  const t = String(rawText || '').normalize('NFKC').replace(/[\u200b-\u200d\u2060\ufeff]/g, '').trim().toLowerCase();
+  const m = t.match(/^[.\/!#\u0964]\s*([^\s.\/!#\u0964]+)\s*(.*)$/u);
+  if (!m) return null;
+  const word = m[1];
+  const action = Object.keys(CHAT_COMMAND_WORDS).find(a => CHAT_COMMAND_WORDS[a].includes(word));
+  if (!action) return null;
+  const args = (action === 'login' ? String(rawText || '').normalize('NFKC').trim().replace(/^[.\/!#\u0964]\s*\S+\s*/u, '') : m[2]).replace(/[.!?\u0964\s]+$/u, '').trim();
+  return { action, word, args };
+}
+function parseDurationMs(value) {
+  const t = bnToEnDigits(String(value || '')).toLowerCase().replace(/\s+/g, '');
+  const m = t.match(/^(\d+(?:\.\d+)?)(m|min|mins|minute|minutes|মিনিট|h|hr|hrs|hour|hours|ঘণ্টা|ঘন্টা|d|day|days|দিন)?$/);
+  if (!m) return null;
+  const unit = m[2] || 'm';
+  const mult = /^(?:h|hr|hrs|hour|hours|ঘণ্টা|ঘন্টা)$/.test(unit) ? 3600000 : /^(?:d|day|days|দিন)$/.test(unit) ? 86400000 : 60000;
+  const ms = Number(m[1]) * mult;
+  return ms > 0 && ms <= 30 * 86400000 ? ms : null;
+}
+function formatDuration(ms) {
+  const mins = Math.max(1, Math.round(ms / 60000));
+  if (mins < 60) return `${mins} মিনিট`;
+  if (mins < 1440) return `${Math.round(mins / 60 * 10) / 10} ঘণ্টা`;
+  return `${Math.round(mins / 1440 * 10) / 10} দিন`;
+}
+function noteChatCommand(source, label) {
+  chatControlStats.commandsHandled++; chatControlStats.lastCommand = label;
+  chatControlStats.lastCommandAt = new Date().toISOString(); chatControlStats.lastCommandSource = source;
+}
+function isChatAdmin(senderId) {
+  const id = String(senderId || '');
+  return ADMIN_PSIDS.has(id) || (Array.isArray(db.settings?.adminPsids) && db.settings.adminPsids.includes(id));
+}
+async function setGlobalAiPause(on) {
+  db.isGlobalPaused = Boolean(on);
+  if (db.isGlobalPaused) for (const id of Object.keys(db.scheduledFollowups)) cancelFollowup(id);
+  saveStorage();
+  return db.isGlobalPaused;
+}
+// Applies .human / .1off / .ai to ONE customer. Returns a short Bangla description of what changed.
+async function applyChatCommandToCustomer(customerId, cmd, source) {
+  const id = String(customerId), label = `.${cmd.word}`, argMs = cmd.args ? parseDurationMs(cmd.args) : null;
+  let note;
+  if (cmd.action === 'on') {
+    delete db.pendingHandover[id];
+    await setTakeoverState(id, false, `Chat command ${label} (${source})`);
+    note = 'AI আবার চালু হয়েছে';
+    if (db.isGlobalPaused) note += ' (⚠️ তবে গ্লোবাল AI বন্ধ আছে — সবার জন্য চালু করতে .allon দিন)';
+  } else if (cmd.action === 'oneoff') {
+    const ms = argMs || ONE_OFF_PAUSE_MS;
+    await setTakeoverState(id, true, `Chat command ${label} (${source})`, { expiresInMs: ms });
+    note = `শুধু এই কাস্টমারের AI ${formatDuration(ms)} বন্ধ; এরপর নিজে থেকে চালু হবে (আগে চালু করতে .ai)`;
+  } else {
+    await setTakeoverState(id, true, `Chat command ${label} (${source})`, argMs ? { expiresInMs: argMs } : {});
+    note = argMs ? `AI ${formatDuration(argMs)} বন্ধ; এরপর নিজে থেকে চালু হবে` : 'AI বন্ধ — আবার চালু করতে .ai লিখুন';
+  }
+  noteChatCommand(source, `${label} → …${id.slice(-4)}`);
+  console.log(`[ChatControl] ${label} ${id} (${source}): ${note}`);
+  return note;
+}
+function findCustomersByRef(ref) {
+  const q = bnToEnDigits(String(ref || '')).trim().toLowerCase();
+  const all = Object.values(db.customers).filter(c => c && c.id && !isChatAdmin(c.id) && !String(c.id).startsWith('eval_'));
+  const byRecent = list => list.sort((a, b) => Date.parse(b.lastActive || 0) - Date.parse(a.lastActive || 0));
+  if (!q || q === 'last' || q === 'latest' || q === 'শেষ') return byRecent(all).slice(0, 1);
+  if (/^\d{3,}$/.test(q)) return byRecent(all.filter(c => String(c.id).endsWith(q)));
+  return byRecent(all.filter(c => String(c.name || '').toLowerCase().includes(q) || String(c.id).toLowerCase() === q));
+}
+function describeCustomer(c) { return `${c.name || 'Customer'} (…${String(c.id).slice(-4)})`; }
+const ADMIN_CHAT_HELP = `🛠️ অ্যাডমিন কমান্ড
+.list — যাদের AI বন্ধ আছে
+.human [কাস্টমার] — ওই কাস্টমারের AI বন্ধ (.ai না দেওয়া পর্যন্ত)
+.1off [কাস্টমার] [মিনিট] — শুধু ওই এক কাস্টমারের AI সাময়িক বন্ধ (ডিফল্ট ${Math.round(ONE_OFF_PAUSE_MS / 60000)} মিনিট, পরে নিজে চালু)
+.ai [কাস্টমার] — ওই কাস্টমারের AI চালু
+.alloff / .allon — সবার জন্য AI বন্ধ / চালু
+.status — বর্তমান অবস্থা
+[কাস্টমার] = নামের অংশ বা ID-এর শেষ ৩-৪ ডিজিট। না দিলে সর্বশেষ মেসেজ দেওয়া কাস্টমার।
+কাস্টমারের থ্রেডে সরাসরি .human / .1off / .ai লিখলেও কাজ করবে (Page Inbox / Business Suite)।`;
+// Private admin chat. Returns true when the message was a command and has been handled.
+async function handleAdminChatCommand(senderId, rawText) {
+  const id = String(senderId || '');
+  const cmd = parseChatCommand(rawText);
+  if (!cmd) return false;
+  const reply = text => sendFacebookMessage(id, text, { metadata: ADMIN_ECHO_METADATA });
+  if (cmd.action === 'myid') {
+    await reply(`আপনার Messenger ID (PSID): ${id}\n${isChatAdmin(id) ? '✅ আপনি অ্যাডমিন হিসেবে যুক্ত আছেন। .help লিখে কমান্ড দেখুন।' : 'অ্যাডমিন কন্ট্রোল চালু করতে এই ID সার্ভারের ADMIN_PSIDS-এ যোগ করুন (অথবা ADMIN_CHAT_PASSCODE সেট করে .login <পাসকোড> লিখুন)।'}`);
+    return true;
+  }
+  if (cmd.action === 'login') {
+    if (!ADMIN_CHAT_PASSCODE) return false;
+    if (isChatAdmin(id)) { await reply('✅ আপনি আগে থেকেই অ্যাডমিন। .help লিখে কমান্ড দেখুন।'); return true; }
+    const rec = loginAttempts.get(id), fresh = !rec || Date.now() - rec.windowStart > 3600000;
+    if (!fresh && rec.count >= 5) { await reply('অনেকবার ভুল পাসকোড দেওয়া হয়েছে। কিছুক্ষণ পরে চেষ্টা করুন।'); return true; }
+    const a = Buffer.from(cmd.args), b = Buffer.from(ADMIN_CHAT_PASSCODE);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      db.settings = db.settings && typeof db.settings === 'object' ? db.settings : {};
+      db.settings.adminPsids = [...new Set([...(Array.isArray(db.settings.adminPsids) ? db.settings.adminPsids : []), id])];
+      loginAttempts.delete(id); saveStorage(); noteChatCommand('admin-chat', '.login');
+      await reply('✅ অ্যাডমিন হিসেবে যুক্ত হয়েছেন। .help লিখে কমান্ড দেখুন।');
+    } else {
+      loginAttempts.set(id, fresh ? { count: 1, windowStart: Date.now() } : { count: rec.count + 1, windowStart: rec.windowStart });
+      await reply('পাসকোড মেলেনি।');
+    }
+    return true;
+  }
+  if (!isChatAdmin(id)) return false;   // everyone else: the message goes through the normal customer flow
+  if (cmd.action === 'logout') {
+    if (Array.isArray(db.settings?.adminPsids)) db.settings.adminPsids = db.settings.adminPsids.filter(x => x !== id);
+    saveStorage(); await reply(ADMIN_PSIDS.has(id) ? 'আপনি ADMIN_PSIDS-এ আছেন; সার্ভারের environment থেকে সরালে তবেই অ্যাডমিন থাকা বন্ধ হবে।' : 'অ্যাডমিন অ্যাক্সেস সরানো হয়েছে।');
+    return true;
+  }
+  noteChatCommand('admin-chat', `.${cmd.word}${cmd.args ? ' ' + cmd.args : ''}`);
+  if (cmd.action === 'help') { await reply(ADMIN_CHAT_HELP); return true; }
+  if (cmd.action === 'all_off' || cmd.action === 'all_on') {
+    await setGlobalAiPause(cmd.action === 'all_off');
+    await reply(cmd.action === 'all_off' ? '⏸️ সব কাস্টমারের জন্য AI বন্ধ করা হয়েছে। চালু করতে .allon লিখুন।' : '▶️ সব কাস্টমারের জন্য AI চালু করা হয়েছে (যাদের আলাদা করে বন্ধ করা আছে তাদের বাদে)।');
+    return true;
+  }
+  if (cmd.action === 'list') {
+    const paused = Object.keys(db.takeovers).filter(cid => getTakeoverState(cid) && !isChatAdmin(cid));
+    const lines = paused.slice(0, 15).map((cid, i) => {
+      const t = db.takeovers[cid] || {}, left = t.expiresAt ? ` — ${formatDuration(Number(t.expiresAt) - Date.now())} পরে চালু` : ' — .ai না দেওয়া পর্যন্ত';
+      return `${i + 1}) ${describeCustomer(db.customers[cid] || { id: cid })}${left}`;
+    });
+    await reply(`${db.isGlobalPaused ? '⚠️ গ্লোবাল AI বন্ধ আছে (.allon দিন)।\n' : ''}${lines.length ? `AI বন্ধ আছে (${paused.length} জন):\n${lines.join('\n')}` : 'এই মুহূর্তে কোনো কাস্টমারের AI আলাদা করে বন্ধ নেই।'}`);
+    return true;
+  }
+  if (cmd.action === 'status') {
+    const s2 = chatControlStats, paused = Object.keys(db.takeovers).filter(cid => getTakeoverState(cid)).length;
+    await reply(`গ্লোবাল AI: ${db.isGlobalPaused ? 'বন্ধ ⏸️' : 'চালু ▶️'}\nAI বন্ধ কাস্টমার: ${paused} জন\nPage Inbox echo: ${s2.echoEvents ? `পাওয়া যাচ্ছে ✅ (সর্বশেষ ${s2.lastEchoAt})` : '⚠️ এখনো কোনো echo আসেনি — Meta App → Webhooks → Page-এ message_echoes সাবস্ক্রাইব করুন'}\nসর্বশেষ কমান্ড: ${s2.lastCommand || '—'}`);
+    return true;
+  }
+  // .human / .1off / .ai [customer] [minutes]
+  const tokens = cmd.args.split(/\s+/).filter(Boolean);
+  let durationArg = '', refTokens = tokens;
+  if (cmd.action !== 'on' && tokens.length) {
+    const last = tokens[tokens.length - 1];
+    const lastIsDuration = parseDurationMs(last) !== null && (tokens.length >= 2 || /[a-zA-Z\u0980-\u09ff]/.test(last) || bnToEnDigits(last).replace(/\D/g, '').length <= 2);
+    if (lastIsDuration) { durationArg = last; refTokens = tokens.slice(0, -1); }
+  }
+  const matches = findCustomersByRef(refTokens.join(' '));
+  if (!matches.length) { await reply('কোনো কাস্টমার খুঁজে পাইনি। নামের অংশ বা ID-এর শেষ ৩-৪ ডিজিট লিখুন (যেমন .human 4321)।'); return true; }
+  if (matches.length > 1) {
+    await reply(`একাধিক কাস্টমার মিলেছে, আরও নির্দিষ্ট করুন:\n${matches.slice(0, 5).map((c, i) => `${i + 1}) ${describeCustomer(c)}`).join('\n')}\nউদাহরণ: .${cmd.word} ${String(matches[0].id).slice(-4)}`);
+    return true;
+  }
+  const note = await applyChatCommandToCustomer(matches[0].id, { ...cmd, args: durationArg }, 'admin-chat');
+  await reply(`✅ ${describeCustomer(matches[0])}: ${note}`);
+  return true;
+}
 async function handlePageEcho(event, message) {
   try {
     const customerId = String(event?.recipient?.id || '');
@@ -2236,9 +2561,13 @@ async function handlePageEcho(event, message) {
     if (meta.startsWith('IMPOTECH_')) return;                         // sent by this server (bot or admin app)
     if (message.mid && botSentMids.has(String(message.mid))) return;  // sent by this server
     const text = String(message.text || '').normalize('NFKC').trim();
-    const command = normalizeText(text).replace(/\s+/g, '');
-    if (['.human','.stop','.pause'].includes(command)) { await setTakeoverState(customerId, true, `Admin chat command ${command}`); console.log(`[Takeover] Admin enabled human takeover for ${customerId} via ${command}`); return; }
-    if (['.ai','.resume'].includes(command)) { delete db.pendingHandover[customerId]; await setTakeoverState(customerId, false, `Admin chat command ${command}`); console.log(`[Takeover] Admin resumed AI for ${customerId} via ${command}`); return; }
+    // v16: commands typed by the page admin inside the customer's thread (.human / .1off / .ai / .alloff / .allon)
+    const cmd = text ? parseChatCommand(text) : null;
+    if (cmd) {
+      if (['off', 'oneoff', 'on'].includes(cmd.action) && (!cmd.args || parseDurationMs(cmd.args) !== null)) { await applyChatCommandToCustomer(customerId, cmd, 'page-inbox'); return; }
+      if (cmd.action === 'all_off' || cmd.action === 'all_on') { await setGlobalAiPause(cmd.action === 'all_off'); noteChatCommand('page-inbox', `.${cmd.word}`); return; }
+      if (['list', 'status', 'help', 'myid', 'login', 'logout'].includes(cmd.action)) return; // these are answered only in the private admin chat
+    }
     if (!AUTO_TAKEOVER_ON_ADMIN_REPLY || db.isGlobalPaused) return;
     if (text && HUMAN_ECHO_IGNORE_RE && HUMAN_ECHO_IGNORE_RE.test(text)) return;  // Page automation (welcome greeting), not a person
     const c = db.customers[customerId];
@@ -2303,7 +2632,7 @@ app.post('/webhook',async(req,res)=>{
     for(const entry of req.body.entry||[])for(const event of entry.messaging||[]) {
       const senderId=event.sender?.id,message=event.message,messageId=message?.mid,receivedAt=Date.now();
       // Page echoes: this server's own messages are ignored; a human reply from Page Inbox / Business Suite pauses the bot.
-      if (message?.is_echo) { await handlePageEcho(event, message); continue; }
+      if (message?.is_echo) { chatControlStats.echoEvents++; chatControlStats.lastEchoAt = new Date().toISOString(); await handlePageEcho(event, message); continue; }
       if(event.call && senderId) {
         await setTakeoverState(senderId,true,'Incoming Messenger call event'); // takeover is immediate, the reply follows the delay
         enqueueCustomerTask(senderId, async () => {
@@ -2382,7 +2711,7 @@ app.post('/api/customers/:senderId/send',async(req,res)=>{const text=String(req.
 // -----------------------------------------------------------------------------
 app.get('/health',(req,res)=>res.status(200).json({success:true,status:'ok',storage:pool?'postgresql':'memory-only'}));
 app.get('/api/health',(req,res)=>res.status(200).json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',isGlobalPaused:!!db.isGlobalPaused}));
-app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogQualityWarnings:getCatalogQualityWarnings(),catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,catalogSyncMode:CATALOG_SYNC_MODE,catalogAutoRefreshSeconds:Math.round(CATALOG_REFRESH_INTERVAL_MS/1000),catalogDirty,replyDelayMs:REPLY_DELAY_MS,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,voiceModel:VOICE_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
+app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogQualityWarnings:getCatalogQualityWarnings(),catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,catalogSyncMode:CATALOG_SYNC_MODE,catalogAutoRefreshSeconds:Math.round(CATALOG_REFRESH_INTERVAL_MS/1000),catalogDirty,replyDelayMs:REPLY_DELAY_MS,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,voiceModel:VOICE_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,salesQuestions:SALES_QUESTIONS_ENABLED,chatControl:{adminPsidsConfigured:ADMIN_PSIDS.size,adminsRegisteredByLogin:(db.settings?.adminPsids||[]).length,passcodeLoginEnabled:Boolean(ADMIN_CHAT_PASSCODE),oneOffPauseMinutes:Math.round(ONE_OFF_PAUSE_MS/60000),...chatControlStats},historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
 app.get('/api/catalog/media-status',(req,res)=>res.json({success:true,products:products.map(p=>({id:p.id,name:p.name,images:getProductMediaUrls(p,'images').length,videos:getProductMediaUrls(p,'videos').length}))}));
 
 // ============================================================================
@@ -2809,6 +3138,8 @@ async function startServer() {
     if(!PAGE_ACCESS_TOKEN)console.warn('[CONFIG] PAGE_ACCESS_TOKEN missing');
     if(!VERIFY_TOKEN)console.warn('[CONFIG] VERIFY_TOKEN missing');
     if(!OPENROUTER_API_KEY)console.warn('[CONFIG] OPENROUTER_API_KEY missing');
+    console.log(`[CHAT-CONTROL] Page-inbox commands (.ai/.human/.1off) need the webhook field "message_echoes". Private admin chat: ${ADMIN_PSIDS.size ? ADMIN_PSIDS.size + ' admin PSID(s) configured' : (ADMIN_CHAT_PASSCODE ? 'passcode login enabled (.login <passcode>)' : 'NOT configured - set ADMIN_PSIDS or ADMIN_CHAT_PASSCODE; send .myid to the Page to see your PSID')}`);
+    console.log(`[SALES] Salesman questions ${SALES_QUESTIONS_ENABLED ? 'ON' : 'OFF'}; vehicle fitment rows: ${VEHICLE_FITMENT_DATA.length}`);
     startCatalogAutoRefresh();
   });
 }
