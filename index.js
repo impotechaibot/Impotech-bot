@@ -1145,13 +1145,13 @@ function getKnownVehicleCompatibility(senderId, currentText = '', contextText = 
   return findVehicleCompatibility(contextText);
 }
 const VEHICLE_FITMENT_HANDOFF_REPLY = 'আমাদের দেওয়া তালিকায় আপনার বাইক/গাড়ির নির্দিষ্ট মডেলটি নিশ্চিতভাবে মেলেনি। সঠিক ফিটমেন্ট নিশ্চিত করতে আমাদের প্রতিনিধি সাহায্য করবে।';
-function describeVehicle(row) {
-  const extra = [row.years, row.cc].filter(Boolean).join(', ');
+function describeVehicle(row, year) {
+  const extra = year ? `${year} মডেল` : [row.years, row.cc].filter(Boolean).join(', ');
   return `${row.brand} ${row.model}${extra ? ` (${extra})` : ''}`;
 }
-function buildVehicleFitmentReply(row) {
+function buildVehicleFitmentReply(row, year) {
   if (!row) return VEHICLE_FITMENT_HANDOFF_REPLY;
-  const name = describeVehicle(row);
+  const name = describeVehicle(row, year);
   const socket = row.socket ? `Socket: ${row.socket}` : '';
   if (/DC Conversion Required/i.test(row.fitment)) {
     const connection = /Direct Plug-and-Play/i.test(row.fitment) ? 'কনভার্সনের পরে Direct Plug-and-Play' : 'Direct Fit';
@@ -1221,6 +1221,104 @@ function resolvePendingVehicleAnswer(senderId, text) {
   saveVehicleRow(senderId, row, used);
   return row;
 }
+// ===== v16.1 BEGIN: bike model / year sent in two (or three) short messages =====================================
+// Customers often write the bike in pieces: "Discover" + "125", or "Discover 125" + "Model 2021".
+// The pieces are joined (customer messages from the last 3 minutes only) and answered from the same fitment table.
+const SPLIT_VEHICLE_WINDOW_MS = 3 * 60 * 1000;
+const queuedCustomerTexts = new Map(); // senderId -> [{ text, receivedAt }] messages received but not answered yet
+function noteQueuedCustomerText(senderId, text, receivedAt) {
+  const id = String(senderId || ''), t = String(text || '').normalize('NFKC').trim();
+  if (!id || !t) return;
+  const cutoff = Date.now() - 2 * 60 * 1000;
+  const list = (queuedCustomerTexts.get(id) || []).filter(x => x.receivedAt >= cutoff);
+  list.push({ text: t, receivedAt: Number(receivedAt || Date.now()) });
+  queuedCustomerTexts.set(id, list.slice(-6));
+}
+// The customer's own previous short messages (the current one is already the last stored message and is dropped).
+function recentCustomerFragments(senderId, currentText, max = 2) {
+  const now = Date.now(), cur = normalizeText(currentText);
+  const msgs = getHistory(senderId).filter(h => h.role === 'user');
+  if (msgs.length && normalizeText(msgs[msgs.length - 1].text) === cur) msgs.pop();
+  const out = [];
+  for (let i = msgs.length - 1; i >= 0 && out.length < max; i--) {
+    const m = msgs[i], t = String(m.text || '').trim();
+    if (now - Number(m.timestamp || 0) > SPLIT_VEHICLE_WINDOW_MS) break;
+    if (!t || t.length > 60 || t.startsWith('[')) break; // long text or a media placeholder is not a model fragment
+    out.unshift(t);
+  }
+  return out;
+}
+// The row when `parts` (consecutive short messages) name a model only TOGETHER: the earlier parts alone match nothing
+// and the last part really is a piece of the matched model name (so "150 ওয়াট" never completes "Pulsar").
+function matchSplitVehicleParts(parts) {
+  const clean = (parts || []).map(p => String(p || '').trim()).filter(Boolean);
+  if (clean.length < 2) return null;
+  const lastCompact = compactVehicleText(clean[clean.length - 1]);
+  if (lastCompact.length < 2) return null;
+  if (findVehicleCompatibility(clean.slice(0, -1).join(' '))) return null; // already a complete model before the last part
+  const row = findVehicleCompatibility(clean.join(' '));
+  if (!row) return null;
+  const aliases = [...row.aliases, row.model, `${row.brand} ${row.model}`].map(compactVehicleText);
+  return aliases.some(a => a.includes(lastCompact)) ? row : null;
+}
+function findVehicleFromSplitMessages(senderId, currentText) {
+  const cur = String(currentText || '').trim();
+  if (!cur || cur.length > 40 || findVehicleCompatibility(cur)) return null; // a complete model in this message is handled normally
+  const frags = recentCustomerFragments(senderId, cur, 2);
+  for (let n = 1; n <= frags.length; n++) {
+    const parts = [...frags.slice(frags.length - n), cur];
+    const row = matchSplitVehicleParts(parts);
+    if (row) return { row, text: parts.join(' ') };
+  }
+  return null;
+}
+// This message is only the first piece of a model name and the next message (already received) completes it: do not answer
+// the half name; the next message gets the single, complete answer.
+function shouldHoldForSplitVehicleMessage(senderId, text, attachments, receivedAt) {
+  try {
+    const cur = String(text || '').normalize('NFKC').trim();
+    if ((attachments || []).length || !cur || cur.length > 40) return false;
+    const later = (queuedCustomerTexts.get(String(senderId)) || [])
+      .filter(x => x.receivedAt > Number(receivedAt || 0) && x.text.length <= 40).map(x => x.text).slice(0, 2);
+    if (!later.length) return false;
+    const before = [...recentCustomerFragments(senderId, cur, 2), cur];
+    if (findVehicleCompatibility(before.join(' '))) return false; // this message already names a model: answer now
+    for (let k = 1; k <= later.length; k++) if (matchSplitVehicleParts([...before, ...later.slice(0, k)])) return true;
+    return false;
+  } catch (_) { return false; }
+}
+// "Model 2021", "2021", "২০২১ সালের", "2021 model": a message that carries only the model year.
+const MODEL_YEAR_RE = /(?<!\d)(19[89]\d|20[0-3]\d)(?!\d)/;
+function extractModelYear(text = '') {
+  const m = bnToEnDigits(String(text || '').normalize('NFKC')).match(MODEL_YEAR_RE);
+  return m ? Number(m[1]) : null;
+}
+function isYearOnlyMessage(text = '') {
+  const t = bnToEnDigits(normalizeText(text));
+  if (!MODEL_YEAR_RE.test(t)) return false;
+  return t.replace(MODEL_YEAR_RE, ' ').replace(/model|year|made|saal|sal|মডেল(?:ের|ে)?|সাল(?:ের|ে|র)?|বছর(?:ের)?|ইং|এর/gi, ' ').replace(/[\s.-]+/g, ' ').trim() === '';
+}
+// The bike the customer named a moment ago (the year belongs to it).
+function savedRecentVehicleRow(senderId, maxAgeMs = 15 * 60 * 1000) {
+  const c = db.customers[String(senderId || '')];
+  if (!c || !c.vehicleModelUpdatedAt) return null;
+  if (Date.now() - new Date(c.vehicleModelUpdatedAt).getTime() > maxAgeMs) return null;
+  return savedVehicleRow(c);
+}
+// true / false when the table has a year range for this row, null when it has none (then the year cannot contradict the table).
+function vehicleYearInRange(row, year) {
+  const m = String(row?.years || '').match(/(\d{4})\s*-\s*(\d{4})|(\d{4})/);
+  if (!m) return null;
+  const from = Number(m[1] || m[3]), to = Number(m[2] || m[3]);
+  return year >= from && year <= to;
+}
+function buildVehicleYearReply(row, year) {
+  if (vehicleYearInRange(row, year) === false) {
+    return `${VEHICLE_FITMENT_HANDOFF_REPLY}\nআমাদের তালিকায় ${row.brand} ${row.model}-এর জন্য ${row.years} সালের তথ্য আছে; আপনার ${year} সালের মডেলটি তার বাইরে।`;
+  }
+  return buildVehicleFitmentReply(row, year);
+}
+// ===== v16.1 END ==============================================================================================
 function productHasMedia(p) { return Boolean(p) && (getProductMediaUrls(p, 'videos').length > 0 || getProductMediaUrls(p, 'images').length > 0); }
 function pickSalesQuestion(senderId, opts = {}) {
   if (!SALES_QUESTIONS_ENABLED || opts.skip) return null;
@@ -1239,7 +1337,8 @@ function pickSalesQuestion(senderId, opts = {}) {
   }
   if (!product) cands.push({ kind: 'product', key: 'product', text: 'আপনি ঠিক কোন পণ্যটি দেখছেন? পণ্যের নাম বা ছবি পাঠালে আমি দাম, ফিটিং ও সব তথ্য এখনই জানিয়ে দিচ্ছি 📸' });
   if (!row && lightTopic) cands.push({ kind: 'vehicle', key: 'vehicle', text: `আপনার বাইক বা গাড়ির মডেল ও সাল কত? জানালে আমি এখনই মিলিয়ে বলে দিচ্ছি ${product ? 'এই লাইটটি' : 'লাইটটি'} সরাসরি ফিট হবে কি না 🏍️`, pending: { kind: 'vehicle' } });
-  if (row && row.socket && lightTopic) cands.push({ kind: 'socket', key: `socket:${row.id}`, text: `আপনার বাইকের বর্তমান হেডলাইট বাল্বটি কি ${row.socket.split('/')[0].trim()}? জানা থাকলে বলুন, ফিটিং নিশ্চিত করে দেব 👍` });
+  // v16.1: the old "is your current bulb HS1/H4? tell us and we will confirm the fitting" question was removed on purpose. The fitment table already
+  // gives the socket + fitment, so the bot confirms Direct Plug-and-Play straight away and never asks the customer about the bulb type.
   if (product && productHasMedia(product) && !alreadyServedMedia(senderId)) cands.push({ kind: 'media', key: `media:${product.id}`, text: 'লাইটের আলো কেমন হয় তা ভিডিও বা ছবিতে দেখতে চান? 🎥' });
   if (product) cands.push({ kind: 'order', key: `order:${product.id}`, repeatable: true, text: 'সব ঠিক থাকলে অর্ডার করতে চান? “অর্ডার করব” লিখুন, আমি ওয়েবসাইটের লিংক দিয়ে দিচ্ছি 🛒' });
   cands.push({ kind: 'more', key: 'more', repeatable: true, text: 'আর কোনো মডেল বা পণ্যের তথ্য লাগলে বলুন, আমি এখনই জানিয়ে দিচ্ছি 😊' });
@@ -1759,12 +1858,12 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
 ২) অর্ডার: গ্রাহক “অর্ডার করতে চাই”, “Order korte cacchi”, “কিনব/নেব” বা “কিভাবে অর্ডার করব” জানালে সিস্টেম নিজেই (কোড) পণ্য নিশ্চিত করে ঠিকানা ও সচল মোবাইল নম্বর চেয়ে নেয় এবং অর্ডার সংরক্ষণ করে। আপনার কাছে এমন বার্তা এলে FAQ/ক্যাটালগের নির্দেশনা (ঠিকানা ও সচল মোবাইল নম্বর পাঠাতে বলা; ক্যাশ অন ডেলিভারি) অনুসরণ করবেন—“ম্যানুয়ালি যাচাই করে যোগাযোগ করবে” বলে শেষ করবেন না। কোন পণ্য অর্ডার হবে অস্পষ্ট হলে আগে পণ্যটি জিজ্ঞেস করবেন। অর্ডার নিজে কনফার্ম/জমা দেবেন না। একই তথ্য বারবার চাইবেন না।
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
 ৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। নিচে দেওয়া “প্রাসঙ্গিক পণ্য” ও “FAQ” অংশই সর্বশেষ ও সঠিক তথ্য। কথোপকথনের ইতিহাসে বা মেমোরিতে আগে বলা দাম, স্টক, অফার, ওয়ারেন্টি বা বিবরণ নিচের ক্যাটালগের সাথে না মিললে ক্যাটালগের তথ্যই সঠিক; পুরোনো তথ্য কখনো পুনরাবৃত্তি করবে না। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। গ্রাহক আলো/কোয়ালিটি/দেখতে কেমন জানতে চাইলে ক্যাটালগে ভিডিও বা ছবির লিংক থাকলে আগে সেটি দেবে। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
-৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”।
+৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”। তালিকায় মডেল মিললে এবং Direct Plug-and-Play থাকলে সরাসরি নিশ্চিত করবে; গ্রাহকের বর্তমান হেডলাইট বাল্ব/সকেট (HS1/H4) কী—এ প্রশ্ন কখনো করে গ্রাহককে বিভ্রান্ত করবে না। গ্রাহক বাইকের মডেল ও সাল দুটি আলাদা বার্তায় (যেমন “Discover 125” ও “Model 2021”) পাঠালে দুটি মিলিয়ে একটি মডেল হিসেবে ধরবে।
 ৬) মেমোরি ও প্রসঙ্গ (সবচেয়ে গুরুত্বপূর্ণ): সাধারণ text follow-up-এ নিচের “বর্তমান আলোচ্য বিষয়” ধরে উত্তর দেবে। গ্রাহক নতুন পণ্যের নাম লিখলে সেই পণ্য ধরবে। গ্রাহক নতুন ছবি পাঠালে ছবিটি বর্তমান পণ্যের পরিচয় যাচাই/পরিবর্তনের প্রধান উৎস; পুরোনো active product বা আগের বটের অনুমান দিয়ে নতুন ছবিকে শ্রেণিবদ্ধ করবে না। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে প্রয়োজনমতো ইতিহাস ও মেমোরি ব্যবহার করবে, কিন্তু নতুন সংযুক্ত ছবি পুরোনো প্রসঙ্গের চেয়ে অগ্রাধিকার পাবে। একই তথ্য অকারণে আবার চাইবে না।
 ৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
 ৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। উত্তর সর্বোচ্চ ৪টি ছোট লাইনে, তার পরে শেষে ১টি প্রশ্নের লাইন (মোট ৫ লাইনের বেশি নয়); অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
 ৯) ইমোজি: উত্তরের সঙ্গে প্রসঙ্গ অনুযায়ী স্বাভাবিকভাবে ১–৩টি উপযুক্ত ইমোজি ব্যবহার করতে পারবে—যেমন পণ্যের জন্য 🏍️💡, ছবি/ভিডিওর জন্য 📸🎥, দাম/অফারের জন্য 💰, ডেলিভারির জন্য 🚚, ধন্যবাদের জন্য 😊। একই ইমোজি বারবার দেবে না, অপ্রয়োজনীয় ইমোজি দিয়ে উত্তর ভরাবে না, এবং গ্রাহক আনুষ্ঠানিক উত্তর চাইলে ইমোজি কমাবে।
-১০) সেলসম্যান মোড (সবচেয়ে গুরুত্বপূর্ণ): আপনি একজন অভিজ্ঞ, হাসিখুশি ও আন্তরিক দোকানদারের মতো কথা বলবেন—গ্রাহককে স্বাগত জানাবেন, তার প্রয়োজন বুঝবেন এবং কেনার আগ্রহ বাড়াবেন। প্রতিটি উত্তরে আগে গ্রাহকের প্রশ্নের সরাসরি উত্তর দিন, তারপর শেষ লাইনে ঠিক একটি প্রাসঙ্গিক প্রশ্ন করুন (এক বার্তায় একাধিক প্রশ্ন নয়)। গ্রাহক যে পণ্য বা বিষয় নিয়ে জানতে চাইছেন, প্রশ্ন সেটিকে ঘিরেই হবে—যেমন: কোন বাইক/গাড়ি ও কত সালের মডেল; মডেলের ভার্সন (Plus/Pro/xTec, V1/V2, Single/Twin Disc ইত্যাদি); বর্তমান হেডলাইটের বাল্ব/সকেট টাইপ (H4/HS1 ইত্যাদি) জানা আছে কি না; কোন পণ্যটি দেখছেন; আলো/ভিডিও/ছবি দেখতে চান কি না; অর্ডার করতে চান কি না। কথোপকথনে বা “গ্রাহক মেমোরি”-তে যে তথ্য আগেই পাওয়া গেছে (যেমন বাইকের মডেল) তা আবার জিজ্ঞেস করবেন না; আগের প্রশ্ন হুবহু পুনরাবৃত্তি করবেন না; একটি প্রশ্নের উত্তর পেলে পরের ধাপের প্রশ্নে যাবেন। গ্রাহক “না”/“লাগবে না”/ধন্যবাদ বা বিদায় জানালে নতুন প্রশ্ন করবেন না।
+১০) সেলসম্যান মোড (সবচেয়ে গুরুত্বপূর্ণ): আপনি একজন অভিজ্ঞ, হাসিখুশি ও আন্তরিক দোকানদারের মতো কথা বলবেন—গ্রাহককে স্বাগত জানাবেন, তার প্রয়োজন বুঝবেন এবং কেনার আগ্রহ বাড়াবেন। প্রতিটি উত্তরে আগে গ্রাহকের প্রশ্নের সরাসরি উত্তর দিন, তারপর শেষ লাইনে ঠিক একটি প্রাসঙ্গিক প্রশ্ন করুন (এক বার্তায় একাধিক প্রশ্ন নয়)। গ্রাহক যে পণ্য বা বিষয় নিয়ে জানতে চাইছেন, প্রশ্ন সেটিকে ঘিরেই হবে—যেমন: কোন বাইক/গাড়ি ও কত সালের মডেল; মডেলের ভার্সন (Plus/Pro/xTec, V1/V2, Single/Twin Disc ইত্যাদি); কোন পণ্যটি দেখছেন; আলো/ভিডিও/ছবি দেখতে চান কি না; অর্ডার করতে চান কি না। কথোপকথনে বা “গ্রাহক মেমোরি”-তে যে তথ্য আগেই পাওয়া গেছে (যেমন বাইকের মডেল) তা আবার জিজ্ঞেস করবেন না; আগের প্রশ্ন হুবহু পুনরাবৃত্তি করবেন না; একটি প্রশ্নের উত্তর পেলে পরের ধাপের প্রশ্নে যাবেন। গ্রাহক “না”/“লাগবে না”/ধন্যবাদ বা বিদায় জানালে নতুন প্রশ্ন করবেন না।
 ১১) আকর্ষণীয় উপস্থাপনা: ক্যাটালগে যা আছে শুধু সেই সুবিধা (যেমন উজ্জ্বলতা, সহজ ফিটিং, ওয়ারেন্টি, ডেলিভারি, ফ্রি ডেলিভারি বা অফার থাকলে) ইতিবাচক ও উৎসাহব্যঞ্জক ভাষায় তুলে ধরবেন। ক্যাটালগে নেই এমন ছাড়, অফার, স্টক-সংকট, ওয়ারেন্টি বা বৈশিষ্ট্য কখনো বানিয়ে বলবেন না এবং ভুয়া তাড়াহুড়ো (fake urgency) দেখাবেন না।
 ১২) অর্ডার: গ্রাহক কিনতে আগ্রহী হলে চ্যাটে ফোন নম্বর বা ঠিকানা চাইবেন না; অর্ডার শুধু ${IMPOTECH_WEBSITE_URL} ওয়েবসাইটের মাধ্যমে হয়—সিস্টেম নিজেই লিংক পাঠায়।
 বর্তমান আলোচ্য বিষয়:
@@ -2179,6 +2278,25 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
           await sendFacebookMessage(id, appendSalesQuestion(id, buildVehicleFitmentReply(answeredRow), { customerText, vehicleRow: answeredRow }));
           return;
         }
+        // v16.1: the bike was sent in two short messages ("Discover" + "125"): join them and answer once.
+        const splitVehicle = findVehicleFromSplitMessages(id, customerText);
+        if (splitVehicle) {
+          delete ensureCustomer(id).pendingVehicleAsk;
+          saveVehicleRow(id, splitVehicle.row, splitVehicle.text);
+          await sendFacebookMessage(id, appendSalesQuestion(id, buildVehicleFitmentReply(splitVehicle.row), { customerText: splitVehicle.text, vehicleRow: splitVehicle.row }));
+          return;
+        }
+        // v16.1: a message that only carries the model year ("Model 2021") belongs to the bike the customer just named.
+        if (isYearOnlyMessage(customerText)) {
+          const yearRow = savedRecentVehicleRow(id), modelYear = extractModelYear(customerText);
+          if (yearRow && modelYear) {
+            delete ensureCustomer(id).pendingVehicleAsk;
+            saveVehicleRow(id, yearRow, String(modelYear));
+            const yearReply = buildVehicleYearReply(yearRow, modelYear);
+            await sendFacebookMessage(id, vehicleYearInRange(yearRow, modelYear) === false ? yearReply : appendSalesQuestion(id, yearReply, { customerText: String(modelYear), vehicleRow: yearRow }));
+            return;
+          }
+        }
       }
       // 3) FAQ: sent verbatim only if it clearly matches and does not belong to another product/category.
       // A pure price question is answered from the live catalog (next step), never from a FAQ; a message with a new image is answered by image analysis.
@@ -2368,6 +2486,8 @@ async function handleIncomingMessage({ senderId, text: rawText, attachments, mes
     // The customer explicitly asked for a person: no extra consent question, hand over right away.
     await transferToHuman(senderId, 'Customer asked for a human representative'); return;
   }
+  // v16.1: "Discover" + "125" - this message is only the first half of the bike name; the next message completes it and gets the one answer.
+  if (shouldHoldForSplitVehicleMessage(senderId, text, attachments, receivedAt)) { console.log(`[Fitment] ${senderId}: half bike name held; answering together with the next message`); return; }
   await processCustomerMessage(senderId, text, attachments, messageId || null);
 }
 
@@ -2665,6 +2785,7 @@ app.post('/webhook',async(req,res)=>{
       if(!message||message.is_echo||!senderId)continue;
       if(messageId&&!(await claimMessageId(messageId)))continue;
       const text=String(message.text||message.quick_reply?.payload||'').normalize('NFKC').trim(),attachments=message.attachments||[];
+      noteQueuedCustomerText(senderId, text, receivedAt); // v16.1: lets a half-typed bike name wait for its second message
       enqueueCustomerTask(senderId, () => handleIncomingMessage({ senderId, text, attachments, messageId, receivedAt }));
     }
   }catch(err){console.error('[Webhook] Processing error:',err.message);}
