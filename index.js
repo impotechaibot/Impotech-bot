@@ -1,5 +1,12 @@
 /*
- * ImpoTech Messenger Bot — v16 (Salesman Mode + New Vehicle Fitment + Chat Control)
+ * ImpoTech Messenger Bot — v17 (Variant-Safe Sales + Strong Memory + Website CTA + Chat Control Audit)
+ * v17 changes (all v16.1 services retained; no service removed):
+ *  1) Variant-safe product resolution: never guess between similar catalog variants; show exact matching options.
+ *  2) No forced/repeated sales questions after direct answers; only ask when a required detail is genuinely missing.
+ *  3) Stronger conversation-history context and strict active-product continuity.
+ *  4) Website-first purchase CTA and more reliable structured-JSON reply extraction.
+ *  5) Chat pause controls use one shared persisted state path for API and chat commands.
+ *
  * v16 changes (everything from v15 is kept; nothing was removed):
  *  1) Vehicle fitment table: Hero Splendor iSmart 110 (i3S), Hero Splendor (Plus / Pro / xTec), Bajaj Pulsar 150 / 180 / 220
  *     (All Models / 2021 / 2023), Pulsar 150 V1 (Dual / Single Disc), Hero Honda Hunk (2010), Hero Hunk, Yamaha FZS V2, TVS Metro Plus 110.
@@ -90,7 +97,7 @@ const TRANSCRIPTION_MAX_TOKENS = 1000;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_MESSENGER_TEXT_LENGTH = 2000;
 const MAX_AI_LINES = 5;
-const HISTORY_LIMIT = 20;
+const HISTORY_LIMIT = 30; // retain more recent customer/agent turns so short follow-ups resolve correctly
 const MESSAGE_RETENTION_LIMIT = 20000;
 const MEMORY_RETENTION_DAYS = 20;
 const MEMORY_RETENTION_MS = MEMORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -584,7 +591,7 @@ function resolveConversationTopic(text, senderId) {
     setActiveCategory(id, requested);
     const choices = getProductsByExplicitCategory(requested);
     if (choices.length === 1) { rememberActiveProduct(id, choices[0]); return out(choices[0], [], requested, true); }
-    return out(null, choices.slice(0, 3), requested, true);
+    return out(null, choices.slice(0, 12), requested, true);
   }
   const active = findActiveProduct(id);
   if (active) return out(active);
@@ -592,7 +599,7 @@ function resolveConversationTopic(text, senderId) {
   if (category) {
     const choices = getProductsByExplicitCategory(category);
     if (choices.length === 1) { rememberActiveProduct(id, choices[0]); return out(choices[0], [], category); }
-    if (choices.length > 1) return out(null, choices.slice(0, 3), category);
+    if (choices.length > 1) return out(null, choices.slice(0, 12), category);
   }
   return out(findProductFromRecentContext(id), [], null);
 }
@@ -1351,10 +1358,14 @@ function appendSalesQuestion(senderId, reply, opts = {}) {
   try {
     const base = String(reply || '').trim();
     if (!base || !SALES_QUESTIONS_ENABLED || opts.skip) return reply;
-    if (/[?？]/.test(base.split('\n').slice(-2).join('\n'))) return reply;      // the reply already ends with a question
-    if (!opts.only && base.includes(IMPOTECH_WEBSITE_URL)) return reply;         // order link replies are not followed by more questions
+    if (/[?？]/.test(base.split('\n').slice(-2).join('\n'))) return reply;
+    if (base.includes(IMPOTECH_WEBSITE_URL)) return reply;
+    // v17: A direct answer is complete. Never append a generic "which item?", media offer,
+    // or order question after the customer has already identified the product / received its price.
+    // Questions are added only when code explicitly marks a genuinely missing detail.
+    if (!opts.forceQuestion) return base;
     const pick = pickSalesQuestion(senderId, opts);
-    if (!pick) return reply;
+    if (!pick) return base;
     markSalesAsked(senderId, pick.key);
     if (pick.pending) setPendingVehicleAsk(senderId, pick.pending);
     return `${base}\n\n${pick.text}`;
@@ -1834,7 +1845,7 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
   const productContext = relevantProducts.length
     ? relevantProducts.map((p, i) => [
         `[পণ্য ${i + 1}]`, `ID: ${p.id || 'N/A'}`, `নাম: ${p.name || 'N/A'}`,
-        `ব্র্যান্ড: ${p.brand || 'N/A'}`, `মডেল: ${p.model || 'N/A'}`,
+        `ব্র্যান্ড: ${p.brand || 'N/A'}`, `মডেল: ${p.model || 'N/A'}`, `ভ্যারিয়েন্ট/SKU: ${p.variant || p.version || p.sku || 'N/A'}`,
         `মূল্য: ${p.price ?? 'ক্যাটালগে নেই'} টাকা`,
         `স্টক: ${p.stockStatus || (p.inStock === true ? 'IN_STOCK' : 'তথ্য নেই')}`,
         `বিবরণ: ${p.shortDescription || p.description || 'N/A'}`,
@@ -1857,15 +1868,15 @@ function buildSystemPromptBase(relevantProducts, relevantFaqs, history, memoryCo
 ১) প্রশ্ন বনাম অর্ডার: গ্রাহক স্পষ্টভাবে অর্ডার করার ইচ্ছা না জানানো পর্যন্ত কখনো ফোন নম্বর, ডেলিভারি ঠিকানা বা ব্যক্তিগত তথ্য চাইবে না। পণ্যের বিবরণ, দাম, স্টক, ছবি/ভিডিও, বাইকের মডেল, ফিটমেন্ট বা ডেলিভারি চার্জের প্রশ্নের সরাসরি উত্তর দেবে। শুধু “দাম কত”, “ফিট হবে?”, “ছবি দিন” বা “ডেলিভারি চার্জ কত” বললে অর্ডার শুরু করবে না।
 ২) অর্ডার: গ্রাহক “অর্ডার করতে চাই”, “Order korte cacchi”, “কিনব/নেব” বা “কিভাবে অর্ডার করব” জানালে সিস্টেম নিজেই (কোড) পণ্য নিশ্চিত করে ঠিকানা ও সচল মোবাইল নম্বর চেয়ে নেয় এবং অর্ডার সংরক্ষণ করে। আপনার কাছে এমন বার্তা এলে FAQ/ক্যাটালগের নির্দেশনা (ঠিকানা ও সচল মোবাইল নম্বর পাঠাতে বলা; ক্যাশ অন ডেলিভারি) অনুসরণ করবেন—“ম্যানুয়ালি যাচাই করে যোগাযোগ করবে” বলে শেষ করবেন না। কোন পণ্য অর্ডার হবে অস্পষ্ট হলে আগে পণ্যটি জিজ্ঞেস করবেন। অর্ডার নিজে কনফার্ম/জমা দেবেন না। একই তথ্য বারবার চাইবেন না।
 ৩) Anti-loop: একই প্রশ্ন/মেসেজ পরপর পুনরাবৃত্তি করবে না। গ্রাহক “না”, “করব না”, “করবো না”, “নেব না”, “নিবো না”, “লাগবে না” বা অর্ডার প্রত্যাখ্যান করলে ঠিকানা/ফোন চাওয়া বন্ধ করবে। সংক্ষেপে বলবে: “ঠিক আছে, কোনো সমস্যা নেই। অন্য কোনো তথ্য জানার থাকলে বলবেন, সাহায্য করতে পেরে আনন্দিত হব।” অর্ডার বাতিল হলে অর্ডার ড্রাফটও বাতিল করবে।
-৪) ক্যাটালগ-ভিত্তিক তথ্য: পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। নিচে দেওয়া “প্রাসঙ্গিক পণ্য” ও “FAQ” অংশই সর্বশেষ ও সঠিক তথ্য। কথোপকথনের ইতিহাসে বা মেমোরিতে আগে বলা দাম, স্টক, অফার, ওয়ারেন্টি বা বিবরণ নিচের ক্যাটালগের সাথে না মিললে ক্যাটালগের তথ্যই সঠিক; পুরোনো তথ্য কখনো পুনরাবৃত্তি করবে না। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। গ্রাহক আলো/কোয়ালিটি/দেখতে কেমন জানতে চাইলে ক্যাটালগে ভিডিও বা ছবির লিংক থাকলে আগে সেটি দেবে। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
+৪) ক্যাটালগ-ভিত্তিক তথ্য ও ভ্যারিয়েন্ট সুরক্ষা: একই ক্যাটাগরির একাধিক পণ্য/ভ্যারিয়েন্ট থাকলে প্রতিটি product ID-কে আলাদা পণ্য হিসেবে ধরবে। নাম, মডেল, লেন্স/ওয়াট, রং, দাম, ছবি, ভিডিও, স্টক ও বৈশিষ্ট্য এক ভ্যারিয়েন্ট থেকে অন্যটিতে কপি করবে না। গ্রাহকের লেখা, URL, ছবি এবং আগের কথোপকথন মিলিয়ে নির্দিষ্ট product ID নিশ্চিত না হলে কোনো একটি ভ্যারিয়েন্ট ধরে দাম/ফিটমেন্ট বলবে না; বরং সম্ভাব্য সঠিক ভ্যারিয়েন্টগুলোর ক্যাটালগ-নাম দেখিয়ে একবারে শুধু প্রয়োজনীয় নির্বাচন জানতে চাইবে। পণ্যের নাম, দাম, স্টক, বৈশিষ্ট্য, ওয়ারেন্টি বা স্পেসিফিকেশন বানিয়ে বলবে না। নিচে দেওয়া “প্রাসঙ্গিক পণ্য” ও “FAQ” অংশই সর্বশেষ ও সঠিক তথ্য। কথোপকথনের ইতিহাসে বা মেমোরিতে আগে বলা দাম, স্টক, অফার, ওয়ারেন্টি বা বিবরণ নিচের ক্যাটালগের সাথে না মিললে ক্যাটালগের তথ্যই সঠিক; পুরোনো তথ্য কখনো পুনরাবৃত্তি করবে না। ক্যাটালগে থাকা ছবি, Facebook Reel বা ভিডিওর সঠিক URL হুবহু দেবে; URL বানাবে বা বদলাবে না। গ্রাহক আলো/কোয়ালিটি/দেখতে কেমন জানতে চাইলে ক্যাটালগে ভিডিও বা ছবির লিংক থাকলে আগে সেটি দেবে। তথ্য না থাকলে স্পষ্টভাবে বলবে যে ক্যাটালগে তথ্যটি নেই।
 ৫) হেডলাইট/বাইক/গাড়ি ফিটমেন্ট: প্রথমে কোডে থাকা VEHICLE_FITMENT_DATA তালিকায় গ্রাহকের উল্লেখ করা সঠিক মডেল মিলিয়ে দেখবে। মিল পাওয়া গেলে শুধু সেই রেকর্ডের years/socket/fitment এবং DC Conversion Required তথ্য অনুযায়ী উত্তর দেবে; AC-to-DC conversion প্রয়োজন থাকলে স্পষ্ট বলবে। মডেল তালিকায় না থাকলে অনুমান করবে না; উত্তর হবে: “${VEHICLE_FITMENT_HANDOFF_REPLY}”। তালিকায় মডেল মিললে এবং Direct Plug-and-Play থাকলে সরাসরি নিশ্চিত করবে; গ্রাহকের বর্তমান হেডলাইট বাল্ব/সকেট (HS1/H4) কী—এ প্রশ্ন কখনো করে গ্রাহককে বিভ্রান্ত করবে না। গ্রাহক বাইকের মডেল ও সাল দুটি আলাদা বার্তায় (যেমন “Discover 125” ও “Model 2021”) পাঠালে দুটি মিলিয়ে একটি মডেল হিসেবে ধরবে।
-৬) মেমোরি ও প্রসঙ্গ (সবচেয়ে গুরুত্বপূর্ণ): সাধারণ text follow-up-এ নিচের “বর্তমান আলোচ্য বিষয়” ধরে উত্তর দেবে। গ্রাহক নতুন পণ্যের নাম লিখলে সেই পণ্য ধরবে। গ্রাহক নতুন ছবি পাঠালে ছবিটি বর্তমান পণ্যের পরিচয় যাচাই/পরিবর্তনের প্রধান উৎস; পুরোনো active product বা আগের বটের অনুমান দিয়ে নতুন ছবিকে শ্রেণিবদ্ধ করবে না। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে প্রয়োজনমতো ইতিহাস ও মেমোরি ব্যবহার করবে, কিন্তু নতুন সংযুক্ত ছবি পুরোনো প্রসঙ্গের চেয়ে অগ্রাধিকার পাবে। একই তথ্য অকারণে আবার চাইবে না।
+৬) মেমোরি ও প্রসঙ্গ (সবচেয়ে গুরুত্বপূর্ণ): সর্বশেষ গ্রাহক বার্তার পাশাপাশি নিচের সাম্প্রতিক কথোপকথন, সংরক্ষিত মেমোরি, সক্রিয় পণ্য এবং আগের প্রশ্নের উত্তর একসঙ্গে বিচার করবে। ছোট/অসম্পূর্ণ follow-up (যেমন “এগুলা”, “এটার”, “ওইটা”, “আর ছবি”, “দাম বলেন”) হলে অবিলম্বে আগের প্রাসঙ্গিক turn-কে অগ্রাধিকার দেবে; আলাদা কাস্টমারের ইতিহাস কখনো ব্যবহার করবে না। সাধারণ text follow-up-এ নিচের “বর্তমান আলোচ্য বিষয়” ধরে উত্তর দেবে। গ্রাহক নতুন পণ্যের নাম লিখলে সেই পণ্য ধরবে। গ্রাহক নতুন ছবি পাঠালে ছবিটি বর্তমান পণ্যের পরিচয় যাচাই/পরিবর্তনের প্রধান উৎস; পুরোনো active product বা আগের বটের অনুমান দিয়ে নতুন ছবিকে শ্রেণিবদ্ধ করবে না। “এটা”, “ওটা”, “দাম কত”, “ছবিটা” ইত্যাদির ক্ষেত্রে প্রয়োজনমতো ইতিহাস ও মেমোরি ব্যবহার করবে, কিন্তু নতুন সংযুক্ত ছবি পুরোনো প্রসঙ্গের চেয়ে অগ্রাধিকার পাবে। একই তথ্য অকারণে আবার চাইবে না।
 ৭) মানব প্রতিনিধি: সাধারণ প্রশ্নের উত্তর নিজে দেবে। অন্য সমস্যা সমাধান করা সম্ভব না হলে সম্মতি চাইবে; সম্মতি ছাড়া সাধারণ প্রশ্নে takeover চালু করবে না। ${HANDOVER_MARKER} নিজে থেকে লিখবে না।
-৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। উত্তর সর্বোচ্চ ৪টি ছোট লাইনে, তার পরে শেষে ১টি প্রশ্নের লাইন (মোট ৫ লাইনের বেশি নয়); অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
+৮) ভাষা ও দৈর্ঘ্য: গ্রাহক যে ভাষায় লিখবে—বাংলা, English বা Banglish—সেই ভাষায় স্বাভাবিক, সরাসরি ও সংক্ষিপ্ত উত্তর দেবে। উত্তর সর্বোচ্চ ৫টি ছোট লাইনে রাখবে; কোনো তথ্য বা নির্বাচন সত্যিই বাকি থাকলেই একটি প্রাসঙ্গিক প্রশ্ন করবে। অপ্রয়োজনীয় ভূমিকা বা একই কথা পুনরাবৃত্তি নয়।
 ৯) ইমোজি: উত্তরের সঙ্গে প্রসঙ্গ অনুযায়ী স্বাভাবিকভাবে ১–৩টি উপযুক্ত ইমোজি ব্যবহার করতে পারবে—যেমন পণ্যের জন্য 🏍️💡, ছবি/ভিডিওর জন্য 📸🎥, দাম/অফারের জন্য 💰, ডেলিভারির জন্য 🚚, ধন্যবাদের জন্য 😊। একই ইমোজি বারবার দেবে না, অপ্রয়োজনীয় ইমোজি দিয়ে উত্তর ভরাবে না, এবং গ্রাহক আনুষ্ঠানিক উত্তর চাইলে ইমোজি কমাবে।
-১০) সেলসম্যান মোড (সবচেয়ে গুরুত্বপূর্ণ): আপনি একজন অভিজ্ঞ, হাসিখুশি ও আন্তরিক দোকানদারের মতো কথা বলবেন—গ্রাহককে স্বাগত জানাবেন, তার প্রয়োজন বুঝবেন এবং কেনার আগ্রহ বাড়াবেন। প্রতিটি উত্তরে আগে গ্রাহকের প্রশ্নের সরাসরি উত্তর দিন, তারপর শেষ লাইনে ঠিক একটি প্রাসঙ্গিক প্রশ্ন করুন (এক বার্তায় একাধিক প্রশ্ন নয়)। গ্রাহক যে পণ্য বা বিষয় নিয়ে জানতে চাইছেন, প্রশ্ন সেটিকে ঘিরেই হবে—যেমন: কোন বাইক/গাড়ি ও কত সালের মডেল; মডেলের ভার্সন (Plus/Pro/xTec, V1/V2, Single/Twin Disc ইত্যাদি); কোন পণ্যটি দেখছেন; আলো/ভিডিও/ছবি দেখতে চান কি না; অর্ডার করতে চান কি না। কথোপকথনে বা “গ্রাহক মেমোরি”-তে যে তথ্য আগেই পাওয়া গেছে (যেমন বাইকের মডেল) তা আবার জিজ্ঞেস করবেন না; আগের প্রশ্ন হুবহু পুনরাবৃত্তি করবেন না; একটি প্রশ্নের উত্তর পেলে পরের ধাপের প্রশ্নে যাবেন। গ্রাহক “না”/“লাগবে না”/ধন্যবাদ বা বিদায় জানালে নতুন প্রশ্ন করবেন না।
+১০) বিক্রয়-সহায়তা (গুরুত্বপূর্ণ): অভিজ্ঞ ও আন্তরিক দোকানদারের মতো কথা বলবেন। প্রতিবার আগে গ্রাহকের প্রশ্নের সরাসরি উত্তর দিন। শুধু বিক্রির জন্য প্রতিটি উত্তরের শেষে প্রশ্ন জুড়বেন না। পণ্যের নাম/মডেল/ভ্যারিয়েন্ট ক্যাটালগ থেকে নিশ্চিত হলে উত্তরে সেই সঠিক নামটি উল্লেখ করে সেটিই আলোচ্য পণ্য হিসেবে নিশ্চিত করুন; আবার “কোন আইটেম নিতে চান?” জিজ্ঞেস করবেন না। একই ক্যাটাগরিতে একাধিক ভ্যারিয়েন্ট থাকলে একটির দাম/বৈশিষ্ট্য অন্যটির সঙ্গে মেশাবেন না; ক্যাটালগে থাকা সঠিক ভ্যারিয়েন্টগুলোর নাম/ID মিলিয়ে প্রয়োজন হলে একটি নির্দিষ্ট নির্বাচন-প্রশ্ন করবেন। গ্রাহক ইতিমধ্যে পণ্য/বাইক/সাল/ভ্যারিয়েন্ট জানালে আবার জিজ্ঞেস করবেন না। ছবি/ভিডিও চাইলে বর্তমান আলোচ্য পণ্যের মিডিয়াই দেবেন।
 ১১) আকর্ষণীয় উপস্থাপনা: ক্যাটালগে যা আছে শুধু সেই সুবিধা (যেমন উজ্জ্বলতা, সহজ ফিটিং, ওয়ারেন্টি, ডেলিভারি, ফ্রি ডেলিভারি বা অফার থাকলে) ইতিবাচক ও উৎসাহব্যঞ্জক ভাষায় তুলে ধরবেন। ক্যাটালগে নেই এমন ছাড়, অফার, স্টক-সংকট, ওয়ারেন্টি বা বৈশিষ্ট্য কখনো বানিয়ে বলবেন না এবং ভুয়া তাড়াহুড়ো (fake urgency) দেখাবেন না।
-১২) অর্ডার: গ্রাহক কিনতে আগ্রহী হলে চ্যাটে ফোন নম্বর বা ঠিকানা চাইবেন না; অর্ডার শুধু ${IMPOTECH_WEBSITE_URL} ওয়েবসাইটের মাধ্যমে হয়—সিস্টেম নিজেই লিংক পাঠায়।
+১২) ওয়েবসাইট-প্রথম অর্ডার: গ্রাহক কিনতে চান/অর্ডার করবেন/কীভাবে অর্ডার করবেন জানতে চাইলে সরাসরি ${IMPOTECH_WEBSITE_URL} লিংক দিন এবং সাইটে পণ্য নির্বাচন → Cart/Checkout → Place Order সম্পন্ন করতে বলুন। পণ্যের তথ্য বা দাম দেওয়ার পর গ্রাহক কেনার আগ্রহ দেখালে ওয়েবসাইটে অর্ডার করার সুবিধাটি সংক্ষেপে মনে করিয়ে দিতে পারেন। চ্যাটে ফোন নম্বর, ঠিকানা বা অর্ডার-তথ্য সংগ্রহ করবেন না; ওয়েবসাইটই একমাত্র checkout channel।
 বর্তমান আলোচ্য বিষয়:
 ${topicContext}
 
@@ -2018,7 +2029,7 @@ async function generateAIResponse(customerText, attachments = [], senderId, inco
     relevantProducts = [];
   } else {
     relevantProducts = topic.product ? [topic.product]
-      : topic.categoryProducts.length ? topic.categoryProducts.slice(0, MAX_PRODUCTS_TO_AI)
+      : topic.categoryProducts.length ? topic.categoryProducts.slice(0, 12)
       : findRelevantProducts(query);
     if (!relevantProducts.length) relevantProducts = findRelevantProducts(context);
   }
@@ -2071,7 +2082,7 @@ async function generateAIResponse(customerText, attachments = [], senderId, inco
 - গ্রাহক শুধু “কি”, “এটা কী”, “এইটা কী আছে” বললেও ছবিটিকে বর্ণনা করে সঠিক ক্যাটালগ পণ্য শনাক্ত করুন; অকারণে আগের পণ্যের বর্ণনা পুনরাবৃত্তি বা অর্ডারের প্রশ্ন করবেন না।` : '';
   const outputContract = `
 
-আউটপুট ফরম্যাট বাধ্যতামূলক: বৈধ JSON object দিন, Markdown code fence নয়। ফিল্ড: "reply" (গ্রাহককে পাঠানোর সংক্ষিপ্ত উত্তর), "productId" (নিচের LIVE catalog product ID থেকে একটি string, না মিললে null), "imageDescription" (ছবিতে দৃশ্যমান বস্তু/রং/আকৃতি/লেখার সংক্ষিপ্ত বর্ণনা; ছবি না থাকলে খালি string), "confidence" (0 থেকে 1)। customer reply-তে JSON বা metadata দেখাবেন না। আউটপুট শুধু একটি JSON object হবে (আগে/পরে কোনো লেখা নয়)। "reply"-তে Markdown চিহ্ন (** বা #) ব্যবহার করবেন না—শুধু সাধারণ টেক্সট ও ইমোজি। "reply"-তে শুধু গ্রাহকের জিজ্ঞাসা করা/ছবিতে শনাক্ত একটি পণ্যের তথ্য ও দাম দেবেন, অন্য পণ্যের দাম বা তথ্য মেশাবেন না। পণ্য নির্বাচন কেবল নিচের ক্যাটালগ থেকে করবেন; আন্দাজ করে ID বানাবেন না।
+আউটপুট ফরম্যাট বাধ্যতামূলক: বৈধ JSON object দিন, Markdown code fence নয়। ফিল্ড: "reply" (গ্রাহককে পাঠানোর সংক্ষিপ্ত উত্তর), "productId" (নিচের LIVE catalog product ID থেকে একটি string, না মিললে null), "imageDescription" (ছবিতে দৃশ্যমান বস্তু/রং/আকৃতি/লেখার সংক্ষিপ্ত বর্ণনা; ছবি না থাকলে খালি string), "confidence" (0 থেকে 1)। customer reply-তে JSON বা metadata দেখাবেন না। আউটপুট শুধু একটি JSON object হবে (আগে/পরে কোনো লেখা নয়)। "reply"-তে Markdown চিহ্ন (** বা #) ব্যবহার করবেন না—শুধু সাধারণ টেক্সট ও ইমোজি। "reply"-তে শুধু গ্রাহকের জিজ্ঞাসা করা/ছবিতে শনাক্ত একটি নির্দিষ্ট পণ্যের তথ্য ও দাম দেবেন, অন্য পণ্যের দাম বা তথ্য মেশাবেন না। একই ক্যাটাগরির একাধিক ভ্যারিয়েন্ট থাকলে productId অবশ্যই নির্দিষ্ট variant-এর ID হতে হবে; নিশ্চিত না হলে null দিন এবং নামগুলো আলাদা করে নির্বাচন চাইুন। পণ্য নির্বাচন কেবল নিচের ক্যাটালগ থেকে করবেন; আন্দাজ করে ID বানাবেন না।
 LIVE catalog choices: ${catalogChoicesText}
 বর্তমান পণ্য থাকলে সাধারণ text follow-up-এ সেটিই রাখুন। তবে নতুন ছবি এলে ছবিকে অগ্রাধিকার দিন: ছবিতে নতুন পণ্য ক্যাটালগে মিলে গেলে সেটিই নির্বাচন করুন এবং আগের পণ্যকে ধরে রাখবেন না। গ্রাহক যদি শুধু রং জিজ্ঞেস করেন এবং নতুন ছবি না থাকে, বর্তমান পণ্য ধরে উত্তর দিন। ছবি বুঝতে না পারলে মিথ্যা শনাক্তকরণ করবেন না।${visualPriorityRule}`;
   const system = systemBase + outputContract;
@@ -2093,20 +2104,19 @@ LIVE catalog choices: ${catalogChoicesText}
     TEXT_MODEL,
     { maxTokens: MAX_OUTPUT_TOKENS, temperature: 0.1 }
   );
-  let parsed = null;
-  try {
-    const trimmed = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-    try { parsed = JSON.parse(trimmed); }
-    catch (_) {
-      const candidate = trimmed.match(/\{[\s\S]*\}/)?.[0];
-      if (candidate) parsed = JSON.parse(candidate);
-    }
-  } catch (e) {
-    console.warn('[AI] Structured output parse failed; using plain response.');
-  }
-
+  let parsed = extractStructuredObject(raw);
   if (!parsed) parsed = salvageStructuredFields(raw);
-  const reply = stripMessengerMarkdown(String(parsed?.reply || raw).trim());
+  let replyValue = parsed?.reply;
+  if (typeof replyValue === 'string') {
+    const nested = extractStructuredObject(replyValue);
+    if (nested && typeof nested.reply === 'string') replyValue = nested.reply;
+  }
+  // Never expose the model's JSON envelope to Messenger customers.
+  let reply = stripMessengerMarkdown(String(replyValue || raw).trim());
+  if (/^\s*\{\s*["']reply["']\s*:/i.test(reply)) {
+    const recovered = salvageStructuredFields(reply);
+    if (recovered?.reply) reply = stripMessengerMarkdown(String(recovered.reply).trim());
+  }
   const imageDescription = String(parsed?.imageDescription || '').trim().slice(0, 500);
   const selectedId = parsed?.productId == null ? '' : String(parsed.productId);
   let selectedProduct = selectedId ? products.find(p => String(p.id) === selectedId) : null;
@@ -2358,8 +2368,10 @@ async function processCustomerMessage(senderId,text,attachments=[],messageId=nul
           return;
         }
         if (topic.categoryProducts.length) {
-          const priceLines = topic.categoryProducts.slice(0, 3).map(item => getPriceReply(item) || `${item.name}-এর দাম ক্যাটালগে উল্লেখ নেই।`);
-          await sendFacebookMessage(id, appendSalesQuestion(id, priceLines.join('\n'), { customerText }));
+          const variants = topic.categoryProducts.slice(0, 12);
+          const priceLines = variants.map((item, index) => `${index + 1}. ${getPriceReply(item) || `${item.name}-এর দাম ক্যাটালগে উল্লেখ নেই।`}`);
+          const suffix = variants.length > 1 ? '\n\nআপনি কোন নির্দিষ্ট ভ্যারিয়েন্টটি নিতে চাচ্ছেন? তালিকার নাম বা নম্বরটি জানালেই সেটি নিশ্চিত করে দেব।' : '';
+          await sendFacebookMessage(id, priceLines.join('\n') + suffix);
           return;
         }
         await sendFacebookMessage(id, topic.category ? 'এই ক্যাটাগরির নির্দিষ্ট পণ্য শনাক্ত করতে পারিনি। ক্যাটালগে একাধিক মডেল থাকলে পণ্যের ছবি বা মডেল পাঠান।' : 'কোন পণ্যের দাম জানতে চান? পণ্যের নাম/মডেল লিখুন বা পণ্যের ছবি পাঠান।');
@@ -2715,6 +2727,22 @@ function guardSingleProductReply(reply, customerText, senderId) {
     return kept.join('\n').trim() || reply;
   } catch (_) { return reply; }
 }
+// v17: robustly extract a JSON object even when the model wraps it in prose/fences or escapes it.
+function extractStructuredObject(raw) {
+  const source = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  try { const direct = JSON.parse(source); if (direct && typeof direct === 'object') return direct; } catch (_) {}
+  const start = source.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0, inString = false, escaped = false;
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i];
+    if (inString) { if (escaped) escaped = false; else if (ch === '\\\\') escaped = true; else if (ch === '"') inString = false; continue; }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) { try { const value = JSON.parse(source.slice(start, i + 1)); return value && typeof value === 'object' ? value : null; } catch (_) { return null; } }
+  }
+  return null;
+}
 // The model sometimes answers in plain text instead of JSON: recover reply/productId when a JSON-like fragment exists.
 function salvageStructuredFields(raw) {
   const s = String(raw || '');
@@ -2810,8 +2838,8 @@ app.delete('/api/catalog/faqs/:id',async(req,res)=>{try{const key=String(req.par
 // -----------------------------------------------------------------------------
 // Status, takeover and customer APIs
 // -----------------------------------------------------------------------------
-app.get('/api/bot-status',(req,res)=>res.json({success:true,isGlobalPaused:!!db.isGlobalPaused,reason:db.isGlobalPaused?'Global human takeover active':'AI bot active',totalPausedCustomers:Object.values(db.takeovers).filter(x=>x&&x.isPaused).length}));
-app.post('/api/toggle-bot',(req,res)=>{db.isGlobalPaused=!!req.body.isPaused;if(db.isGlobalPaused)for(const id of Object.keys(db.scheduledFollowups))cancelFollowup(id);saveStorage();res.json({success:true,isGlobalPaused:db.isGlobalPaused});});
+app.get('/api/bot-status',(req,res)=>res.json({success:true,isGlobalPaused:!!db.isGlobalPaused,botEnabled:!db.isGlobalPaused,reason:db.isGlobalPaused?'Global AI pause active':'AI bot active',totalPausedCustomers:Object.keys(db.takeovers).filter(id=>getTakeoverState(id)).length}));
+app.post('/api/toggle-bot',async(req,res)=>{const raw=req.body?.isPaused ?? req.body?.enabled;if(typeof raw!=='boolean')return res.status(400).json({success:false,message:'isPaused (boolean) is required'});await setGlobalAiPause(raw);res.json({success:true,isGlobalPaused:!!db.isGlobalPaused,botEnabled:!db.isGlobalPaused,totalPausedCustomers:Object.keys(db.takeovers).filter(id=>getTakeoverState(id)).length});});
 app.post('/api/customers/:senderId/takeover',async(req,res)=>{const {senderId}=req.params;const on=req.body.isPaused!==undefined?!!req.body.isPaused:req.body.takeover!==undefined?!!req.body.takeover:true;await setTakeoverState(senderId,on,req.body.reason);res.json({success:true,senderId,isPaused:on,takeover:on,message:on?'Human takeover enabled. AI remains paused until admin resumes it.':'AI resumed for this customer.'});});
 app.get('/api/customers/:senderId/status',(req,res)=>{const id=String(req.params.senderId),on=getTakeoverState(id);res.json({success:true,senderId:id,isPaused:on,takeover:on,reason:db.takeovers[id]?.reason||null,updatedAt:db.takeovers[id]?.timestamp||null});});
 app.post('/api/customers/:senderId/takeover/enable',async(req,res)=>{await setTakeoverState(req.params.senderId,true,req.body?.reason||'Enabled from admin chat');res.json({success:true,senderId:req.params.senderId,takeover:true,isPaused:true});});
