@@ -6,6 +6,7 @@
  *  3) Stronger conversation-history context and strict active-product continuity.
  *  4) Website-first purchase CTA and more reliable structured-JSON reply extraction.
  *  5) Chat pause controls use one shared persisted state path for API and chat commands.
+ *  6) Page Inbox control: auto-request Page webhook subscription for messages + message_echoes, persist pause before returning, and log echo diagnostics.
  *
  * v16 changes (everything from v15 is kept; nothing was removed):
  *  1) Vehicle fitment table: Hero Splendor iSmart 110 (i3S), Hero Splendor (Plus / Pro / xTec), Bajaj Pulsar 150 / 180 / 220
@@ -131,7 +132,7 @@ const ADMIN_PSIDS = new Set(String(process.env.ADMIN_PSIDS || '').split(/[\s,;]+
 const ADMIN_CHAT_PASSCODE = String(process.env.ADMIN_CHAT_PASSCODE || '').trim();
 const ONE_OFF_PAUSE_MS = (() => { const n = Number(process.env.ONE_OFF_PAUSE_MINUTES); return process.env.ONE_OFF_PAUSE_MINUTES !== undefined && Number.isFinite(n) && n > 0 ? n * 60000 : 60 * 60000; })();
 const SALES_QUESTIONS_ENABLED = process.env.SALES_QUESTIONS !== 'false';
-const chatControlStats = { echoEvents: 0, lastEchoAt: null, commandsHandled: 0, lastCommand: null, lastCommandAt: null, lastCommandSource: null };
+const chatControlStats = { echoEvents: 0, lastEchoAt: null, lastEchoRecipientId: null, lastEchoText: null, lastEchoCommand: null, commandsHandled: 0, lastCommand: null, lastCommandAt: null, lastCommandSource: null, lastEchoError: null, webhookSubscription: null };
 const loginAttempts = new Map(); // psid -> { count, windowStart } (passcode brute-force guard)
 // 'replace' (default): the admin app is the source of truth, FAQs/products you save fully replace the old ones.
 // 'merge': legacy behaviour, old products/FAQs are always retained.
@@ -1483,7 +1484,9 @@ async function setTakeoverState(customerId, enabled, reasonStr, options = {}) {
   db.takeovers[id]={isPaused:on,reason:reasonStr||(on?'Human takeover':'Admin resumed AI'),timestamp,...(expiresAt?{expiresAt}:{})};
   ensureCustomer(id);
   Object.assign(db.customers[id],{isPaused:on,takeover:on,takeoverUpdatedAt:timestamp});
-  if(on)cancelFollowup(id); saveStorage(); return on;
+  if(on)cancelFollowup(id); saveStorage();
+  try { await persistChain; } catch (err) { console.error('[ChatControl] Customer pause persistence failed:', err.message); }
+  return on;
 }
 function splitForMessenger(text, limit) {
   const parts = []; let rest = String(text);
@@ -2514,6 +2517,42 @@ function verifyMetaSignature(req) {
   const a = Buffer.from(sig), b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
+// Ensure this Page has subscribed this app to outgoing Page Inbox echoes as well as incoming messages.
+// Without message_echoes, manual replies sent from Meta Business Suite never reach handlePageEcho(),
+// so .human / .alloff typed in a customer thread cannot be detected.
+async function ensureMessengerWebhookSubscriptions() {
+  if (!PAGE_ACCESS_TOKEN) return { success: false, skipped: true, reason: 'PAGE_ACCESS_TOKEN missing' };
+  const base = `https://graph.facebook.com/${GRAPH_API_VERSION}/me/subscribed_apps`;
+  const required = ['messages', 'message_echoes', 'messaging_postbacks', 'message_deliveries', 'message_reads'];
+  try {
+    let existing = [];
+    try {
+      const current = await axios.get(base, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 12000 });
+      for (const appInfo of (Array.isArray(current.data?.data) ? current.data.data : [])) {
+        if (Array.isArray(appInfo.subscribed_fields)) existing.push(...appInfo.subscribed_fields);
+      }
+    } catch (readErr) {
+      console.warn('[CHAT-CONTROL] Could not read current Page webhook subscriptions:', readErr.response?.data?.error?.message || readErr.message);
+    }
+    const fields = [...new Set([...existing, ...required])];
+    const body = new URLSearchParams({ subscribed_fields: fields.join(',') });
+    body.set('access_token', PAGE_ACCESS_TOKEN);
+    const result = await axios.post(base, body.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000
+    });
+    const ok = result.data?.success === true;
+    console.log(ok
+      ? `[CHAT-CONTROL] Page webhook subscriptions confirmed: ${fields.join(',')}`
+      : '[CHAT-CONTROL] Meta did not confirm Page webhook subscription; check Meta permissions and App Dashboard fields.');
+    return { success: ok, fields, response: result.data };
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.message;
+    console.warn('[CHAT-CONTROL] Could not subscribe Page webhook fields automatically:', detail);
+    console.warn('[CHAT-CONTROL] In Meta Developers → Webhooks → Page, manually enable messages and message_echoes, then subscribe the Page.');
+    return { success: false, reason: detail };
+  }
+}
 // ---- v13: human takeover helpers ---------------------------------------------------------------
 const HUMAN_REQUEST_ONLY_RE = /^(?:প্রতিনিধি|human|agent|human agent|কাস্টমার কেয়ার|customer care|real person)$/i;
 const HUMAN_REQUEST_RE = /প্রতিনিধি(?:র|কে)?\s*(?:সাথে|সঙ্গে)?\s*(?:কথা|যোগাযোগ)|প্রতিনিধি\s*(?:চাই|দিন|দেন|লাগবে)|(?:মানুষ|এজেন্ট|হিউম্যান)(?:ের|এর)?\s*(?:সাথে|সঙ্গে)\s*কথা|(?:talk|speak|connect|chat)\s*(?:to|with)\s*(?:a\s*|an\s*|the\s*|your\s*)?(?:human|agent|person|representative|someone|manager)|real\s*person|human\s*agent|customer\s*care\s*(?:er\s*)?(?:sathe|shathe)?|(?:manush|agent|representative)\s*(?:er|r)?\s*(?:sathe|shathe)\s*kotha/i;
@@ -2572,6 +2611,9 @@ async function setGlobalAiPause(on) {
   db.isGlobalPaused = Boolean(on);
   if (db.isGlobalPaused) for (const id of Object.keys(db.scheduledFollowups)) cancelFollowup(id);
   saveStorage();
+  // Wait for the queued PostgreSQL write so the OFF state is not lost on an immediate restart.
+  try { await persistChain; } catch (err) { console.error('[ChatControl] Global pause persistence failed:', err.message); }
+  console.log(`[ChatControl] GLOBAL AI ${db.isGlobalPaused ? 'OFF' : 'ON'}`);
   return db.isGlobalPaused;
 }
 // Applies .human / .1off / .ai to ONE customer. Returns a short Bangla description of what changed.
@@ -2687,29 +2729,59 @@ async function handleAdminChatCommand(senderId, rawText) {
 }
 async function handlePageEcho(event, message) {
   try {
+    // For an is_echo event, Meta identifies the customer as recipient (the Page is sender).
     const customerId = String(event?.recipient?.id || '');
-    if (!customerId || !message) return;
+    if (!customerId || !message) {
+      chatControlStats.lastEchoError = 'Echo event had no recipient/customer ID';
+      console.warn('[ChatControl] Ignored echo: recipient/customer ID missing', JSON.stringify({ sender: event?.sender?.id, recipient: event?.recipient?.id }));
+      return;
+    }
+    const text = String(message.text || '').normalize('NFKC').replace(/[\u200b-\u200d\u2060\ufeff]/g, '').trim();
+    chatControlStats.lastEchoRecipientId = customerId;
+    chatControlStats.lastEchoText = text.slice(0, 160);
+    chatControlStats.lastEchoError = null;
+
+    // Do not mistake messages sent by this bot/admin backend for a human operator command.
     const meta = String(message.metadata || '');
-    if (meta.startsWith('IMPOTECH_')) return;                         // sent by this server (bot or admin app)
-    if (message.mid && botSentMids.has(String(message.mid))) return;  // sent by this server
-    const text = String(message.text || '').normalize('NFKC').trim();
-    // v16: commands typed by the page admin inside the customer's thread (.human / .1off / .ai / .alloff / .allon)
+    if (meta.startsWith('IMPOTECH_') || (message.mid && botSentMids.has(String(message.mid)))) return;
+
     const cmd = text ? parseChatCommand(text) : null;
     if (cmd) {
-      if (['off', 'oneoff', 'on'].includes(cmd.action) && (!cmd.args || parseDurationMs(cmd.args) !== null)) { await applyChatCommandToCustomer(customerId, cmd, 'page-inbox'); return; }
-      if (cmd.action === 'all_off' || cmd.action === 'all_on') { await setGlobalAiPause(cmd.action === 'all_off'); noteChatCommand('page-inbox', `.${cmd.word}`); return; }
-      if (['list', 'status', 'help', 'myid', 'login', 'logout'].includes(cmd.action)) return; // these are answered only in the private admin chat
+      chatControlStats.lastEchoCommand = `.${cmd.word}`;
+      if (['off', 'oneoff', 'on'].includes(cmd.action)) {
+        // In the customer's own thread, no customer selector is needed: recipient is the customer.
+        // A duration is optional; invalid trailing text is rejected instead of silently pausing the wrong person.
+        if (cmd.args && parseDurationMs(cmd.args) === null) {
+          console.warn(`[ChatControl] Invalid Page Inbox command arguments: ${text}`);
+          return;
+        }
+        await applyChatCommandToCustomer(customerId, cmd, 'page-inbox');
+        return;
+      }
+      if (cmd.action === 'all_off' || cmd.action === 'all_on') {
+        await setGlobalAiPause(cmd.action === 'all_off');
+        noteChatCommand('page-inbox', `.${cmd.word}`);
+        console.log(`[ChatControl] Page Inbox command .${cmd.word} applied by echo from customer thread …${customerId.slice(-4)}`);
+        return;
+      }
+      if (['list', 'status', 'help', 'myid', 'login', 'logout'].includes(cmd.action)) return;
     }
+
+    // Any ordinary human reply in Page Inbox pauses this customer's AI.
     if (!AUTO_TAKEOVER_ON_ADMIN_REPLY || db.isGlobalPaused) return;
-    if (text && HUMAN_ECHO_IGNORE_RE && HUMAN_ECHO_IGNORE_RE.test(text)) return;  // Page automation (welcome greeting), not a person
+    if (text && HUMAN_ECHO_IGNORE_RE && HUMAN_ECHO_IGNORE_RE.test(text)) return;
     const c = db.customers[customerId];
-    if (c?.firstContactAt && Date.now() - Number(c.firstContactAt) < HUMAN_ECHO_IGNORE_NEW_MS) return; // instant greeting for a brand-new customer
+    if (c?.firstContactAt && Date.now() - Number(c.firstContactAt) < HUMAN_ECHO_IGNORE_NEW_MS) return;
     const existing = db.takeovers[customerId];
-    if (existing?.isPaused && !existing.expiresAt && getTakeoverState(customerId)) return; // already paused until an admin resumes
+    if (existing?.isPaused && !existing.expiresAt && getTakeoverState(customerId)) return;
     await setTakeoverState(customerId, true, 'Human agent replied from Page Inbox', { expiresInMs: HUMAN_REPLY_PAUSE_MS });
     console.log(`[Takeover] Human reply detected for ${customerId}; AI paused${HUMAN_REPLY_PAUSE_MS ? ` for ${Math.round(HUMAN_REPLY_PAUSE_MS / 60000)} min` : ' until .ai'}`);
-  } catch (err) { console.error('[Takeover] Echo handling failed:', err.message); }
+  } catch (err) {
+    chatControlStats.lastEchoError = err?.message || String(err);
+    console.error('[Takeover] Echo handling failed:', err.message);
+  }
 }
+
 // ---- v13: keep the answer about ONE product ----------------------------------------------------
 const COMPARISON_RE = /তুলনা|compare|কোনটা\s*ভালো|কোনটি\s*ভালো|কোনটা\s*নিব|অন্য\s*(?:কোন|কি|কী)|আর\s*(?:কি|কী)|কী\s*কী\s*(?:পণ্য|আইটেম|লাইট)|কি\s*কি\s*(?:পণ্য|আইটেম|লাইট)|সব\s*(?:পণ্য|আইটেম|লাইট)|পণ্যের\s*তালিকা|product\s*list|all\s*products|options|অপশন|বিকল্প/i;
 function guardSingleProductReply(reply, customerText, senderId) {
@@ -2765,7 +2837,7 @@ app.post('/webhook',async(req,res)=>{
   for (const entry of incomingEntries) {
     const events = Array.isArray(entry.messaging) ? entry.messaging : [];
     incomingEvents += events.length;
-    incomingEchoes += events.filter(event => event.message?.is_echo === true).length;
+    incomingEchoes += events.filter(event => event.message?.is_echo === true || event.message?.is_echo === 'true').length;
   }
   console.log('[Webhook] POST received', {
     object: req.body?.object ?? null,
@@ -2780,7 +2852,7 @@ app.post('/webhook',async(req,res)=>{
     for(const entry of req.body.entry||[])for(const event of entry.messaging||[]) {
       const senderId=event.sender?.id,message=event.message,messageId=message?.mid,receivedAt=Date.now();
       // Page echoes: this server's own messages are ignored; a human reply from Page Inbox / Business Suite pauses the bot.
-      if (message?.is_echo) { chatControlStats.echoEvents++; chatControlStats.lastEchoAt = new Date().toISOString(); await handlePageEcho(event, message); continue; }
+      if (message?.is_echo === true || message?.is_echo === 'true') { chatControlStats.echoEvents++; chatControlStats.lastEchoAt = new Date().toISOString(); await handlePageEcho(event, message); continue; }
       if(event.call && senderId) {
         await setTakeoverState(senderId,true,'Incoming Messenger call event'); // takeover is immediate, the reply follows the delay
         enqueueCustomerTask(senderId, async () => {
@@ -2860,7 +2932,7 @@ app.post('/api/customers/:senderId/send',async(req,res)=>{const text=String(req.
 // -----------------------------------------------------------------------------
 app.get('/health',(req,res)=>res.status(200).json({success:true,status:'ok',storage:pool?'postgresql':'memory-only'}));
 app.get('/api/health',(req,res)=>res.status(200).json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',isGlobalPaused:!!db.isGlobalPaused}));
-app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogQualityWarnings:getCatalogQualityWarnings(),catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,catalogSyncMode:CATALOG_SYNC_MODE,catalogAutoRefreshSeconds:Math.round(CATALOG_REFRESH_INTERVAL_MS/1000),catalogDirty,replyDelayMs:REPLY_DELAY_MS,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,voiceModel:VOICE_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,salesQuestions:SALES_QUESTIONS_ENABLED,chatControl:{adminPsidsConfigured:ADMIN_PSIDS.size,adminsRegisteredByLogin:(db.settings?.adminPsids||[]).length,passcodeLoginEnabled:Boolean(ADMIN_CHAT_PASSCODE),oneOffPauseMinutes:Math.round(ONE_OFF_PAUSE_MS/60000),...chatControlStats},historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
+app.get('/api/status',(req,res)=>res.json({success:true,status:'LIVE_PRODUCTION',storage:pool?'postgresql':'memory-only',catalogProducts:products.length,catalogFaqs:faqs.length,catalogQualityWarnings:getCatalogQualityWarnings(),catalogFile:CATALOG_FILE,githubRepo:GITHUB_REPO,githubBranch:GITHUB_BRANCH,catalogMeta,catalogSyncMode:CATALOG_SYNC_MODE,catalogAutoRefreshSeconds:Math.round(CATALOG_REFRESH_INTERVAL_MS/1000),catalogDirty,replyDelayMs:REPLY_DELAY_MS,globalBotPaused:!!db.isGlobalPaused,helpline:HELPLINE,whatsapp:WHATSAPP_NUMBER,aiModel:TEXT_MODEL,voiceModel:VOICE_MODEL,vehicleFitmentEntries:VEHICLE_FITMENT_DATA.length,salesQuestions:SALES_QUESTIONS_ENABLED,chatControl:{adminPsidsConfigured:ADMIN_PSIDS.size,adminsRegisteredByLogin:(db.settings?.adminPsids||[]).length,passcodeLoginEnabled:Boolean(ADMIN_CHAT_PASSCODE),oneOffPauseMinutes:Math.round(ONE_OFF_PAUSE_MS/60000),requiredPageWebhookFields:['messages','message_echoes'],...chatControlStats},historyLimit:HISTORY_LIMIT,memoryRetentionDays:MEMORY_RETENTION_DAYS,customers:Object.keys(db.customers).length,messages:db.messages.length,orders:db.orders.length,customerMemories:Object.keys(db.customerMemory).length,pendingFollowups:Object.values(db.scheduledFollowups).filter(x=>x&&x.status==='PENDING').length,timestamp:new Date().toISOString()}));
 app.get('/api/catalog/media-status',(req,res)=>res.json({success:true,products:products.map(p=>({id:p.id,name:p.name,images:getProductMediaUrls(p,'images').length,videos:getProductMediaUrls(p,'videos').length}))}));
 
 // ============================================================================
@@ -3273,6 +3345,8 @@ async function initDatabaseWithRetry() {
 async function startServer() {
   await initDatabaseWithRetry();
   await initOptionalServices();
+  // Automatically request Page-level message_echoes subscription; app-level Webhooks still must enable it too.
+  chatControlStats.webhookSubscription = await ensureMessengerWebhookSubscriptions();
   loadLocalCatalog();
   await pullCatalogFromGitHub(true);
   restoreFollowupTasks();
@@ -3287,7 +3361,7 @@ async function startServer() {
     if(!PAGE_ACCESS_TOKEN)console.warn('[CONFIG] PAGE_ACCESS_TOKEN missing');
     if(!VERIFY_TOKEN)console.warn('[CONFIG] VERIFY_TOKEN missing');
     if(!OPENROUTER_API_KEY)console.warn('[CONFIG] OPENROUTER_API_KEY missing');
-    console.log(`[CHAT-CONTROL] Page-inbox commands (.ai/.human/.1off) need the webhook field "message_echoes". Private admin chat: ${ADMIN_PSIDS.size ? ADMIN_PSIDS.size + ' admin PSID(s) configured' : (ADMIN_CHAT_PASSCODE ? 'passcode login enabled (.login <passcode>)' : 'NOT configured - set ADMIN_PSIDS or ADMIN_CHAT_PASSCODE; send .myid to the Page to see your PSID')}`);
+    console.log(`[CHAT-CONTROL] Page Inbox control requires Page + App webhook fields messages,message_echoes. Page subscription result: ${chatControlStats.webhookSubscription?.success ? 'OK' : 'CHECK META CONFIG'}. Private admin chat: ${ADMIN_PSIDS.size ? ADMIN_PSIDS.size + ' admin PSID(s) configured' : (ADMIN_CHAT_PASSCODE ? 'passcode login enabled (.login <passcode>)' : 'NOT configured - set ADMIN_PSIDS or ADMIN_CHAT_PASSCODE; send .myid to the Page to see your PSID')}`);
     console.log(`[SALES] Salesman questions ${SALES_QUESTIONS_ENABLED ? 'ON' : 'OFF'}; vehicle fitment rows: ${VEHICLE_FITMENT_DATA.length}`);
     startCatalogAutoRefresh();
   });
